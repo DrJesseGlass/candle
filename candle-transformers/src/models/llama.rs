@@ -5,7 +5,7 @@
 //! Implementation based on Hugging Face's [transformers](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py)
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, kv_cache::KvCache, Embedding, Module, VarBuilder};
 use std::{f32::consts::PI, sync::Arc};
 
@@ -227,7 +227,6 @@ struct CausalSelfAttention {
     rotary_emb: Arc<LlamaRotaryEmbedding>,
     span: tracing::Span,
     span_rot: tracing::Span,
-    max_position_embeddings: usize,
 }
 
 #[cfg(feature = "flash-attn")]
@@ -386,9 +385,8 @@ impl Block {
     fn forward(
         &mut self,
         x: &Tensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut Cache,
+        mask: Option<&Tensor>,
+        offset: usize,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;

@@ -3,7 +3,6 @@ pub mod conversation;
 pub mod image_processor;
 
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::llama::Cache;
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Device, IndexOp, Tensor};
@@ -41,8 +40,6 @@ struct Args {
     hf: bool,
     #[arg(long, action)]
     cpu: bool,
-    #[arg(long, action)]
-    no_kv_cache: bool,
     #[arg(long)]
     prompt: String,
     /// The seed to use when generating random samples. Copy from candle llama. Not exist in python llava.
@@ -186,7 +183,6 @@ fn main() -> Result<()> {
         )
     };
 
-    let llama_config = llava_config.to_llama_config();
     let dtype: DType = match llava_config.torch_dtype.as_str() {
         "float16" => DType::F16,
         "bfloat16" => DType::BF16,
@@ -195,15 +191,12 @@ fn main() -> Result<()> {
 
     let eos_token_id = llava_config.eos_token_id;
 
-    println!("setting kv cache");
-    let mut cache = Cache::new(!args.no_kv_cache, dtype, &llama_config, &device)?;
-
     println!("loading model weights");
 
     let weight_filenames =
         candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_filenames, dtype, &device)? };
-    let llava: LLaVA = LLaVA::load(vb, &llava_config, clip_vision_config)?;
+    let mut llava: LLaVA = LLaVA::load(vb, &llava_config, clip_vision_config)?;
 
     println!("generating conv template");
     let image_token_se =
@@ -282,19 +275,15 @@ fn main() -> Result<()> {
         llava.prepare_inputs_labels_for_multimodal(&tokens, &[image_tensor], &[image_size])?;
     //inference loop, based on https://github.com/huggingface/candle/blob/main/candle-examples/examples/llama/main.rs
     let mut tokenizer = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
-    let mut index_pos = 0;
+    let mut offset = 0;
     for index in 0..args.max_new_tokens {
         let (_, input_embeds_len, _) = input_embeds.dims3()?;
-        let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
-            (1, index_pos)
-        } else {
-            (input_embeds_len, 0)
-        };
+        let context_size = if index > 0 { 1 } else { input_embeds_len };
         let input = input_embeds.i((.., input_embeds_len.saturating_sub(context_size).., ..))?;
-        let logits = llava.forward(&input, context_index, &mut cache)?; //[1,32000]
+        let logits = llava.forward(&input, offset)?; //[1,32000]
         let logits = logits.squeeze(0)?;
         let (_, input_len, _) = input.dims3()?;
-        index_pos += input_len;
+        offset += input_len;
         let next_token = logits_processor.sample(&logits)?;
         let next_token_tensor = Tensor::from_vec(vec![next_token], 1, &device)?;
         let next_embeds = llava.llama.embed(&next_token_tensor)?.unsqueeze(0)?;
