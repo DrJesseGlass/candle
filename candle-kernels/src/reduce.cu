@@ -5,6 +5,25 @@
 #define WARP_SIZE 32
 const int BLOCK_SIZE = 1024;
 
+// atomicAdd for __half on compute capability < 7.0 (Pascal and older)
+#if __CUDA_ARCH__ < 700
+__device__ __forceinline__ void atomicAdd(__half* address, __half val) {
+    unsigned int* address_as_uint = (unsigned int*)((char*)address - ((size_t)address & 2));
+    unsigned int old = *address_as_uint;
+    unsigned int assumed;
+    __half hsum;
+    do {
+        assumed = old;
+        hsum = __half_as_ushort(((size_t)address & 2) ? __ushort_as_half(old >> 16)
+                                                        : __ushort_as_half(old & 0xffff));
+        hsum = __hadd(hsum, val);
+        old = (size_t)address & 2 ? (old & 0xffff) | (__half_as_ushort(hsum) << 16)
+                                   : (old & 0xffff0000) | __half_as_ushort(hsum);
+        old = atomicCAS(address_as_uint, assumed, old);
+    } while (assumed != old);
+}
+#endif
+
 // TODO: Maybe add some fast_sum_f16_f32 variant that not only accumulate in f32
 // but also expect a f32 output so that this can be used for normalization e.g.
 // in softmax.
