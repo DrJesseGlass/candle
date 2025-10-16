@@ -6,8 +6,8 @@
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use std::{collections::HashMap, f32::consts::PI};
+use candle_nn::{embedding, kv_cache::KvCache, Embedding, Module, VarBuilder};
+use std::{f32::consts::PI, sync::Arc};
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -143,13 +143,9 @@ impl Config {
 }
 
 #[derive(Debug, Clone)]
-pub struct Cache {
-    masks: HashMap<usize, Tensor>,
-    pub use_kv_cache: bool,
-    kvs: Vec<Option<(Tensor, Tensor)>>,
-    cos: Tensor,
+pub(crate) struct LlamaRotaryEmbedding {
     sin: Tensor,
-    device: Device,
+    cos: Tensor,
 }
 
 fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
@@ -160,22 +156,22 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
         .collect()
 }
 
-impl Cache {
-    pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
-        // precompute freqs_cis
-        let theta = match &config.rope_scaling {
+
+impl LlamaRotaryEmbedding {
+    pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+        let theta = match &cfg.rope_scaling {
             None
             | Some(Llama3RopeConfig {
                 rope_type: Llama3RopeType::Default,
                 ..
-            }) => calculate_default_inv_freq(config),
+            }) => calculate_default_inv_freq(cfg),
             Some(rope_scaling) => {
                 let low_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
                     / rope_scaling.low_freq_factor;
                 let high_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
                     / rope_scaling.high_freq_factor;
 
-                calculate_default_inv_freq(config)
+                calculate_default_inv_freq(cfg)
                     .into_iter()
                     .map(|freq| {
                         let wavelen = 2. * PI / freq;
@@ -195,37 +191,25 @@ impl Cache {
             }
         };
 
-        let theta = Tensor::new(theta, device)?;
-
-        let idx_theta = Tensor::arange(0, config.max_position_embeddings as u32, device)?
+        let theta = Tensor::new(theta, dev)?;
+        let idx_theta = Tensor::arange(0, cfg.max_position_embeddings as u32, dev)?
             .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?
+            .reshape((cfg.max_position_embeddings, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        // This is different from the paper, see:
-        // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
+
         Ok(Self {
-            masks: HashMap::new(),
-            use_kv_cache,
-            kvs: vec![None; config.num_hidden_layers],
-            device: device.clone(),
-            cos,
-            sin,
+            sin: idx_theta.sin()?.to_dtype(dtype)?,
+            cos: idx_theta.cos()?.to_dtype(dtype)?,
         })
     }
 
-    fn mask(&mut self, t: usize) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), &self.device)?;
-            self.masks.insert(t, mask.clone());
-            Ok(mask)
-        }
+    pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+        let (_b_sz, _n_head, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, offset, seq_len)?;
+        let sin = self.sin.narrow(0, offset, seq_len)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q, k))
     }
 }
 
@@ -239,6 +223,8 @@ struct CausalSelfAttention {
     num_key_value_heads: usize,
     head_dim: usize,
     use_flash_attn: bool,
+    kv_cache: KvCache,
+    rotary_emb: Arc<LlamaRotaryEmbedding>,
     span: tracing::Span,
     span_rot: tracing::Span,
     max_position_embeddings: usize,
@@ -261,20 +247,11 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
-        let _enter = self.span_rot.enter();
-        let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
-        let cos = cache.cos.narrow(0, index_pos, seq_len)?;
-        let sin = cache.sin.narrow(0, index_pos, seq_len)?;
-        candle_nn::rotary_emb::rope(x, &cos, &sin)
-    }
-
     fn forward(
-        &self,
+        &mut self,
         x: &Tensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut Cache,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
@@ -284,46 +261,19 @@ impl CausalSelfAttention {
 
         let q = q
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
         let k = k
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let mut v = v
+            .transpose(1, 2)?;
+        let v = v
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
-        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
+        let _enter_rot = self.span_rot.enter();
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        drop(_enter_rot);
 
-        if cache.use_kv_cache {
-            if let Some((cache_k, cache_v)) = &cache.kvs[block_idx] {
-                k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
-                v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
-                let k_seq_len = k.dims()[1];
-                if k_seq_len > self.max_position_embeddings {
-                    k = k
-                        .narrow(
-                            D::Minus1,
-                            k_seq_len - self.max_position_embeddings,
-                            self.max_position_embeddings,
-                        )?
-                        .contiguous()?
-                }
-                let v_seq_len = v.dims()[1];
-                if v_seq_len > 2 * self.max_position_embeddings {
-                    v = v
-                        .narrow(
-                            D::Minus1,
-                            v_seq_len - self.max_position_embeddings,
-                            self.max_position_embeddings,
-                        )?
-                        .contiguous()?
-                }
-            }
-            cache.kvs[block_idx] = Some((k.clone(), v.clone()))
-        }
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
@@ -340,28 +290,29 @@ impl CausalSelfAttention {
             let q = q.to_dtype(DType::F32)?;
             let k = k.to_dtype(DType::F32)?;
             let v = v.to_dtype(DType::F32)?;
-            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-            let att = if seq_len == 1 {
-                att
-            } else {
-                let mask = cache.mask(seq_len)?.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, f32::NEG_INFINITY)?
-            };
+            let mut att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+
+            if let Some(mask) = attn_mask {
+                att = att.broadcast_add(mask)?;
+            }
 
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
-        let y = self.o_proj.forward(&y)?;
-        Ok(y)
+        self.o_proj.forward(&y)
     }
 
     fn repeat_kv(&self, x: Tensor) -> Result<Tensor> {
         crate::utils::repeat_kv(x, self.num_attention_heads / self.num_key_value_heads)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache.reset();
+    }
+
+    fn load(vb: VarBuilder, cfg: &Config, rotary_emb: Arc<LlamaRotaryEmbedding>) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
@@ -371,6 +322,9 @@ impl CausalSelfAttention {
         let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
         let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
         let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
+
+        let kv_cache = KvCache::new(2, 512);
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -380,18 +334,12 @@ impl CausalSelfAttention {
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
             use_flash_attn: cfg.use_flash_attn,
+            kv_cache,
+            rotary_emb,
             span,
             span_rot,
-            max_position_embeddings: cfg.max_position_embeddings,
         })
     }
-}
-
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
-    let shape = mask.shape();
-    let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
-    let m = mask.where_cond(&on_true, on_false)?;
-    Ok(m)
 }
 
 #[derive(Debug, Clone)]
@@ -436,7 +384,7 @@ struct Block {
 
 impl Block {
     fn forward(
-        &self,
+        &mut self,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
@@ -445,15 +393,19 @@ impl Block {
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
-        let x = (self.attn.forward(&x, index_pos, block_idx, cache)? + residual)?;
+        let x = (self.attn.forward(&x, mask, offset)? + residual)?;
         let residual = &x;
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
         Ok(x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn clear_kv_cache(&mut self) {
+        self.attn.clear_kv_cache();
+    }
+
+    fn load(vb: VarBuilder, cfg: &Config, rotary_emb: Arc<LlamaRotaryEmbedding>) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
+        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, rotary_emb)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
         let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = RmsNorm::new(
@@ -477,6 +429,8 @@ pub struct Llama {
     blocks: Vec<Block>,
     ln_f: RmsNorm,
     lm_head: Linear,
+    device: Device,
+    dtype: DType,
 }
 
 impl Llama {
@@ -486,15 +440,21 @@ impl Llama {
     }
     // required by LLaVA
     pub fn forward_input_embed(
-        &self,
+        &mut self,
         input_embed: &Tensor,
-        index_pos: usize,
-        cache: &mut Cache,
+        offset: usize,
     ) -> Result<Tensor> {
-        let (_, seq_len, _) = input_embed.dims3()?;
+        let (b_sz, seq_len, _) = input_embed.dims3()?;
         let mut x = input_embed.clone();
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b_sz, seq_len, offset)?)
+        };
+
+        for block in self.blocks.iter_mut() {
+            x = block.forward(&x, mask.as_ref(), offset)?;
         }
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
@@ -502,16 +462,44 @@ impl Llama {
         logits.to_dtype(DType::F32)
     }
 
-    pub fn forward(&self, x: &Tensor, index_pos: usize, cache: &mut Cache) -> Result<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
+    pub fn forward(&mut self, x: &Tensor, offset: usize) -> Result<Tensor> {
+        let (b_sz, seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b_sz, seq_len, offset)?)
+        };
+
+        for block in self.blocks.iter_mut() {
+            x = block.forward(&x, mask.as_ref(), offset)?;
         }
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&x)?;
         logits.to_dtype(DType::F32)
+    }
+
+    fn causal_mask(&self, b: usize, tgt: usize, offset: usize) -> Result<Tensor> {
+        let mask: Vec<_> = (0..tgt)
+            .flat_map(|i| {
+                (0..(tgt + offset)).map(move |j| {
+                    if j <= i + offset {
+                        0f32
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+            })
+            .collect();
+        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for block in &mut self.blocks {
+            block.clear_kv_cache();
+        }
     }
 
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
@@ -522,8 +510,9 @@ impl Llama {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let rotary_emb = Arc::new(LlamaRotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg).unwrap())
+            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg, rotary_emb.clone()).unwrap())
             .collect();
 
         Ok(Self {
@@ -531,6 +520,8 @@ impl Llama {
             blocks,
             ln_f,
             lm_head,
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
         })
     }
 }

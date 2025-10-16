@@ -84,10 +84,6 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 10000)]
     sample_len: usize,
 
-    /// Disable the key-value cache.
-    #[arg(long)]
-    no_kv_cache: bool,
-
     /// The initial prompt.
     #[arg(long)]
     prompt: Option<String>,
@@ -144,7 +140,7 @@ fn main() -> Result<()> {
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
         None => DType::F16,
     };
-    let (llama, tokenizer_filename, mut cache, config) = {
+    let (mut llama, tokenizer_filename, config) = {
         let api = Api::new()?;
         let model_id = args.model_id.unwrap_or_else(|| {
             let str = match args.which {
@@ -202,11 +198,11 @@ fn main() -> Result<()> {
                 vec![api.get("model.safetensors")?]
             }
         };
-        let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+        (Llama::load(vb, &config)?, tokenizer_filename, config)
     };
+
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let eos_token_id = config.eos_token_id.or_else(|| {
         tokenizer
@@ -239,20 +235,16 @@ fn main() -> Result<()> {
     };
 
     let mut start_gen = std::time::Instant::now();
-    let mut index_pos = 0;
+    let mut offset = 0;
     let mut token_generated = 0;
     for index in 0..args.sample_len {
-        let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
-            (1, index_pos)
-        } else {
-            (tokens.len(), 0)
-        };
+        let context_size = if index > 0 { 1 } else { tokens.len() };
         if index == 1 {
             start_gen = std::time::Instant::now()
         }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
-        let logits = llama.forward(&input, context_index, &mut cache)?;
+        let logits = llama.forward(&input, offset)?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits
@@ -264,7 +256,7 @@ fn main() -> Result<()> {
                 &tokens[start_at..],
             )?
         };
-        index_pos += ctxt.len();
+        offset += ctxt.len();
 
         let next_token = logits_processor.sample(&logits)?;
         token_generated += 1;
