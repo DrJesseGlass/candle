@@ -11,7 +11,7 @@ pub mod config;
 pub mod utils;
 
 use crate::models::clip::vision_model::{ClipVisionConfig, ClipVisionTransformer};
-use crate::models::llama::{Cache, Llama};
+use crate::models::llama::Llama;
 use crate::models::with_tracing::linear;
 
 use candle::{bail, Context, Device, IndexOp, Result, Tensor};
@@ -401,12 +401,11 @@ impl LLaVA {
     }
 
     pub fn forward(
-        &self,
+        &mut self,
         input_embeds: &Tensor,
-        position_id: usize,
-        cache: &mut Cache,
+        offset: usize
     ) -> Result<Tensor> {
         self.llama
-            .forward_input_embed(input_embeds, position_id, cache)
+            .forward_input_embed(input_embeds, offset)
     }
 }

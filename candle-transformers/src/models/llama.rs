@@ -292,7 +292,7 @@ impl CausalSelfAttention {
             let mut att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
 
             if let Some(mask) = attn_mask {
-                att = att.broadcast_add(mask)?;
+                att = att.broadcast_add(&mask.to_dtype(DType::F32)?)?;
             }
 
             let att = candle_nn::ops::softmax_last_dim(&att)?;
