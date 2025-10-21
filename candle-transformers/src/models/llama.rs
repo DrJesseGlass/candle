@@ -207,8 +207,8 @@ impl LlamaRotaryEmbedding {
         let (_b_sz, _n_head, seq_len, _n_embd) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        let q = candle_nn::rotary_emb::rope(q, &cos, &sin)?;
+        let k = candle_nn::rotary_emb::rope(k, &cos, &sin)?;
         Ok((q, k))
     }
 }
@@ -260,19 +260,19 @@ impl CausalSelfAttention {
 
         let q = q
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?.contiguous()?;
         let k = k
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?.contiguous()?;
         let v = v
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?.contiguous()?;
 
         let _enter_rot = self.span_rot.enter();
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
         drop(_enter_rot);
 
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
@@ -297,7 +297,7 @@ impl CausalSelfAttention {
 
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
-            att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
+            att.matmul(&v)?.to_dtype(in_dtype)?
         };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
         self.o_proj.forward(&y)
