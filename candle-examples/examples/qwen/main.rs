@@ -327,7 +327,7 @@ fn main() -> Result<()> {
     let config_file = repo.get("config.json")?;
     let device = candle_examples::device(args.cpu)?;
     let dtype = if device.is_cuda() || device.is_metal() {
-        DType::BF16
+        DType::F16
     } else {
         DType::F32
     };
