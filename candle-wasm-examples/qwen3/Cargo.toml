@@ -21,7 +21,7 @@ num-traits = { workspace = true }
 # App crates.
 anyhow = { workspace = true }
 byteorder = { workspace = true }
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"], default-features = false }
 image = { workspace = true }
 log = { workspace = true }
 safetensors = { workspace = true }
@@ -32,3 +32,10 @@ serde_json = { workspace = true }
 console_error_panic_hook = "0.1.7"
 wasm-bindgen = "0.2.87"
 js-sys = "0.3.64"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
