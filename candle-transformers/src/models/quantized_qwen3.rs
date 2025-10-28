@@ -334,7 +334,8 @@ impl ModelWeights {
                 Ok(1) => DType::F16,
                 _ => DType::F16,
             },
-            None => DType::F16,
+            //None => DType::F16,
+            None => DType::F32, //Temp Redesign
         };
 
         let embed_tensor = gg.tensor("token_embd.weight")?;
