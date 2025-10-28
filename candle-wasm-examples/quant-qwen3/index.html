@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Qwen3 WASM Test (Full Precision)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .status {
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        .status.loading {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .status.ready {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        #output {
+            white-space: pre-wrap;
+            font-family: 'Courier New', monospace;
+            border: 1px solid #ddd;
+            padding: 15px;
+            min-height: 200px;
+            margin: 10px 0;
+            background: #f9f9f9;
+            border-radius: 5px;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        input[type="text"] {
+            width: 60%;
+            padding: 8px;
+            font-size: 14px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            padding: 8px 15px;
+            font-size: 14px;
+            margin: 5px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .info {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🚀 Qwen3 WASM Test (Full Precision)</h1>
+
+    <div id="status" class="status loading">Initializing...</div>
+
+    <div class="controls">
+        <input
+            id="prompt"
+            type="text"
+            placeholder="Enter your prompt..."
+            value="Once upon a time"
+        />
+        <button id="generateBtn" onclick="generate()" disabled>Generate</button>
+        <button id="resetBtn" onclick="reset()" disabled>Reset</button>
+        <div class="info">
+            Using full precision Qwen3 model (safetensors format)
+        </div>
+    </div>
+
+    <div id="output"></div>
+
+    <script type="module">
+        import init, { Model } from './pkg/candle_wasm_example_qwen3.js';
+
+        console.log('SIMD supported:', WebAssembly.validate(new Uint8Array([
+            0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3,
+            2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11
+        ])));
+
+        let model = null;
+        window.model = null;
+
+        function updateStatus(message, type = 'loading') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+
+         async function loadModel() {
+            try {
+                updateStatus('Initializing WASM...', 'loading');
+                await init();
+
+                updateStatus('Loading model files (Q8_0 quantized)...', 'loading');
+
+                // Download model files - CHANGE THIS LINE
+                const [weights, tokenizer, config] = await Promise.all([
+                    fetch('Qwen3-0.6B-Q8_0.gguf').then(r => {
+                        if (!r.ok) throw new Error('Failed to load weights. Make sure Qwen3-0.6B-Q8_0.gguf is in the same directory.');
+                        return r.arrayBuffer();
+                    }),
+                    fetch('tokenizer.json').then(r => {
+                        if (!r.ok) throw new Error('Failed to load tokenizer. Make sure tokenizer.json is in the same directory.');
+                        return r.arrayBuffer();
+                    }),
+                    fetch('config.json').then(r => {
+                        if (!r.ok) throw new Error('Failed to load config. Make sure config.json is in the same directory.');
+                        return r.arrayBuffer();
+                    }),
+                ]);
+
+                updateStatus('Creating Q8_0 model...', 'loading');
+
+                // Create model - same API, just different weight format
+                const startTime = Date.now();
+                model = new Model(
+                    new Uint8Array(weights),
+                    new Uint8Array(tokenizer),
+                    new Uint8Array(config)
+                );
+                const loadTime = ((Date.now() - startTime) / 1000).toFixed(2);
+
+                window.model = model;
+
+                // Enable buttons
+                document.getElementById('generateBtn').disabled = false;
+                document.getElementById('resetBtn').disabled = false;
+
+                updateStatus(`✅ Ready! Q8_0 model loaded in ${loadTime}s`, 'ready');
+
+            } catch (e) {
+                updateStatus(`❌ Error: ${e.message}`, 'error');
+                console.error('Load error:', e);
+            }
+        }
+
+        window.generate = async function() {
+            if (!model) return;
+
+            const generateBtn = document.getElementById('generateBtn');
+            const resetBtn = document.getElementById('resetBtn');
+            const promptInput = document.getElementById('prompt');
+            const outputDiv = document.getElementById('output');
+
+            // Disable buttons during generation
+            generateBtn.disabled = true;
+            resetBtn.disabled = true;
+            promptInput.disabled = true;
+
+            try {
+                const prompt = promptInput.value;
+                outputDiv.textContent = prompt;
+
+                updateStatus('Generating...', 'loading');
+                const startTime = Date.now();
+
+                // Initialize with prompt
+                const firstToken = model.init_with_prompt(
+                    prompt,
+                    0.0, // deterministic //0.7,  // temperature
+                    0.9,  // top_p
+                    1.1,  // repeat_penalty
+                    64,   // repeat_last_n
+                    42  // seed
+                );
+                outputDiv.textContent += firstToken;
+
+                // Generate tokens
+                let tokenCount = 1;
+                const maxTokens = 50;
+
+                for (let i = 0; i < maxTokens; i++) {
+                    if (model.is_eos()) {
+                        updateStatus('✅ Generation complete (EOS)', 'ready');
+                        break;
+                    }
+
+                    const token = model.next_token();
+                    outputDiv.textContent += token;
+                    tokenCount++;
+
+                    // Allow UI to update
+                    await new Promise(r => setTimeout(r, 0));
+
+                    // Update status every 10 tokens
+                    if (tokenCount % 10 === 0) {
+                        const elapsed = (Date.now() - startTime) / 1000;
+                        const tokensPerSec = (tokenCount / elapsed).toFixed(2);
+                        updateStatus(`Generating... ${tokenCount} tokens (${tokensPerSec} tok/s)`, 'loading');
+                    }
+                }
+
+                const totalTime = (Date.now() - startTime) / 1000;
+                const tokensPerSec = (tokenCount / totalTime).toFixed(2);
+                updateStatus(
+                    `✅ Generated ${tokenCount} tokens in ${totalTime.toFixed(2)}s (${tokensPerSec} tok/s)`,
+                    'ready'
+                );
+
+            } catch (e) {
+                updateStatus(`❌ Error: ${e.message}`, 'error');
+                console.error('Generation error:', e);
+            } finally {
+                // Re-enable buttons
+                generateBtn.disabled = false;
+                resetBtn.disabled = false;
+                promptInput.disabled = false;
+            }
+        };
+
+        window.reset = function() {
+            if (!model) return;
+            model.reset();
+            document.getElementById('output').textContent = '';
+            updateStatus('✅ Ready!', 'ready');
+        };
+
+        // Load model on page load
+        loadModel();
+    </script>
+</body>
+</html>
