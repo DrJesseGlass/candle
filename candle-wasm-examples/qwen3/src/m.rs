@@ -65,9 +65,10 @@ impl Model {
         let start = Date::now();
         console_log!("weights len: {:?} bytes", weights.len());
 
-        // Load full precision model
+        // Load full precision model - force F32 for SIMD optimization
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
-        console_log!("full precision weights loaded");
+        console_log!("VarBuilder dtype: {:?}", vb.dtype());
+
         let model = Qwen3::new(&config, vb)?;
 
         console_log!("model loaded in {:?}s", (Date::now() - start) / 1000.);

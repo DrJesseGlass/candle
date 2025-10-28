@@ -1,7 +1,7 @@
 use candle::{DType, Device, Tensor};
 use candle::quantized::gguf_file;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::quantized_qwen3::ModelWeights as QuantizedQwen3;
+use candle_transformers::models::quantized_qwen3_simd::ModelWeights as QuantizedQwen3;
 use js_sys::Date;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -85,8 +85,8 @@ impl Model {
         repeat_last_n: usize,
         seed: f64,
     ) -> Result<String, JsError> {
-        // Note: Quantized model doesn't have clear_kv_cache method in the provided code
-        // You'll need to add it or handle KV cache differently
+
+        self.model.clear_kv_cache();
 
         let temp = if temp <= 0. { None } else { Some(temp) };
         let top_p = if top_p <= 0. || top_p >= 1. {
@@ -139,7 +139,7 @@ impl Model {
     #[wasm_bindgen]
     pub fn reset(&mut self) {
         self.tokens.clear();
-        // Note: You'll need to add a way to reset KV cache in quantized model
+        self.model.clear_kv_cache();
     }
 }
 
