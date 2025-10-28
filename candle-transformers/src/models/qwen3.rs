@@ -392,7 +392,13 @@ impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
+        // Force F32 dtype for SIMD optimization
+        let dtype = DType::F32;
+
+        // Use dtype instead of vb.dtype() for rotary embeddings
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(dtype, cfg, vb.device())?);
+        // Temp Tweak
+        //let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
