@@ -583,7 +583,6 @@ impl GgmlType for BlockQ8_0 {
     const BLCK_SIZE: usize = QK8_0;
     type VecDotType = BlockQ8_0;
 
-    // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/ggml.c#L1619
     fn to_float(xs: &[Self], ys: &mut [f32]) {
         let k = ys.len();
         debug_assert!(
@@ -591,13 +590,23 @@ impl GgmlType for BlockQ8_0 {
             "dequantize_row_q8_0: {k} is not divisible by {QK8_0}"
         );
 
-        let nb = k / QK8_0;
+        // Use SIMD optimization when available
+        #[cfg(target_feature = "simd128")]
+        {
+            crate::quantized::simd128::dequantize_q8_0_simd(xs, ys);
+            return;
+        }
 
-        for i in 0..nb {
-            let d = xs[i].d.to_f32();
-
-            for j in 0..QK8_0 {
-                ys[i * QK8_0 + j] = xs[i].qs[j] as f32 * d;
+        // Fallback to scalar implementation
+        // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/ggml.c#L1619
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            let nb = k / QK8_0;
+            for i in 0..nb {
+                let d = xs[i].d.to_f32();
+                for j in 0..QK8_0 {
+                    ys[i * QK8_0 + j] = xs[i].qs[j] as f32 * d;
+                }
             }
         }
     }
