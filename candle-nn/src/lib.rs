@@ -34,6 +34,8 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+#[cfg(feature = "simd-flash-attn")]
+pub mod simd_flash_attention;
 pub mod var_builder;
 pub mod var_map;
 

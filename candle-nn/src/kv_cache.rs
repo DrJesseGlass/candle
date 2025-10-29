@@ -631,6 +631,270 @@ impl ScatteredCacheBuilder {
     }
 }
 
+/// WASM-optimized KV cache with fixed preallocation
+///
+/// API-compatible with standard KvCache but with different internal behavior:
+/// - Lazy initialization on first append (like standard KvCache)
+/// - Preallocates large buffer to avoid future grows (WASM optimization)
+/// - Zero-copy slicing for retrieval
+#[derive(Debug, Clone)]
+pub struct WasmKvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    dim: usize,
+    current_seq_len: usize,
+    max_seq_len: usize,
+}
+
+impl WasmKvCache {
+    /// Create a new WASM KV cache
+    ///
+    /// # Arguments
+    /// * `dim` - Dimension along which to store sequence (typically 1)
+    /// * `max_seq_len` - Maximum sequence length to preallocate
+    ///
+    /// # Performance Notes
+    /// - Buffers are lazily allocated on first append
+    /// - Preallocates `max_seq_len` tokens to avoid future grows
+    /// - For WASM, recommend max_seq_len = 2048 or 4096
+    ///
+    /// # API Compatibility
+    /// This matches the signature of standard `KvCache::new()` for drop-in replacement.
+    pub fn new(dim: usize, max_seq_len: usize) -> Self {
+        Self {
+            k: None,
+            v: None,
+            dim,
+            current_seq_len: 0,
+            max_seq_len,
+        }
+    }
+
+    /// Internal helper to lazy-initialize the buffers
+    fn ensure_initialized(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
+        if self.k.is_none() {
+            // First append - create preallocated buffers
+            let mut k_shape = k_new.dims().to_vec();
+            k_shape[self.dim] = self.max_seq_len;
+
+            self.k = Some(Tensor::zeros(&*k_shape, k_new.dtype(), k_new.device())?);
+            self.v = Some(Tensor::zeros(&*k_shape, v_new.dtype(), v_new.device())?);
+        }
+        Ok(())
+    }
+
+    /// Append new K and V tensors to the cache
+    ///
+    /// # Performance Notes
+    /// - Lazy-initializes on first call (preallocates max_seq_len)
+    /// - Uses slice_set (in-place update, no allocation)
+    /// - Returns views into preallocated buffers (zero-copy)
+    pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<(Tensor, Tensor)> {
+        let seq_len = k_new.dim(self.dim)?;
+
+        // Lazy initialization on first append
+        self.ensure_initialized(k_new, v_new)?;
+
+        // Check if we exceed max length
+        if self.current_seq_len + seq_len > self.max_seq_len {
+            candle::bail!(
+                "KV cache overflow: current={}, adding={}, max={}. \
+                 Consider increasing max_seq_len or using a ring buffer.",
+                self.current_seq_len,
+                seq_len,
+                self.max_seq_len
+            );
+        }
+
+        let k = self.k.as_mut().unwrap();
+        let v = self.v.as_mut().unwrap();
+
+        // In-place update (no allocation)
+        k.slice_set(k_new, self.dim, self.current_seq_len)?;
+        v.slice_set(v_new, self.dim, self.current_seq_len)?;
+
+        self.current_seq_len += seq_len;
+
+        // Return views (zero-copy slicing)
+        let k_view = k.narrow(self.dim, 0, self.current_seq_len)?;
+        let v_view = v.narrow(self.dim, 0, self.current_seq_len)?;
+
+        Ok((k_view, v_view))
+    }
+
+    /// Get current K and V tensors (zero-copy views)
+    pub fn current(&self) -> Result<Option<(Tensor, Tensor)>> {
+        if self.current_seq_len == 0 || self.k.is_none() {
+            return Ok(None);
+        }
+
+        let k = self.k.as_ref().unwrap();
+        let v = self.v.as_ref().unwrap();
+
+        let k_view = k.narrow(self.dim, 0, self.current_seq_len)?;
+        let v_view = v.narrow(self.dim, 0, self.current_seq_len)?;
+
+        Ok(Some((k_view, v_view)))
+    }
+
+    /// Reset the cache (doesn't deallocate)
+    pub fn reset(&mut self) {
+        self.current_seq_len = 0;
+        // Keep buffers allocated for reuse
+        // This is key for WASM - avoid dealloc/realloc cycles
+    }
+
+    pub fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// Get memory usage in bytes (approximate)
+    pub fn memory_bytes(&self) -> usize {
+        if self.k.is_none() {
+            return 0;
+        }
+
+        let k = self.k.as_ref().unwrap();
+
+        let dtype_size = match k.dtype() {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+            DType::U8 => 1,
+            _ => 4,
+        };
+
+        let elements_per_tensor = k.elem_count();
+        elements_per_tensor * dtype_size * 2  // k and v
+    }
+}
+
+/// Ring buffer KV cache for very long sequences
+///
+/// When sequence exceeds max_seq_len, oldest tokens are discarded.
+/// This is useful for long-running conversations in WASM where
+/// memory is constrained.
+#[derive(Debug, Clone)]
+pub struct WasmRingKvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    dim: usize,
+    write_pos: usize,
+    current_seq_len: usize,
+    max_seq_len: usize,
+}
+
+impl WasmRingKvCache {
+    pub fn new(dim: usize, max_seq_len: usize) -> Self {
+        Self {
+            k: None,
+            v: None,
+            dim,
+            write_pos: 0,
+            current_seq_len: 0,
+            max_seq_len,
+        }
+    }
+
+    fn ensure_initialized(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
+        if self.k.is_none() {
+            let mut k_shape = k_new.dims().to_vec();
+            k_shape[self.dim] = self.max_seq_len;
+
+            self.k = Some(Tensor::zeros(&*k_shape, k_new.dtype(), k_new.device())?);
+            self.v = Some(Tensor::zeros(&*k_shape, v_new.dtype(), v_new.device())?);
+        }
+        Ok(())
+    }
+
+    pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.ensure_initialized(k_new, v_new)?;
+
+        let seq_len = k_new.dim(self.dim)?;
+        let k = self.k.as_mut().unwrap();
+        let v = self.v.as_mut().unwrap();
+
+        if seq_len >= self.max_seq_len {
+            // New sequence is longer than buffer - just keep the end
+            let start = seq_len - self.max_seq_len;
+            let k_tail = k_new.narrow(self.dim, start, self.max_seq_len)?;
+            let v_tail = v_new.narrow(self.dim, start, self.max_seq_len)?;
+
+            k.slice_set(&k_tail.contiguous()?, self.dim, 0)?;
+            v.slice_set(&v_tail.contiguous()?, self.dim, 0)?;
+
+            self.write_pos = 0;
+            self.current_seq_len = self.max_seq_len;
+
+            return Ok((k.clone(), v.clone()));
+        }
+
+        // Check if we wrap around
+        if self.write_pos + seq_len <= self.max_seq_len {
+            // Simple case: no wrap
+            k.slice_set(&k_new.contiguous()?, self.dim, self.write_pos)?;
+            v.slice_set(&v_new.contiguous()?, self.dim, self.write_pos)?;
+
+            self.write_pos += seq_len;
+            self.current_seq_len = self.current_seq_len.saturating_add(seq_len).min(self.max_seq_len);
+        } else {
+            // Wrap around case: split the write
+            let first_part = self.max_seq_len - self.write_pos;
+            let second_part = seq_len - first_part;
+
+            // Write first part at the end
+            let k_first = k_new.narrow(self.dim, 0, first_part)?;
+            let v_first = v_new.narrow(self.dim, 0, first_part)?;
+            k.slice_set(&k_first.contiguous()?, self.dim, self.write_pos)?;
+            v.slice_set(&v_first.contiguous()?, self.dim, self.write_pos)?;
+
+            // Write second part at the beginning
+            let k_second = k_new.narrow(self.dim, first_part, second_part)?;
+            let v_second = v_new.narrow(self.dim, first_part, second_part)?;
+            k.slice_set(&k_second.contiguous()?, self.dim, 0)?;
+            v.slice_set(&v_second.contiguous()?, self.dim, 0)?;
+
+            self.write_pos = second_part;
+            self.current_seq_len = self.max_seq_len;
+        }
+
+        // Return current view
+        if self.current_seq_len < self.max_seq_len {
+            let k_view = k.narrow(self.dim, 0, self.current_seq_len)?;
+            let v_view = v.narrow(self.dim, 0, self.current_seq_len)?;
+            Ok((k_view, v_view))
+        } else {
+            // Full buffer - need to return reordered view
+            // [write_pos..max] + [0..write_pos]
+            if self.write_pos == 0 {
+                Ok((k.clone(), v.clone()))
+            } else {
+                let k_tail = k.narrow(self.dim, self.write_pos, self.max_seq_len - self.write_pos)?;
+                let k_head = k.narrow(self.dim, 0, self.write_pos)?;
+                let k_full = Tensor::cat(&[&k_tail, &k_head], self.dim)?;
+
+                let v_tail = v.narrow(self.dim, self.write_pos, self.max_seq_len - self.write_pos)?;
+                let v_head = v.narrow(self.dim, 0, self.write_pos)?;
+                let v_full = Tensor::cat(&[&v_tail, &v_head], self.dim)?;
+
+                Ok((k_full, v_full))
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.write_pos = 0;
+        self.current_seq_len = 0;
+    }
+
+    pub fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

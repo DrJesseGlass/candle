@@ -1,18 +1,17 @@
 use candle::{DType, Device, Tensor};
 use candle::quantized::gguf_file;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::quantized_qwen3::ModelWeights as QuantizedQwen3;
 use js_sys::Date;
-use serde::Deserialize;
 use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
 use std::io::Cursor;
 
 use crate::console_log;
+use candle_transformers::models::quantized_qwen3::{ModelWeights as QuantizedQwen3, ComputeMode};
 
 #[wasm_bindgen]
 pub struct Model {
-    model: QuantizedQwen3,  // Change this
+    model: QuantizedQwen3,
     tokenizer: Tokenizer,
     logits_processor: LogitsProcessor,
     tokens: Vec<u32>,
@@ -27,13 +26,20 @@ impl Model {
     pub fn load(
         weights: Vec<u8>,
         tokenizer: Vec<u8>,
-        config: Vec<u8>,  // This won't be used for GGUF, but keep for compatibility
+        _config: Vec<u8>,  // Not used for GGUF, but keep for compatibility
     ) -> Result<Model, JsError> {
         console_error_panic_hook::set_once();
-        console_log!("loading quantized qwen3 model (Q8_0)");
+
+        // Check if SIMD is enabled
+        #[cfg(feature = "simd-flash-attn")]
+        console_log!("Loading quantized Qwen3 model (Q8_0) with SIMD flash attention");
+
+        #[cfg(not(feature = "simd-flash-attn"))]
+        console_log!("Loading quantized Qwen3 model (Q8_0) - standard mode");
+
         let device = Device::Cpu;
 
-        console_log!("loading tokenizer");
+        console_log!("Loading tokenizer...");
         let tokenizer =
             Tokenizer::from_bytes(&tokenizer).map_err(|m| JsError::new(&m.to_string()))?;
 
@@ -43,24 +49,38 @@ impl Model {
             None => match tokenizer.get_vocab(true).get("<|im_end|>") {
                 Some(&token) => token,
                 None => {
-                    console_log!("warning: no EOS token found, using 0");
+                    console_log!("⚠️  Warning: no EOS token found, using 0");
                     0
                 }
             }
         };
 
         let start = Date::now();
-        console_log!("weights len: {:?} bytes", weights.len());
+        console_log!("Weights size: {} bytes ({:.2} MB)",
+            weights.len(),
+            weights.len() as f64 / 1_048_576.0
+        );
 
-        // Load GGUF quantized model
+        // Load GGUF quantized model with SIMD optimizations
         let mut cursor = Cursor::new(weights);
         let content = gguf_file::Content::read(&mut cursor)
             .map_err(|e| JsError::new(&format!("Failed to read GGUF: {}", e)))?;
 
-        console_log!("GGUF file loaded, parsing model weights");
-        let model = QuantizedQwen3::from_gguf(content, &mut cursor, &device)?;
+        console_log!("GGUF file parsed, loading model weights...");
 
-        console_log!("quantized model loaded in {:?}s", (Date::now() - start) / 1000.);
+        // Use the new integrated API with optimizations
+        let model = QuantizedQwen3::from_gguf_with_config(
+            content,
+            &mut cursor,
+            &device,
+            ComputeMode::ForceF32,  // Best for SIMD on WASM
+            true,                    // use_flash_attn
+            false,                   // cache_masks (not needed with SIMD)
+        )?;
+
+        let load_time = (Date::now() - start) / 1000.0;
+        console_log!("✅ Quantized model loaded in {:.2}s", load_time);
+
         let logits_processor = LogitsProcessor::new(299792458, None, None);
 
         Ok(Self {
@@ -74,7 +94,6 @@ impl Model {
         })
     }
 
-    // init_with_prompt and next_token stay mostly the same
     #[wasm_bindgen]
     pub fn init_with_prompt(
         &mut self,
@@ -85,8 +104,8 @@ impl Model {
         repeat_last_n: usize,
         seed: f64,
     ) -> Result<String, JsError> {
-        // Note: Quantized model doesn't have clear_kv_cache method in the provided code
-        // You'll need to add it or handle KV cache differently
+        // Clear KV cache
+        self.model.clear_kv_cache();
 
         let temp = if temp <= 0. { None } else { Some(temp) };
         let top_p = if top_p <= 0. || top_p >= 1. {
@@ -108,7 +127,7 @@ impl Model {
             .get_ids()
             .to_vec();
 
-        console_log!("prompt encoded to {} tokens", tokens.len());
+        console_log!("Prompt encoded to {} tokens", tokens.len());
 
         let text = self
             .process(&tokens)
@@ -139,7 +158,7 @@ impl Model {
     #[wasm_bindgen]
     pub fn reset(&mut self) {
         self.tokens.clear();
-        // Note: You'll need to add a way to reset KV cache in quantized model
+        self.model.clear_kv_cache();
     }
 }
 
@@ -169,7 +188,7 @@ impl Model {
         let token = match self.tokenizer.decode(&[next_token], false) {
             Ok(token) => token,
             Err(e) => {
-                console_log!("error decoding token: {:?}", e);
+                console_log!("Error decoding token: {:?}", e);
                 "".to_string()
             }
         };

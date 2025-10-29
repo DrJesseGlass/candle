@@ -10,9 +10,50 @@ use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
+
+// WASM optimizations:
+#[cfg(target_arch = "wasm32")]
+use candle_nn::kv_cache::WasmKvCache as KvCache;
+
+// Use standard KV cache on non-WASM
+#[cfg(not(target_arch = "wasm32"))]
+use candle_nn::kv_cache::KvCache;
+
+// ============================================================================
+// Conditional compilation for flash attention backends
+// ============================================================================
+
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn;
+
+#[cfg(all(not(feature = "flash-attn"), not(feature = "simd-flash-attn")))]
+use candle_nn::cpu_flash_attention;
+
+#[cfg(all(not(feature = "flash-attn"), feature = "simd-flash-attn"))]
+use candle_nn::simd_flash_attention;
+
+// ============================================================================
+// Configuration for optimizations
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ComputeMode {
+    /// Use the dtype from GGUF metadata (dynamic)
+    Dynamic,
+    /// Force F32 for all activations (better for SIMD in WASM)
+    ForceF32,
+    /// Force F16 for all activations
+    ForceF16,
+}
+
+impl Default for ComputeMode {
+    fn default() -> Self {
+        ComputeMode::Dynamic
+    }
+}
 
 struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
@@ -80,10 +121,15 @@ impl Module for MlpWeights {
     }
 }
 
+// ============================================================================
+// Rotary embeddings with configurable dtype
+// ============================================================================
+
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    dtype: DType,
 }
 
 impl RotaryEmbedding {
@@ -107,8 +153,9 @@ impl RotaryEmbedding {
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            dtype,
         })
     }
 
@@ -135,6 +182,7 @@ struct AttentionWeights {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    use_flash_attn: bool,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
     span_attn: tracing::Span,
@@ -147,6 +195,7 @@ impl AttentionWeights {
         num_kv_heads: usize,
         head_dim: usize,
         rms_norm_eps: f64,
+        use_flash_attn: bool,
         rotary_emb: Arc<RotaryEmbedding>,
         prefix: &str,
     ) -> Result<Self> {
@@ -177,6 +226,7 @@ impl AttentionWeights {
             num_kv_heads,
             num_kv_groups,
             head_dim,
+            use_flash_attn,
             rotary_emb,
             kv_cache,
             span_attn,
@@ -221,28 +271,155 @@ impl AttentionWeights {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
+        if self.use_flash_attn {
+            self.forward_flash_attn(&q, &k, &v, attn_mask, b, l)
+        } else {
+            self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
+        }
+    }
+
+
+
+    /// GPU flash attention (CUDA)
+    #[cfg(feature = "flash-attn")]
+    fn forward_flash_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        _attn_mask: Option<&Tensor>,
+        b: usize,
+        l: usize,
+    ) -> Result<Tensor> {
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let ctx = candle_flash_attn::flash_attn(&q, &k, &v, scale, true)?;
+
+        ctx.reshape((b, l, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+
+    /// SIMD-optimized CPU flash attention (uses loop bounds, no masking)
+    #[cfg(all(not(feature = "flash-attn"), feature = "simd-flash-attn"))]
+    fn forward_flash_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        _attn_mask: Option<&Tensor>,
+        b: usize,
+        l: usize,
+    ) -> Result<Tensor> {
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        // SIMD flash attention works with dequantized tensors
+        let ctx = match q.dtype() {
+            DType::F32 => simd_flash_attention::run_simd_flash_attn_cpu::<f32>(
+                &q, &k, &v, scale, true  // is_causal = true
+            )?,
+            DType::F64 => simd_flash_attention::run_simd_flash_attn_cpu::<f64>(
+                &q, &k, &v, scale, true
+            )?,
+            DType::BF16 => {
+                let q_f32 = q.to_dtype(DType::F32)?;
+                let k_f32 = k.to_dtype(DType::F32)?;
+                let v_f32 = v.to_dtype(DType::F32)?;
+                let ctx_f32 = simd_flash_attention::run_simd_flash_attn_cpu::<f32>(
+                    &q_f32, &k_f32, &v_f32, scale, true
+                )?;
+                ctx_f32.to_dtype(DType::BF16)?
+            }
+            dtype => candle::bail!("Unsupported dtype for SIMD flash attention: {:?}", dtype),
+        };
+
+        let ctx = ctx.transpose(1, 2)?;
+        ctx.reshape((b, l, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+
+    /// Standard CPU flash attention (uses mask tensor)
+    #[cfg(all(not(feature = "flash-attn"), not(feature = "simd-flash-attn")))]
+    fn forward_flash_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+        b: usize,
+        l: usize,
+    ) -> Result<Tensor> {
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        let ctx = match q.dtype() {
+            DType::F32 => cpu_flash_attention::run_flash_attn_cpu::<f32>(
+                &q, &k, &v, attn_mask, scale, None, None,
+            )?,
+            DType::F64 => cpu_flash_attention::run_flash_attn_cpu::<f64>(
+                &q, &k, &v, attn_mask, scale, None, None,
+            )?,
+            DType::BF16 => {
+                let q_f32 = q.to_dtype(DType::F32)?;
+                let k_f32 = k.to_dtype(DType::F32)?;
+                let v_f32 = v.to_dtype(DType::F32)?;
+                let ctx_f32 = cpu_flash_attention::run_flash_attn_cpu::<f32>(
+                    &q_f32, &k_f32, &v_f32, attn_mask, scale, None, None,
+                )?;
+                ctx_f32.to_dtype(DType::BF16)?
+            }
+            dtype => candle::bail!("Unsupported dtype for CPU flash attention: {:?}", dtype),
+        };
+
+        let ctx = ctx.transpose(1, 2)?;
+        ctx.reshape((b, l, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+
+    fn forward_standard_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+        b: usize,
+        l: usize,
+    ) -> Result<Tensor> {
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+
         if let Some(m) = attn_mask {
-            let m_dtype = m.dtype();
-            let scores_dtype = scores.dtype();
-            let mask = if m_dtype != scores_dtype {
-                m.to_dtype(scores_dtype)?
+            let m = if m.dtype() != scores.dtype() {
+                m.to_dtype(scores.dtype())?
             } else {
                 m.clone()
             };
-            scores = scores.broadcast_add(&mask)?;
+            scores = scores.broadcast_add(&m)?;
         }
+
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+        let ctx = probs.matmul(&v)?;
         let reshaped_ctx = ctx
             .transpose(1, 2)?
             .reshape((b, l, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&reshaped_ctx)
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +437,7 @@ impl LayerWeights {
         num_key_value_heads: usize,
         head_dim: usize,
         rms_norm_eps: f64,
+        use_flash_attn: bool,
         rotary: Arc<RotaryEmbedding>,
         layer_idx: usize,
     ) -> Result<Self> {
@@ -273,6 +451,7 @@ impl LayerWeights {
             num_key_value_heads,
             head_dim,
             rms_norm_eps,
+            use_flash_attn,
             rotary,
             &prefix,
         )?;
@@ -295,6 +474,10 @@ impl LayerWeights {
     }
 }
 
+// ============================================================================
+// Model with configurable optimizations
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
     embed_tokens: Embedding,
@@ -303,15 +486,30 @@ pub struct ModelWeights {
     lm_head: QMatMul,
     device: Device,
     dtype: DType,
+    cache_masks: bool,
+    cached_masks: Option<std::collections::HashMap<(usize, usize), Tensor>>,
     span: tracing::Span,
     span_output: tracing::Span,
 }
 
 impl ModelWeights {
+    /// Create model with dynamic dtype from GGUF metadata
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+    ) -> Result<Self> {
+        Self::from_gguf_with_config(ct, reader, device, ComputeMode::Dynamic, false, false)
+    }
+
+    /// Create model with configurable compute mode, flash attention, and mask caching
+    pub fn from_gguf_with_config<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        compute_mode: ComputeMode,
+        use_flash_attn: bool,
+        cache_masks: bool,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
@@ -328,19 +526,34 @@ impl ModelWeights {
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
 
-        let dtype = match gg.metadata().get("general.dtype") {
-            Some(v) => match v.to_u32() {
-                Ok(0) => DType::F32,
-                Ok(1) => DType::F16,
-                _ => DType::F16,
-            },
-            //None => DType::F16,
-            None => DType::F32, //Temp Redesign
+        // Determine dtype based on mode
+        let dtype = match compute_mode {
+            ComputeMode::Dynamic => {
+                match gg.metadata().get("general.dtype") {
+                    Some(v) => match v.to_u32() {
+                        Ok(0) => DType::F32,
+                        Ok(1) => DType::F16,
+                        _ => DType::F16,
+                    },
+                    None => DType::F16,
+                }
+            }
+            ComputeMode::ForceF32 => DType::F32,
+            ComputeMode::ForceF16 => DType::F16,
         };
+        eprintln!("🔍 Using dtype: {:?}", dtype);
 
+        // Dequantize embeddings to the configured dtype
         let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_weights = embed_tensor.dequantize(device)?;
+        let embed_weights = if embed_weights.dtype() != dtype {
+            embed_weights.to_dtype(dtype)?
+        } else {
+            embed_weights
+        };
+        let embed_tokens = Embedding::new(embed_weights, hidden_size);
 
+        // Create rotary embeddings with configured dtype
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
             head_dim,
@@ -357,20 +570,29 @@ impl ModelWeights {
                 num_kv_heads,
                 head_dim,
                 rms_norm_eps,
+                use_flash_attn,
                 rotary.clone(),
                 i,
             )?);
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        // Load output projection tensor, falling back to tied embeddings like gemma3
+
         let lm_head_tensor = match gg.tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => gg.tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+
+        let cached_masks = if cache_masks {
+            Some(std::collections::HashMap::new())
+        } else {
+            None
+        };
+
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -378,47 +600,85 @@ impl ModelWeights {
             lm_head,
             device: device.clone(),
             dtype,
+            cache_masks,
+            cached_masks,
             span,
             span_output,
         })
     }
 
-    fn causal_mask(
-        &self,
-        b: usize,
-        tgt: usize,
-        offset: usize,
-        sw: Option<usize>,
-    ) -> Result<Tensor> {
+    fn causal_mask(&mut self, b: usize, tgt: usize, offset: usize) -> Result<Tensor> {
+        // Check cache if enabled
+        if self.cache_masks {
+            let key = (tgt, offset);
+            if let Some(cached_masks) = &self.cached_masks {
+                if let Some(mask) = cached_masks.get(&key) {
+                    return if b == 1 {
+                        Ok(mask.clone())
+                    } else {
+                        mask.broadcast_left(b)
+                    };
+                }
+            }
+        }
+
+        // Create mask
         let minf = f32::NEG_INFINITY;
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
                 (0..(tgt + offset)).map(move |j| {
-                    let past_ok = j <= i + offset;
-                    let sw_ok = match sw {
-                        Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
-                        None => true,
-                    };
-                    if past_ok && sw_ok {
-                        0.
+                    if j <= i + offset {
+                        0.0f32
                     } else {
                         minf
                     }
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+
+        let mask_tensor = Tensor::from_slice(
+            &mask,
+            (1, 1, tgt, tgt + offset),
+            &self.device,
+        )?
+        .to_dtype(self.dtype)?;
+
+        // Cache if enabled
+        if self.cache_masks {
+            if let Some(cached_masks) = &mut self.cached_masks {
+                cached_masks.insert((tgt, offset), mask_tensor.clone());
+            }
+        }
+
+        if b == 1 {
+            Ok(mask_tensor)
+        } else {
+            mask_tensor.broadcast_left(b)
+        }
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let _enter = self.span.enter();
+
         let (b, l) = input.dims2()?;
-        let mut h = self.embed_tokens.forward(input)?;
+        let mut h = {
+            let _enter = self.span.enter();
+            self.embed_tokens.forward(input)?
+        };
+
         let causal_mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            // Only create mask if NOT using SIMD flash attention
+            #[cfg(all(not(feature = "flash-attn"), feature = "simd-flash-attn"))]
+            {
+                None  // SIMD flash attention uses loop bounds, no mask needed
+            }
+            #[cfg(not(all(not(feature = "flash-attn"), feature = "simd-flash-attn")))]
+            {
+                Some(self.causal_mask(b, l, offset)?)
+            }
         };
+
         for layer in &mut self.layers {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
         }
