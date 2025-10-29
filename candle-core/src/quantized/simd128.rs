@@ -1,4 +1,4 @@
-use super::k_quants::{BlockQ2K, BlockQ4K, BlockQ4_0, BlockQ6K, BlockQ8K, BlockQ8_0, QK8_0, QK_K};
+use super::k_quants::{BlockQ2K, BlockQ4K, BlockQ4_0, BlockQ6K, BlockQ8K, BlockQ8_0, QK4_0, QK8_0, QK_K};
 use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
 
@@ -473,18 +473,6 @@ pub(crate) fn dequantize_q8_0_simd(blocks: &[BlockQ8_0], output: &mut [f32]) {
     }
 }
 
-/// WASM SIMD-optimized Q4_0 dequantization
-///
-/// Q4_0 packs two 4-bit values per byte, making it more complex than Q8_0.
-/// This SIMD version provides 3-4x speedup over scalar unpacking.
-///
-/// # Performance
-/// - Processes 16 values per iteration (vs 2 in scalar)
-/// - Expected speedup: 35-45% on overall inference
-///
-/// # Arguments
-/// * `blocks` - Input quantized Q4_0 blocks
-/// * `output` - Pre-allocated output buffer (blocks.len() * 32 elements)
 #[inline(always)]
 pub(crate) fn dequantize_q4_0_simd(blocks: &[BlockQ4_0], output: &mut [f32]) {
     debug_assert_eq!(
@@ -497,161 +485,19 @@ pub(crate) fn dequantize_q4_0_simd(blocks: &[BlockQ4_0], output: &mut [f32]) {
         let mut out_offset = 0;
 
         for block in blocks.iter() {
-            // Broadcast scale factor to all SIMD lanes
-            let scale = f32x4_splat(f16::to_f32(block.d));
+            let d = f16::to_f32(block.d);  // ← Scalar, not SIMD!
 
-            // Constant for un-biasing: Q4_0 uses bias of 8
-            let bias = f32x4_splat(-8.0);
-
-            // Process 16 bytes → 32 values in chunks of 8 (two groups of 4)
             for i in 0..16 {
                 let byte = block.qs[i];
 
-                // Extract lower nibble (bits 0-3) for 1st value
-                let low = (byte & 0x0F) as f32;
+                let low = (byte & 0x0F) as i8 - 8;
+                output[out_offset + i * 2] = d * (low as f32);
 
-                // Extract upper nibble (bits 4-7) for 2nd value
-                let high = (byte >> 4) as f32;
-
-                // Dequantize: (quantized - 8) * scale
-                let val_low = scale * (low - 8.0);
-                let val_high = scale * (high - 8.0);
-
-                // Store results
-                let idx = out_offset + i * 2;
-                output[idx] = val_low;
-                output[idx + 1] = val_high;
+                let high = (byte >> 4) as i8 - 8;
+                output[out_offset + i * 2 + 1] = d * (high as f32);
             }
 
             out_offset += QK4_0;
-        }
-    }
-}
-
-/// Optimized version using v128 operations for better throughput
-///
-/// This version processes 4 unpacked values at once using SIMD vectors.
-/// May be faster on some browsers.
-#[inline(always)]
-pub(crate) fn dequantize_q4_0_simd_v2(blocks: &[BlockQ4_0], output: &mut [f32]) {
-    debug_assert_eq!(output.len(), blocks.len() * QK4_0);
-
-    unsafe {
-        let mut out_offset = 0;
-
-        // SIMD constants
-        let mask_low = u8x16_splat(0x0F);
-        let bias_vec = f32x4_splat(8.0);
-
-        for block in blocks.iter() {
-            let scale = f32x4_splat(f16::to_f32(block.d));
-
-            // Process 16 bytes (32 values) in chunks of 4 bytes (8 values)
-            for chunk in 0..4 {
-                let byte_offset = chunk * 4;
-
-                // Load 4 bytes
-                let b0 = block.qs[byte_offset];
-                let b1 = block.qs[byte_offset + 1];
-                let b2 = block.qs[byte_offset + 2];
-                let b3 = block.qs[byte_offset + 3];
-
-                // Unpack lower nibbles
-                let l0 = (b0 & 0x0F) as f32;
-                let l1 = (b1 & 0x0F) as f32;
-                let l2 = (b2 & 0x0F) as f32;
-                let l3 = (b3 & 0x0F) as f32;
-
-                // Unpack upper nibbles
-                let h0 = (b0 >> 4) as f32;
-                let h1 = (b1 >> 4) as f32;
-                let h2 = (b2 >> 4) as f32;
-                let h3 = (b3 >> 4) as f32;
-
-                // Create SIMD vectors
-                let low_vec = f32x4(l0, l1, l2, l3);
-                let high_vec = f32x4(h0, h1, h2, h3);
-
-                // Dequantize: (value - 8) * scale
-                let low_result = f32x4_mul(f32x4_sub(low_vec, bias_vec), scale);
-                let high_result = f32x4_mul(f32x4_sub(high_vec, bias_vec), scale);
-
-                // Interleave and store results
-                let out_base = out_offset + chunk * 8;
-                output[out_base] = f32x4_extract_lane::<0>(low_result);
-                output[out_base + 1] = f32x4_extract_lane::<0>(high_result);
-                output[out_base + 2] = f32x4_extract_lane::<1>(low_result);
-                output[out_base + 3] = f32x4_extract_lane::<1>(high_result);
-                output[out_base + 4] = f32x4_extract_lane::<2>(low_result);
-                output[out_base + 5] = f32x4_extract_lane::<2>(high_result);
-                output[out_base + 6] = f32x4_extract_lane::<3>(low_result);
-                output[out_base + 7] = f32x4_extract_lane::<3>(high_result);
-            }
-
-            out_offset += QK4_0;
-        }
-    }
-}
-
-#[cfg(test)]
-mod q4_0_tests {
-    use super::*;
-
-    #[test]
-    fn test_dequantize_q4_0_simd_correctness() {
-        let mut block = BlockQ4_0::zeros();
-        block.d = f16::from_f32(2.0);
-
-        // Pack some test values
-        // Lower nibbles: 0,1,2,3,... Upper nibbles: 8,9,10,11,...
-        for i in 0..16 {
-            let low = i & 0x0F;
-            let high = (i + 8) & 0x0F;
-            block.qs[i as usize] = (high << 4) | low;
-        }
-
-        let blocks = vec![block];
-        let mut output = vec![0.0f32; 32];
-
-        unsafe {
-            dequantize_q4_0_simd(&blocks, &mut output);
-        }
-
-        // Verify results
-        // First value: (0 - 8) * 2.0 = -16.0
-        assert!((output[0] - (-16.0)).abs() < 1e-4);
-        // Second value: (8 - 8) * 2.0 = 0.0
-        assert!(output[1].abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_v2_matches_v1() {
-        let mut blocks = Vec::new();
-        for _ in 0..10 {
-            let mut block = BlockQ4_0::zeros();
-            block.d = f16::from_f32(1.5);
-            for i in 0..16 {
-                block.qs[i] = ((i * 7) % 256) as u8;
-            }
-            blocks.push(block);
-        }
-
-        let mut output_v1 = vec![0.0f32; 320];
-        let mut output_v2 = vec![0.0f32; 320];
-
-        unsafe {
-            dequantize_q4_0_simd(&blocks, &mut output_v1);
-            dequantize_q4_0_simd_v2(&blocks, &mut output_v2);
-        }
-
-        for i in 0..320 {
-            assert!(
-                (output_v1[i] - output_v2[i]).abs() < 1e-5,
-                "v1 and v2 differ at index {}: {} vs {}",
-                i,
-                output_v1[i],
-                output_v2[i]
-            );
         }
     }
 }

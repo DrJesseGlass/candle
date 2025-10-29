@@ -29,7 +29,9 @@ print(f"GGUF model location: {GGUF_SNAPSHOT}")
 print(f"Tokenizer/config location: {QWEN_SNAPSHOT}")
 
 # Verify files exist
-GGUF_FILE = 'Qwen3-0.6B-Q8_0.gguf'
+# GGUF_FILE = 'Qwen3-0.6B-Q8_0.gguf'      # 8-bit quantization
+GGUF_FILE = 'Qwen3-0.6B-Q4_K_M.gguf'  # 4-bit K-quants (smaller, faster)
+
 files_to_check = [
     (GGUF_SNAPSHOT, GGUF_FILE),
     (QWEN_SNAPSHOT, 'tokenizer.json'),
@@ -57,7 +59,7 @@ class CustomHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         # Serve model files from HuggingFace cache
-        if self.path == '/Qwen3-0.6B-Q8_0.gguf':
+        if self.path == '/' + GGUF_FILE:
             self.send_file(GGUF_SNAPSHOT / GGUF_FILE)
         elif self.path == '/tokenizer.json':
             self.send_file(QWEN_SNAPSHOT / 'tokenizer.json')
