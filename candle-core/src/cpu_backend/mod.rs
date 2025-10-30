@@ -2572,119 +2572,23 @@ impl BackendDevice for CpuDevice {
         crate::bail!("cannot seed the CPU rng with set_seed")
     }
 
-    fn rand_uniform(&self, shape: &Shape, dtype: DType, min: f64, max: f64) -> Result<CpuStorage> {
-        use rand::prelude::*;
-
-        let elem_count = shape.elem_count();
-        use rand::thread_rng;
-        let mut rng = thread_rng();
-        match dtype {
-            DType::U8 | DType::U32 | DType::I64 => {
-                Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt())
-            }
-            DType::BF16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distributions::Uniform::new(bf16::from_f64(min), bf16::from_f64(max))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<bf16, _>(uniform))
-                }
-                Ok(CpuStorage::BF16(data))
-            }
-            DType::F16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distributions::Uniform::new(f16::from_f64(min), f16::from_f64(max))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f16, _>(uniform))
-                }
-                Ok(CpuStorage::F16(data))
-            }
-            DType::F8E4M3 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform =
-                    rand::distributions::Uniform::new(F8E4M3::from_f64(min), F8E4M3::from_f64(max))
-                        .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<F8E4M3, _>(uniform))
-                }
-                Ok(CpuStorage::F8E4M3(data))
-            }
-            DType::F32 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform =
-                    rand::distributions::Uniform::new(min as f32, max as f32).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f32, _>(uniform))
-                }
-                Ok(CpuStorage::F32(data))
-            }
-            DType::F64 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distributions::Uniform::new(min, max).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(rng.sample::<f64, _>(uniform))
-                }
-                Ok(CpuStorage::F64(data))
-            }
-        }
+    pub(crate) fn rand_uniform(
+        &self,
+        _shape: &Shape,
+        _dtype: DType,
+        _min: f64,
+        _max: f64,
+    ) -> Result<Self::Storage> {
+        Err(Error::Msg("Random generation not supported in IC build".to_string()))
     }
 
-    fn rand_normal(&self, shape: &Shape, dtype: DType, mean: f64, std: f64) -> Result<CpuStorage> {
-        use rand::prelude::*;
-        use rand_distr::Distribution;
-
-        let elem_count = shape.elem_count();
-        let mut rng = rand::rng();
-        match dtype {
-            DType::U8 | DType::U32 | DType::I64 => {
-                Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt())
-            }
-            DType::BF16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(bf16::from_f64(mean), bf16::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::BF16(data))
-            }
-            DType::F16 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(f16::from_f64(mean), f16::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F16(data))
-            }
-            DType::F8E4M3 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(F8E4M3::from_f64(mean), F8E4M3::from_f64(std))
-                    .map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F8E4M3(data))
-            }
-            DType::F32 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal =
-                    rand_distr::Normal::new(mean as f32, std as f32).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F32(data))
-            }
-            DType::F64 => {
-                let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(mean, std).map_err(Error::wrap)?;
-                for _i in 0..elem_count {
-                    data.push(normal.sample(&mut rng))
-                }
-                Ok(CpuStorage::F64(data))
-            }
-        }
+    fn rand_normal(&self,
+            _shape: &Shape,
+            _dtype: DType,
+            _mean: f64,
+            _std: f64,
+        ) -> Result<Self::Storage> {
+            Err(Error::Msg("Random generation not supported in IC build".to_string()))
     }
 
     #[allow(clippy::uninit_vec)]
