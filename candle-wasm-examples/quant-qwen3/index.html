@@ -240,7 +240,7 @@
     <div class="panel" style="margin-top: 20px;">
         <h2>⚡ Benchmark & Comparison</h2>
         <div class="controls">
-            <button onclick="runBenchmark()">Run Benchmark (50 tokens)</button>
+            <button onclick="runBenchmark()">Run Benchmark (300 tokens)</button>
             <button onclick="saveBenchmark()">Save as Baseline</button>
             <button class="secondary" onclick="compareBenchmarks()">Compare with Baseline</button>
         </div>
@@ -258,7 +258,9 @@
             profile_clear,
             profile_enable,
             get_memory_info,
-            log_memory
+            log_memory,
+            get_wasm_memory_info,
+            log_wasm_memory
         } from './pkg/candle_wasm_example_quant_qwen3.js';
 
         let model = null;
@@ -277,11 +279,17 @@
         }
 
         window.updateMemory = function() {
-            const info = get_memory_info();
+            const jsInfo = get_memory_info();
+            const wasmInfo = get_wasm_memory_info();
+
             document.getElementById('memoryInfo').innerHTML = `
                 <div class="metric">
-                    <span class="metric-label">💾 Memory Usage:</span>
-                    <span class="metric-value">${info}</span>
+                    <span class="metric-label">💾 JS Heap:</span>
+                    <span class="metric-value">${jsInfo}</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">🔧 WASM Memory:</span>
+                    <span class="metric-value">${wasmInfo}</span>
                 </div>
             `;
         };
@@ -439,16 +447,45 @@
             model.reset();
             profile_clear();
 
+            model.init_with_prompt("The quick brown fox", 0.0, 0.9, 1.1, 64, 42);
+
+            const startWasmMem = get_wasm_memory_info();  // Capture the value
+            log_wasm_memory();  // Log to console
+
             const startTime = performance.now();
             const startMem = performance.memory ? performance.memory.usedJSHeapSize : 0;
 
-            model.init_with_prompt("The quick brown fox", 0.0, 0.9, 1.1, 64, 42);
-
             // Single WASM call instead of 49 JS→WASM calls
-            model.generate_tokens(49);
+            //model.generate_tokens(120);
+
+            const maxTokens = 500;  // Try 500 like you had before
+            let tokenCount = 1;  // Already got 1 from init_with_prompt
+
+            for (let i = 0; i < maxTokens - 1; i++) {
+                if (model.is_eos()) {
+                    console.log(`EOS reached at token ${tokenCount}`);
+                    break;
+                }
+
+                try {
+                    model.next_token();
+                    tokenCount++;
+                } catch (e) {
+                    console.error(`Error at token ${tokenCount}:`, e.message);
+                    break;
+                }
+
+                // Optional: yield to browser every 10 tokens
+                if (i % 10 === 0) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
+            }
 
             const endTime = performance.now();
             const endMem = performance.memory ? performance.memory.usedJSHeapSize : 0;
+
+            const endWasmMem = get_wasm_memory_info();  // Capture the value
+            log_wasm_memory();  // Log to console
 
             const totalTime = endTime - startTime;
             const tokPerSec = (50 / (totalTime / 1000)).toFixed(2);
@@ -475,6 +512,14 @@
                     <div class="metric">
                         <span class="metric-label">Memory Used:</span>
                         <span class="metric-value">${results.memoryDelta} MB</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">WASM Memory (Start):</span>
+                        <span class="metric-value">${startWasmMem}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">WASM Memory (End):</span>
+                        <span class="metric-value">${endWasmMem}</span>
                     </div>
                 </div>
             `;

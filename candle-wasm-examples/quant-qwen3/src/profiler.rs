@@ -278,3 +278,26 @@ pub fn log_memory() {
     let info = get_memory_info();
     web_sys::console::log_1(&format!("💾 Memory: {}", info).into());
 }
+
+#[wasm_bindgen]
+pub fn get_wasm_memory_info() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pages = core::arch::wasm32::memory_size(0);
+        let bytes = pages as f64 * 65536.0;
+        let mb = bytes / (1024.0 * 1024.0);
+
+        format!("WASM Memory: {:.2} MB ({} pages of 64KB)", mb, pages)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "Not WASM".to_string()
+    }
+}
+
+#[wasm_bindgen]
+pub fn log_wasm_memory() {
+    let info = get_wasm_memory_info();
+    web_sys::console::log_1(&format!("💾 {}", info).into());
+}

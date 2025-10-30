@@ -212,7 +212,8 @@ impl AttentionWeights {
         // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
         // The cache will grow in chunks of 512 tokens when needed.
         //let kv_cache = KvCache::new(2, 512);
-        let kv_cache = KvCache::new(2, 101);
+        let kv_cache = KvCache::new(2, 256);
+        //let kv_cache = KvCache::new(2, 101);
 
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
