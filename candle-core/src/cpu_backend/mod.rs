@@ -2572,7 +2572,7 @@ impl BackendDevice for CpuDevice {
         crate::bail!("cannot seed the CPU rng with set_seed")
     }
 
-    pub(crate) fn rand_uniform(
+    fn rand_uniform(
         &self,
         _shape: &Shape,
         _dtype: DType,
