@@ -29,8 +29,8 @@ print(f"GGUF model location: {GGUF_SNAPSHOT}")
 print(f"Tokenizer/config location: {QWEN_SNAPSHOT}")
 
 # Verify files exist
-# GGUF_FILE = 'Qwen3-0.6B-Q8_0.gguf'      # 8-bit quantization
-GGUF_FILE = 'Qwen3-0.6B-Q4_K_M.gguf'  # 4-bit K-quants (smaller, faster)
+GGUF_FILE = 'Qwen3-0.6B-Q8_0.gguf'      # 8-bit quantization
+#GGUF_FILE = 'Qwen3-0.6B-Q4_K_M.gguf'  # 4-bit K-quants (smaller, faster)
 
 files_to_check = [
     (GGUF_SNAPSHOT, GGUF_FILE),
@@ -51,7 +51,14 @@ for base_path, filename in files_to_check:
 
 
 class CustomHandler(SimpleHTTPRequestHandler):
+    # Add .wasm MIME type support
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        '.wasm': 'application/wasm',
+    }
+
     def end_headers(self):
+        # Add CORS headers for all responses
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
@@ -60,25 +67,22 @@ class CustomHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         # Serve model files from HuggingFace cache
         if self.path == '/' + GGUF_FILE:
-            self.send_file(GGUF_SNAPSHOT / GGUF_FILE)
+            self.send_file(GGUF_SNAPSHOT / GGUF_FILE, 'application/octet-stream')
         elif self.path == '/tokenizer.json':
-            self.send_file(QWEN_SNAPSHOT / 'tokenizer.json')
+            self.send_file(QWEN_SNAPSHOT / 'tokenizer.json', 'application/json')
         elif self.path == '/config.json':
-            self.send_file(QWEN_SNAPSHOT / 'config.json')
+            self.send_file(QWEN_SNAPSHOT / 'config.json', 'application/json')
         else:
             # Serve everything else from current directory (pkg/, index.html)
             SimpleHTTPRequestHandler.do_GET(self)
 
-    def send_file(self, filepath):
+    def send_file(self, filepath, content_type):
         try:
             with open(filepath, 'rb') as f:
                 content = f.read()
 
             self.send_response(200)
-            if filepath.suffix == '.json':
-                self.send_header('Content-Type', 'application/json')
-            else:
-                self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
@@ -89,7 +93,7 @@ class CustomHandler(SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     PORT = 8080
     print(f"\nServing WASM from: {os.getcwd()}")
-    print(f"Serving Q8_0 GGUF from: {GGUF_SNAPSHOT}")
+    print(f"Serving Q4_K_M GGUF from: {GGUF_SNAPSHOT}")
     print(f"Serving tokenizer/config from: {QWEN_SNAPSHOT}")
     print(f"\n🚀 Server running at http://localhost:{PORT}\n")
 

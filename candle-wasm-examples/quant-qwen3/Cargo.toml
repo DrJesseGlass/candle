@@ -29,16 +29,17 @@ getrandom = { version = "0.3", features = ["wasm_js"], default-features = false 
 image = { workspace = true }
 log = { workspace = true }
 safetensors = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-rayon = { workspace = true }  # Needed for SIMD flash attention
-tracing = { workspace = true }  # Needed for spans
-libc = "0.2"  # For macOS thread affinity in SIMD flash attention
+rayon = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
 
 # Wasm specific crates.
 console_error_panic_hook = "0.1.7"
 wasm-bindgen = "0.2.87"
 js-sys = "0.3.64"
+web-sys = { version = "0.3.70", features = ["console", "Window", "Performance"] }
 
 [profile.release]
 opt-level = "z"
