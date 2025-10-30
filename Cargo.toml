@@ -1,14 +1,8 @@
 [workspace]
 members = [
     "candle-core",
-    "candle-datasets",
-    "candle-examples",
     "candle-nn",
-    "candle-pyo3",
     "candle-transformers",
-    "candle-wasm-examples/*",
-    "candle-wasm-tests",
-    "tensor-tools",
 ]
 exclude = [
     "candle-book",
@@ -16,6 +10,12 @@ exclude = [
     "candle-kernels",
     "candle-metal-kernels",
     "candle-onnx",
+    "candle-datasets",
+    "candle-examples",
+    "candle-pyo3",
+    "candle-wasm-examples/*",
+    "candle-wasm-tests",
+    "tensor-tools",
 ]
 resolver = "2"
 
@@ -58,14 +58,14 @@ cudarc = { version = "0.17.3", features = [
 fancy-regex = "0.13.0"
 gemm = { version = "0.18.2", features = ["wasm-simd128-enable"] }
 hf-hub = "0.4.1"
-half = { version = "2.5.0", features = [
+half = { version = "=2.4.1", features = [
     "num-traits",
     "use-intrinsics",
-    "rand_distr",
+    #"rand_distr",
 ] }
 float8 = { version = "0.4.2", features = [
     "num-traits",
-    "rand_distr",
+    #"rand_distr",
 ] }
 hound = "3.5.1"
 image = { version = "0.25.2", default-features = false, features = [
@@ -79,8 +79,8 @@ log = "0.4"
 memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
 num_cpus = "1.15.0"
 num-traits = "0.2.15"
-parquet = { version = "51.0.0" }
-rand = "0.8.0"
+parquet = { version = "50.0.0" }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 rand_distr = "0.5.1"
 rayon = "1.7.0"
 safetensors = "0.4.1"
@@ -88,7 +88,7 @@ serde = { version = "1.0.171", features = ["derive"] }
 serde_plain = "1.0.2"
 serde_json = "1.0.99"
 thiserror = "1"
-tokenizers = { version = "0.21.0", default-features = false }
+tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm"] }
 tracing = "0.1.37"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.7"
