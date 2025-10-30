@@ -180,6 +180,27 @@ impl Model {
         self.tokens.clear();
         self.model.clear_kv_cache();
     }
+
+    #[wasm_bindgen]
+    pub fn generate_tokens(&mut self, count: usize) -> Result<String, JsError> {
+        let _prof = ProfileGuard::new("generate_tokens_batch");
+
+        let mut result = String::new();
+
+        for _ in 0..count {
+            if self.is_eos() {
+                break;
+            }
+
+            let last_token = *self.tokens.last().unwrap();
+            let text = self
+                .process(&[last_token])
+                .map_err(|m| JsError::new(&m.to_string()))?;
+            result.push_str(&text);
+        }
+
+        Ok(result)
+    }
 }
 
 impl Model {
@@ -238,3 +259,6 @@ impl Model {
         Ok(token)
     }
 }
+
+
+

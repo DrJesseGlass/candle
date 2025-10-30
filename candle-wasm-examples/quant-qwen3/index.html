@@ -240,7 +240,7 @@
     <div class="panel" style="margin-top: 20px;">
         <h2>⚡ Benchmark & Comparison</h2>
         <div class="controls">
-            <button onclick="runBenchmark()">Run Benchmark (10 tokens)</button>
+            <button onclick="runBenchmark()">Run Benchmark (50 tokens)</button>
             <button onclick="saveBenchmark()">Save as Baseline</button>
             <button class="secondary" onclick="compareBenchmarks()">Compare with Baseline</button>
         </div>
@@ -249,7 +249,7 @@
 
     <script type="module">
         const MODEL_FILE = 'Qwen3-0.6B-Q8_0.gguf';
-        // 'Qwen3-0.6B-Q4_K_M.gguf'
+        //const MODEL_FILE = 'Qwen3-0.6B-Q4_K_M.gguf';
         // Change this to switch models
 
         import init, {
@@ -395,7 +395,7 @@
                     outputDiv.textContent += token;
                     tokenCount++;
 
-                    await new Promise(r => setTimeout(r, 0));
+                    //await new Promise(r => setTimeout(r, 0));
 
                     if (tokenCount % 10 === 0) {
                         const elapsed = (Date.now() - startTime) / 1000;
@@ -444,16 +444,14 @@
 
             model.init_with_prompt("The quick brown fox", 0.0, 0.9, 1.1, 64, 42);
 
-            for (let i = 0; i < 9; i++) {
-                if (model.is_eos()) break;
-                model.next_token();
-            }
+            // Single WASM call instead of 49 JS→WASM calls
+            model.generate_tokens(49);
 
             const endTime = performance.now();
             const endMem = performance.memory ? performance.memory.usedJSHeapSize : 0;
 
             const totalTime = endTime - startTime;
-            const tokPerSec = (10 / (totalTime / 1000)).toFixed(2);
+            const tokPerSec = (50 / (totalTime / 1000)).toFixed(2);
             const memUsed = ((endMem - startMem) / 1048576).toFixed(2);
 
             const results = {
