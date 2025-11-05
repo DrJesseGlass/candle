@@ -134,10 +134,6 @@ enum WhichModel {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Run on CPU rather than on GPU.
-    #[arg(long)]
-    cpu: bool,
-
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
     tracing: bool,
@@ -254,17 +250,25 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let config_file = repo.get("config.json")?;
-    let device = candle_examples::device(args.cpu)?;
+    let device = candle_examples::device(false)?;  // false = use GPU if available
 
     let dtype = match args.dtype.as_str() {
         "f16" => DType::F16,
         "bf16" => DType::BF16,
         "f32" => DType::F32,
         "auto" => {
+            // Auto-select best dtype based on device capability
+            // - BF16: Preferred for modern GPUs (Ampere+: RTX 30xx/40xx, A100, H100)
+            //         More stable, wider range, matches training dtype
+            // - F16:  Fallback for older GPUs (Pascal/Turing: GTX 10xx, RTX 20xx)
+            //         Still fast, compatible with more hardware
+            // - F32:  CPU default (BF16 not well supported on CPU)
+            //
+            // Note: BF16 will error on GTX 10xx series. Use --dtype f16 for those GPUs.
             if device.is_cuda() || device.is_metal() {
-                DType::BF16
+                DType::BF16  // Prefer BF16 on GPU
             } else {
-                DType::F32
+                DType::F32   // CPU uses F32
             }
         }
         other => anyhow::bail!("Unsupported dtype: {}, use f16, bf16, f32, or auto", other),
