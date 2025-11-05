@@ -36,20 +36,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns true if this layer should skip RoPE (use NoPE).
-    ///
-    /// SmolLM3 uses a hybrid approach where some layers skip rotary positional
-    /// embeddings for better long-context performance.
-    ///
-    /// Configuration can specify this in two ways:
-    /// 1. Explicit array (`no_rope_layers`): 1 = skip RoPE, 0 = use RoPE
-    /// 2. Interval pattern (`no_rope_layer_interval`): Every Nth layer skips RoPE
-    ///    e.g., interval=4 means layers 3,7,11,15... skip RoPE (75% use RoPE, 25% NoPE)
+
     pub fn should_skip_rope(&self, layer_idx: usize) -> bool {
         // Method 1: Explicit array (some model variants may provide this)
         if let Some(ref no_rope_layers) = self.no_rope_layers {
             if layer_idx < no_rope_layers.len() {
-                return no_rope_layers[layer_idx] == 1;
+                // FIXED: 0 = skip RoPE (NoPE), 1 = use RoPE
+                return no_rope_layers[layer_idx] == 0;  // ← Changed from == 1 to == 0
             }
         }
 
@@ -263,6 +256,10 @@ impl SmolLM3Attention {
         };
 
         // 4. Accumulate KV cache
+        // Reset KV cache if we're at the first position
+        if offset == 0 {
+            self.kv_cache.reset();
+        }
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         // 5. GQA repeat_kv

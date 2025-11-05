@@ -57,10 +57,18 @@ impl TextGeneration {
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(prompt, false)  // true = add special tokens (matches quantized version)
+            .encode(prompt, true)  // true = add special tokens (matches quantized version)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+
+        //let mut tokens = vec![
+        //    128011, 9125, 198, 567, 34689, 271, 81434, 356, 28540, 2696, 25, 5651, 220, 2366, 20,
+        // //   198, 15724, 2696, 25, 220, 2304, 6841, 220, 2366, 20, 198, 26197, 287, 14904, 25, 611,
+        //    2201, 5978, 771, 271, 567, 8572, 39397, 271, 2675, 527, 264, 11190, 15592, 18328, 7086,
+        //    4487, 337, 11237, 11, 16572, 555, 473, 36368, 19109, 382, 128011, 882, 198, 2323, 128012,
+        // /   198, 128011, 78191, 198, 128002, 271, 128003, 198
+        //];
         println!("Input token IDs: {:?}", tokens);
         println!("Number of input tokens: {}", tokens.len());
         for &t in tokens.iter() {
@@ -81,6 +89,18 @@ impl TextGeneration {
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+
+            // Debug: Print top 5 logits for first token
+            if generated_tokens == 0 {
+                let logits_vec = logits.to_vec1::<f32>()?;
+                let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                println!("\nTop 5 logits for first token:");
+                for (idx, val) in indexed.iter().take(5) {
+                    println!("  Token {}: {:.4}", idx, val);
+                }
+            }
+
             let logits = if self.repeat_penalty == 1. {
                 logits
             } else {
@@ -184,6 +204,10 @@ struct Args {
     #[arg(long, default_value = "3b")]
     model: WhichModel,
 
+    /// Disable chat template (for testing chat model with raw prompts)
+    #[arg(long)]
+    no_chat_template: bool,
+
     /// Data type to use (f32, f16, bf16, or auto)
     #[arg(long, default_value = "auto")]
     dtype: String,
@@ -227,6 +251,7 @@ fn main() -> Result<()> {
             format!("HuggingFaceTB/{}", model_name)
         }
     };
+    println!("DEBUG: Loading model from: {}", model_id);
     let repo = api.repo(Repo::with_revision(
         model_id,
         RepoType::Model,
@@ -285,6 +310,16 @@ fn main() -> Result<()> {
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let config: Config = serde_json::from_slice(&std::fs::read(config_file)?)?;
+
+    println!("DEBUG Config:");
+    println!("  vocab_size: {}", config.vocab_size);
+    println!("  hidden_size: {}", config.hidden_size);
+    println!("  num_attention_heads: {}", config.num_attention_heads);
+    println!("  num_key_value_heads: {}", config.num_key_value_heads);
+    println!("  max_position_embeddings: {}", config.max_position_embeddings);
+    println!("  rope_theta: {}", config.rope_theta);
+    println!("  intermediate_size: {}", config.intermediate_size);
+
     let model = ModelForCausalLM::new(&config, vb)?;
 
     println!("loaded the model in {:?}", start.elapsed());
@@ -323,19 +358,34 @@ fn main() -> Result<()> {
     println!("EOS token ID: {:?}", config.eos_token_id);
 
     // Format prompt with chat template for 3b (chat-tuned) model
-    let formatted_prompt = if matches!(args.model, WhichModel::W3b) {
-        // SmolLM3-3B has extended thinking mode by default
-        // Add /no_think system prompt to get direct answers
+    let formatted_prompt = if matches!(args.model, WhichModel::W3b) && !args.no_chat_template {
+        // SmolLM3-3B requires the full chat template with metadata and instructions
+        // This matches what tokenizer.apply_chat_template() produces in Python
         let chat_template_str = format!(
-            "<|im_start|>system\n/no_think<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\n\
+## Metadata\n\
+\n\
+Knowledge Cutoff Date: June 2025\n\
+Today Date: 05 November 2025\n\
+Reasoning Mode: /no_think\n\
+\n\
+## Custom Instructions\n\
+\n\
+You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
+\n\
+<|im_start|>user\n\
+{}<|im_end|>\n\
+<|im_start|>assistant\n\
+<think>\n\
+\n\
+</think>\n",
             args.prompt
         );
-        println!("Using chat template for SmolLM3-3B (with /no_think)");
-        println!("Formatted prompt: '{}'", chat_template_str);
+        println!("Using full chat template for SmolLM3-3B");
         chat_template_str
     } else {
-        // 3b-base: no chat formatting
-        println!("Using base model (no chat template)");
+        // 3b-base or no chat template: use raw prompt
+        println!("Using raw prompt (no chat template)");
         args.prompt.clone()
     };
 

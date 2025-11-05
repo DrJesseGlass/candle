@@ -250,6 +250,7 @@ fn main() -> anyhow::Result<()> {
     // SmolLM3-3B uses chat template with /no_think to disable extended thinking mode
     let prompt_str = format!("<|im_start|>system\n/no_think<|im_end|>\n<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
 
+
     print!("Prompt: {}", &prompt_str);
 
     let tokens = tos

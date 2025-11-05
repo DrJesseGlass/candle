@@ -21,11 +21,13 @@ def generate_reference(
         seed: int = 299792458,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         dtype: str = "auto",
+        use_chat_template: bool = False,
 ):
     """Generate reference output using HuggingFace transformers."""
 
     print(f"Loading model: {model_id}")
     print(f"Device: {device}")
+    print(f"Use chat template: {use_chat_template}")
 
     # Set seed for reproducibility
     torch.manual_seed(seed)
@@ -54,11 +56,51 @@ def generate_reference(
         device_map=device,
     )
 
+    # Format prompt with chat template if requested
+    if use_chat_template:
+        print("\n" + "=" * 80)
+        print("CHAT TEMPLATE FORMATTING")
+        print("=" * 80)
+
+        # Show what apply_chat_template produces
+        messages = [
+            {"role": "system", "content": "/no_think"},
+            {"role": "user", "content": prompt}
+        ]
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        print(f"\nOriginal prompt: {prompt}")
+        print(f"\nFormatted with apply_chat_template:")
+        print(f"```\n{formatted_prompt}\n```")
+        print(f"\nRepr (shows exact characters):")
+        print(f"{repr(formatted_prompt)}")
+
+        # Tokenize to show token IDs
+        formatted_tokens = tokenizer.encode(formatted_prompt, add_special_tokens=True)
+        print(f"\nToken IDs: {formatted_tokens}")
+
+        # Show what each token decodes to
+        print(f"\nToken-by-token breakdown:")
+        for i, token_id in enumerate(formatted_tokens):
+            token_text = tokenizer.decode([token_id])
+            print(f"  {i}: {token_id:6d} -> {repr(token_text)}")
+
+        print("=" * 80)
+
+        # Use the formatted prompt
+        final_prompt = formatted_prompt
+    else:
+        final_prompt = prompt
+
     # Tokenize input
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = tokenizer(final_prompt, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
 
-    print(f"\nPrompt: {prompt}")
+    print(f"\nFinal prompt: {final_prompt}")
     print(f"Input tokens: {input_ids[0].tolist()}")
     print(f"Input length: {len(input_ids[0])}")
 
@@ -113,6 +155,7 @@ def generate_reference(
         "all_ids": outputs[0].tolist(),
         "dtype": str(torch_dtype),
         "device": device,
+        "formatted_prompt": final_prompt if use_chat_template else prompt,
     }
 
 
@@ -183,6 +226,10 @@ def main():
                         help="Force CPU inference (to match candle CPU)")
     parser.add_argument("--dtype", choices=["auto", "f32", "bf16", "f16"], default="auto",
                         help="Data type (auto, f32, bf16, f16)")
+    parser.add_argument("--chat", action="store_true",
+                        help="Use chat template (for SmolLM3-3B, not -Base)")
+    parser.add_argument("--save-tokens", type=str,
+                        help="Save input token IDs to file (for Rust to replicate exactly)")
     parser.add_argument("--candle-output", type=str,
                         help="Path to candle output file (optional)")
 
@@ -204,6 +251,7 @@ def main():
         seed=args.seed,
         device=device,
         dtype=args.dtype,
+        use_chat_template=args.chat,
     )
 
     print("\n" + "=" * 80)
@@ -212,11 +260,20 @@ def main():
     print(f"\nPython configuration:")
     print(f"  Device: {result['device']}")
     print(f"  Dtype: {result['dtype']}")
+    print(f"  Chat template: {args.chat}")
+
+    if args.chat:
+        print("\nFormatted prompt (repr):")
+        print(repr(result['formatted_prompt']))
+        print("\nFormatted prompt (readable):")
+        print(result['formatted_prompt'])
+
     print("\nRun your candle implementation with these EXACT parameters:")
-    cpu_flag = "--cpu" if result['device'] == "cpu" else ""
+    cpu_flag = "" if result['device'] != "cpu" else ""
+    model_name = "3b" if args.chat else "3b-base"
     command = f"""
 cargo run --release --example smollm3 -- \\
-  --model 3b-base \\
+  --model {model_name} \\
   --prompt "{args.prompt}" \\
   --sample-len {args.max_tokens} \\
   --temperature {args.temperature} \\
@@ -235,6 +292,17 @@ cargo run --release --example smollm3 -- \\
 
     print("\nExpected generated token IDs:")
     print(result["generated_ids"])
+
+    # Save tokens if requested
+    if args.save_tokens:
+        with open(args.save_tokens, 'w') as f:
+            f.write(','.join(map(str, result["input_ids"])))
+        print(f"\nSaved input tokens to: {args.save_tokens}")
+
+    # Print Rust array format
+    print("\nRust format for input tokens:")
+    print(f"let tokens = vec![{', '.join(map(str, result['input_ids']))}];")
+    print(f"\nExpected first generated token: {result['generated_ids'][0]}")
 
     # If candle output provided, compare
     if args.candle_output:
