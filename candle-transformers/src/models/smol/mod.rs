@@ -7,3 +7,4 @@
 //! a separate implementation.
 
 pub mod smollm3;
+pub mod quantized_smollm3;

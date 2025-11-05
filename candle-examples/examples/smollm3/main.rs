@@ -57,11 +57,12 @@ impl TextGeneration {
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(prompt, true)
+            .encode(prompt, false)  // true = add special tokens (matches quantized version)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
         println!("Input token IDs: {:?}", tokens);
+        println!("Number of input tokens: {}", tokens.len());
         for &t in tokens.iter() {
             if let Some(t) = self.tokenizer.next_token(t)? {
                 print!("{t}")
@@ -248,6 +249,12 @@ fn main() -> Result<()> {
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
+    // Check if chat template tokens are in vocabulary (for debugging)
+    let vocab = tokenizer.get_vocab(true);
+    let has_im_start = vocab.contains_key("<|im_start|>");
+    let has_im_end = vocab.contains_key("<|im_end|>");
+    println!("Chat template tokens in vocab: <|im_start|>={}, <|im_end|>={}", has_im_start, has_im_end);
+
     let start = std::time::Instant::now();
     let config_file = repo.get("config.json")?;
     let device = candle_examples::device(false)?;  // false = use GPU if available
@@ -312,6 +319,26 @@ fn main() -> Result<()> {
         &device,
         config.eos_token_id,
     );
-    pipeline.run(&args.prompt, args.sample_len)?;
+
+    println!("EOS token ID: {:?}", config.eos_token_id);
+
+    // Format prompt with chat template for 3b (chat-tuned) model
+    let formatted_prompt = if matches!(args.model, WhichModel::W3b) {
+        // SmolLM3-3B has extended thinking mode by default
+        // Add /no_think system prompt to get direct answers
+        let chat_template_str = format!(
+            "<|im_start|>system\n/no_think<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            args.prompt
+        );
+        println!("Using chat template for SmolLM3-3B (with /no_think)");
+        println!("Formatted prompt: '{}'", chat_template_str);
+        chat_template_str
+    } else {
+        // 3b-base: no chat formatting
+        println!("Using base model (no chat template)");
+        args.prompt.clone()
+    };
+
+    pipeline.run(&formatted_prompt, args.sample_len)?;
     Ok(())
 }
