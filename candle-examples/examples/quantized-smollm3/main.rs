@@ -40,9 +40,9 @@ impl Quantization {
 
     fn filename_ggml(&self) -> &'static str {
         match self {
-            Self::Q4KM => "smollm3-3b-q4_k_m.gguf",
-            Self::Q8_0 => "smollm3-3b-q8_0.gguf",
-            Self::F16 => "smollm3-3b-f16.gguf",
+            Self::Q4KM => "SmolLM3-Q4_K_M.gguf",
+            Self::Q8_0 => "SmolLM3-Q8_0.gguf",
+            Self::F16 => "SmolLM3-f16.gguf",
         }
     }
 
@@ -259,6 +259,14 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     let tokens = tokens.get_ids();
+
+    //let mut tokens = vec![
+    //    128011, 9125, 198, 567, 34689, 271, 81434, 356, 28540, 2696, 25, 5651, 220, 2366, 20,
+    // //   198, 15724, 2696, 25, 220, 2304, 6841, 220, 2366, 20, 198, 26197, 287, 14904, 25, 611,
+    //    2201, 5978, 771, 271, 567, 8572, 39397, 271, 2675, 527, 264, 11190, 15592, 18328, 7086,
+    //    4487, 337, 11237, 11, 16572, 555, 473, 36368, 19109, 382, 128011, 882, 198, 2323, 128012,
+    // /   198, 128011, 78191, 198, 128002, 271, 128003, 198
+    //];
 
     let to_sample = args.sample_len.saturating_sub(1);
 

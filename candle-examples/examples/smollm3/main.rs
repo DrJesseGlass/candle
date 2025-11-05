@@ -325,14 +325,25 @@ fn main() -> Result<()> {
     println!("loaded the model in {:?}", start.elapsed());
     println!("SmolLM3 Config:");
 
-    if let Some(interval) = config.no_rope_layer_interval {
-        // Every 4th layer uses NoPE, others use RoPE
-        let num_nope_layers = config.num_hidden_layers / interval;
-        let num_rope_layers = config.num_hidden_layers - num_nope_layers;
+    if let Some(ref no_rope_layers) = config.no_rope_layers {
+        // Count actual RoPE vs NoPE layers from the array
+        let num_rope_layers = no_rope_layers.iter().filter(|&&x| x == 1).count();
+        let num_nope_layers = no_rope_layers.iter().filter(|&&x| x == 0).count();
+
         println!("  - {} layers total", config.num_hidden_layers);
         println!("  - RoPE: {} layers ({}%)", num_rope_layers, num_rope_layers * 100 / config.num_hidden_layers);
         println!("  - NoPE: {} layers ({}%)", num_nope_layers, num_nope_layers * 100 / config.num_hidden_layers);
-        println!("  - Pattern: NoPE on every {}th layer (indices 3, 7, 11, ...)", interval);
+        println!("  - Pattern: Explicit array (1=RoPE, 0=NoPE)");
+    } else if let Some(interval) = config.no_rope_layer_interval {
+        // Fallback: calculate from interval pattern
+        // Every Nth layer (3, 7, 11, ...) uses NoPE, others use RoPE
+        let num_nope_layers = config.num_hidden_layers / interval;
+        let num_rope_layers = config.num_hidden_layers - num_nope_layers;
+
+        println!("  - {} layers total", config.num_hidden_layers);
+        println!("  - RoPE: {} layers ({}%)", num_rope_layers, num_rope_layers * 100 / config.num_hidden_layers);
+        println!("  - NoPE: {} layers ({}%)", num_nope_layers, num_nope_layers * 100 / config.num_hidden_layers);
+        println!("  - Pattern: Every {}th layer uses NoPE (indices 3, 7, 11, ...)", interval);
     } else {
         println!("  - {} layers with standard RoPE", config.num_hidden_layers);
     }

@@ -211,20 +211,18 @@ impl AttentionWeights {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-
-        // Apply Q/K normalization if available
+        // Apply Q/K normalization if available - only flatten if needed
         let (q, k) = if let (Some(ref q_norm), Some(ref k_norm)) = (&self.q_norm, &self.k_norm) {
-            let q_flat = q_norm.forward(&q_flat)?;
-            let k_flat = k_norm.forward(&k_flat)?;
-            let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-            let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+            // Only flatten when we need to apply normalization
+            let q_flat = q.flatten(0, 2)?;
+            let k_flat = k.flatten(0, 2)?;
+            let q_normed = q_norm.forward(&q_flat)?;
+            let k_normed = k_norm.forward(&k_flat)?;
+            let q = q_normed.reshape((b, self.num_heads, l, self.head_dim))?;
+            let k = k_normed.reshape((b, self.num_kv_heads, l, self.head_dim))?;
             (q, k)
         } else {
-            // No normalization - reshape back
-            let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-            let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+            // No normalization - use tensors directly without extra operations
             (q, k)
         };
 
@@ -361,14 +359,34 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        let num_attention_heads = md_get("smollm3.attention.head_count")?.to_u32()? as usize;
-        let num_kv_heads = md_get("smollm3.attention.head_count_kv")?.to_u32()? as usize;
+        // Read metadata from GGUF
+        let num_attention_heads_gguf = md_get("smollm3.attention.head_count")?.to_u32()? as usize;
+        let num_kv_heads_gguf = md_get("smollm3.attention.head_count_kv")?.to_u32()? as usize;
+        let rope_freq_base_gguf = md_get("smollm3.rope.freq_base")?.to_f32()? as f64;
+
+        // WORKAROUND: Some GGUF files (e.g., unsloth) have incorrect metadata
+        // SmolLM3-3B should have: 36 heads, 9 KV heads, rope_theta=500000
+        // If metadata looks wrong, use correct hardcoded values
+        let metadata_looks_correct =
+            num_attention_heads_gguf == 36 &&
+            num_kv_heads_gguf == 9 &&
+            (rope_freq_base_gguf - 500000.0).abs() < 1.0;
+
+        let (num_attention_heads, num_kv_heads, rope_freq_base) = if !metadata_looks_correct {
+            println!("⚠ WARNING: GGUF metadata appears incorrect!");
+            println!("  GGUF says: {} heads, {} KV heads, rope_theta={}",
+                num_attention_heads_gguf, num_kv_heads_gguf, rope_freq_base_gguf);
+            println!("  Using correct SmolLM3-3B values: 36 heads, 9 KV heads, rope_theta=500000");
+            (36, 9, 500000.0)
+        } else {
+            (num_attention_heads_gguf, num_kv_heads_gguf, rope_freq_base_gguf)
+        };
+
         let head_dim = md_get("smollm3.rope.dimension_count")?.to_u32()? as usize; // head_dim = rope.dimension_count
         let num_layers = md_get("smollm3.block_count")?.to_u32()? as usize;
         let hidden_size = md_get("smollm3.embedding_length")?.to_u32()? as usize;
         let max_position_embeddings = md_get("smollm3.context_length")?.to_u32()? as usize;
         let rms_norm_eps = md_get("smollm3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base = md_get("smollm3.rope.freq_base")?.to_f32()? as f64;
 
         // SmolLM3: NoPE configuration - not in GGUF metadata, so we hardcode interval=4
         // Based on SmolLM3 paper: every 4th layer skips RoPE
