@@ -36,14 +36,31 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns true if this layer should skip RoPE (use NoPE)
+    /// Returns true if this layer should skip RoPE (use NoPE).
+    ///
+    /// SmolLM3 uses a hybrid approach where some layers skip rotary positional
+    /// embeddings for better long-context performance.
+    ///
+    /// Configuration can specify this in two ways:
+    /// 1. Explicit array (`no_rope_layers`): 1 = skip RoPE, 0 = use RoPE
+    /// 2. Interval pattern (`no_rope_layer_interval`): Every Nth layer skips RoPE
+    ///    e.g., interval=4 means layers 3,7,11,15... skip RoPE (75% use RoPE, 25% NoPE)
     pub fn should_skip_rope(&self, layer_idx: usize) -> bool {
+        // Method 1: Explicit array (some model variants may provide this)
         if let Some(ref no_rope_layers) = self.no_rope_layers {
-            // Check the array - 1 means skip RoPE, 0 means use RoPE
             if layer_idx < no_rope_layers.len() {
                 return no_rope_layers[layer_idx] == 1;
             }
         }
+
+        // Method 2: Interval pattern (SmolLM3-3B uses this)
+        // With interval=4: layers 0,1,2 use RoPE; layer 3 skips RoPE (NoPE)
+        // Pattern: every 4th layer (3,7,11...) skips RoPE
+        if let Some(interval) = self.no_rope_layer_interval {
+            return (layer_idx + 1) % interval == 0;
+        }
+
+        // Default: use RoPE on all layers (standard Llama behavior)
         false
     }
 
@@ -234,8 +251,8 @@ impl SmolLM3Attention {
 
         // 3. RoPE - only apply if this layer should use RoPE (not NoPE)
         let (q, k) = if self.skip_rope {
-            // NoPE: Skip rotary embeddings
-            (q, k)
+            // NoPE: Skip rotary embeddings, but ensure tensors are contiguous
+            (q.contiguous()?, k.contiguous()?)
         } else {
             // Apply RoPE
             if let Some(ref rope) = self.rotary_emb {

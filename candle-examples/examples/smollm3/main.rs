@@ -61,6 +61,7 @@ impl TextGeneration {
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        println!("Input token IDs: {:?}", tokens);
         for &t in tokens.iter() {
             if let Some(t) = self.tokenizer.next_token(t)? {
                 print!("{t}")
@@ -69,6 +70,7 @@ impl TextGeneration {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
+        let mut generated_token_ids = Vec::new();
 
         let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
@@ -92,6 +94,7 @@ impl TextGeneration {
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
+            generated_token_ids.push(next_token);
 
             // Check for EOS token
             if let Some(eos_id) = self.eos_token_id {
@@ -111,9 +114,11 @@ impl TextGeneration {
         }
         std::io::stdout().flush()?;
         println!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
+            "\n\n{} tokens generated ({:.2} token/s)",
+            generated_tokens,
             generated_tokens as f64 / dt.as_secs_f64(),
         );
+        println!("Generated token IDs: {:?}", generated_token_ids);
         Ok(())
     }
 }
@@ -181,6 +186,10 @@ struct Args {
 
     #[arg(long, default_value = "3b")]
     model: WhichModel,
+
+    /// Data type to use (f32, f16, bf16, or auto)
+    #[arg(long, default_value = "auto")]
+    dtype: String,
 }
 
 fn main() -> Result<()> {
@@ -246,21 +255,42 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let config_file = repo.get("config.json")?;
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.is_cuda() || device.is_metal() {
-        DType::BF16
-    } else {
-        DType::F32
+
+    let dtype = match args.dtype.as_str() {
+        "f16" => DType::F16,
+        "bf16" => DType::BF16,
+        "f32" => DType::F32,
+        "auto" => {
+            if device.is_cuda() || device.is_metal() {
+                DType::BF16
+            } else {
+                DType::F32
+            }
+        }
+        other => anyhow::bail!("Unsupported dtype: {}, use f16, bf16, f32, or auto", other),
     };
+
+    println!("Using dtype: {:?}", dtype);
+
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let config: Config = serde_json::from_slice(&std::fs::read(config_file)?)?;
     let model = ModelForCausalLM::new(&config, vb)?;
 
     println!("loaded the model in {:?}", start.elapsed());
     println!("SmolLM3 Config:");
-    println!("  - {} layers with NoPE every {} layers",
-        config.num_hidden_layers,
-        config.no_rope_layer_interval.unwrap_or(0)
-    );
+
+    if let Some(interval) = config.no_rope_layer_interval {
+        // Every 4th layer uses NoPE, others use RoPE
+        let num_nope_layers = config.num_hidden_layers / interval;
+        let num_rope_layers = config.num_hidden_layers - num_nope_layers;
+        println!("  - {} layers total", config.num_hidden_layers);
+        println!("  - RoPE: {} layers ({}%)", num_rope_layers, num_rope_layers * 100 / config.num_hidden_layers);
+        println!("  - NoPE: {} layers ({}%)", num_nope_layers, num_nope_layers * 100 / config.num_hidden_layers);
+        println!("  - Pattern: NoPE on every {}th layer (indices 3, 7, 11, ...)", interval);
+    } else {
+        println!("  - {} layers with standard RoPE", config.num_hidden_layers);
+    }
+
     println!("  - GQA: {} attention heads, {} KV heads",
         config.num_attention_heads,
         config.num_key_value_heads

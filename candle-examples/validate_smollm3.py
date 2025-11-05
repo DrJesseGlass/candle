@@ -20,6 +20,7 @@ def generate_reference(
         top_p: float = 1.0,
         seed: int = 299792458,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        dtype: str = "auto",
 ):
     """Generate reference output using HuggingFace transformers."""
 
@@ -31,11 +32,25 @@ def generate_reference(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    # Determine dtype
+    if dtype == "auto":
+        torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    elif dtype == "f32":
+        torch_dtype = torch.float32
+    elif dtype == "bf16":
+        torch_dtype = torch.bfloat16
+    elif dtype == "f16":
+        torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+
+    print(f"Dtype: {torch_dtype}")
+
     # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        torch_dtype=torch_dtype,
         device_map=device,
     )
 
@@ -67,7 +82,7 @@ def generate_reference(
         else:
             # Sampling
             outputs = model.generate(
-                input_id,
+                input_ids,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
@@ -96,6 +111,8 @@ def generate_reference(
         "input_ids": input_ids[0].tolist(),
         "generated_ids": generated_ids.tolist(),
         "all_ids": outputs[0].tolist(),
+        "dtype": str(torch_dtype),
+        "device": device,
     }
 
 
@@ -162,10 +179,20 @@ def main():
                         help="Top-p sampling")
     parser.add_argument("--seed", type=int, default=299792458,
                         help="Random seed")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Force CPU inference (to match candle CPU)")
+    parser.add_argument("--dtype", choices=["auto", "f32", "bf16", "f16"], default="auto",
+                        help="Data type (auto, f32, bf16, f16)")
     parser.add_argument("--candle-output", type=str,
                         help="Path to candle output file (optional)")
 
     args = parser.parse_args()
+
+    # Determine device
+    if args.cpu:
+        device = "cpu"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Generate reference output
     result = generate_reference(
@@ -175,13 +202,19 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         seed=args.seed,
+        device=device,
+        dtype=args.dtype,
     )
 
     print("\n" + "=" * 80)
     print("INSTRUCTIONS FOR CANDLE")
     print("=" * 80)
+    print(f"\nPython configuration:")
+    print(f"  Device: {result['device']}")
+    print(f"  Dtype: {result['dtype']}")
     print("\nRun your candle implementation with these EXACT parameters:")
-    print(f"""
+    cpu_flag = "--cpu" if result['device'] == "cpu" else ""
+    command = f"""
 cargo run --release --example smollm3 -- \\
   --model 3b-base \\
   --prompt "{args.prompt}" \\
@@ -189,8 +222,9 @@ cargo run --release --example smollm3 -- \\
   --temperature {args.temperature} \\
   --top-p {args.top_p} \\
   --seed {args.seed} \\
-  --repeat-penalty 1.0
-""")
+  --repeat-penalty 1.0{" " + cpu_flag if cpu_flag else ""}
+"""
+    print(command)
 
     if args.temperature == 0.0:
         print("\nNOTE: Temperature is 0.0, so we're using greedy decoding.")
