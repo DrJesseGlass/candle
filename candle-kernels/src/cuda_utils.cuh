@@ -115,6 +115,39 @@ __device__ void chunk_sum(
     }
 }
 
+// atomicAdd for __half on compute capability < 7.0 (Pascal and older)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+__device__ __forceinline__ void atomicAdd(__half* address, __half val) {
+    unsigned int* address_as_uint = (unsigned int*)((char*)address - ((size_t)address & 2));
+    unsigned int old = *address_as_uint;
+    unsigned int assumed;
+
+    do {
+        assumed = old;
+        __half hsum;
+
+        // Extract the half value at our address
+        if ((size_t)address & 2) {
+            hsum = __ushort_as_half(old >> 16);
+        } else {
+            hsum = __ushort_as_half(old & 0xffff);
+        }
+
+        // Add the values
+        hsum = __hadd(hsum, val);
+
+        // Construct new value with updated half
+        if ((size_t)address & 2) {
+            old = (old & 0xffff) | (__half_as_ushort(hsum) << 16);
+        } else {
+            old = (old & 0xffff0000) | __half_as_ushort(hsum);
+        }
+
+        old = atomicCAS(address_as_uint, assumed, old);
+    } while (assumed != old);
+}
+#endif
+
 __device__ __forceinline__ bool isnang(float a) { return isnan(a); }
 __device__ __forceinline__ bool isnang(double a) { return isnan(a); }
 __device__ __forceinline__ float recipg(float a) { return 1.0 / a; }
