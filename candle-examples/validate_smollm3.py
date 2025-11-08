@@ -145,6 +145,13 @@ def generate_reference(
     print(f"\nGenerated only:\n{generated_text}")
     print(f"\nGenerated token IDs: {generated_ids.tolist()}")
     print(f"Number of tokens generated: {len(generated_ids)}")
+
+    # Print each token with its text
+    print(f"\nToken breakdown:")
+    for i, tok_id in enumerate(generated_ids.tolist()):
+        tok_text = tokenizer.decode([tok_id])
+        print(f"  {i:3d}: {tok_id:6d} -> {repr(tok_text)}")
+
     print("=" * 80)
 
     return {
@@ -303,6 +310,14 @@ cargo run --release --example smollm3 -- \\
     print("\nRust format for input tokens:")
     print(f"let tokens = vec![{', '.join(map(str, result['input_ids']))}];")
     print(f"\nExpected first generated token: {result['generated_ids'][0]}")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    # Add right after:
+    print("\nWith decoded text:")
+    for tok_id in result["generated_ids"]:
+        tok_text = tokenizer.decode([tok_id])
+        print(tok_text,end='')
+    #    print(f"{tok_id} -> {repr(tok_text)}")
 
     # If candle output provided, compare
     if args.candle_output:

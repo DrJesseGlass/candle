@@ -242,30 +242,44 @@ fn main() -> anyhow::Result<()> {
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
-    let mut prompt_str = args
+    let prompt_str = args
         .prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
-    // SmolLM3-3B uses chat template - can be disabled with --no-chat-template flag
+    // Don't apply any chat template manually - just use the raw prompt
+    // The GGUF tokenizer has its own embedded chat template
+    println!("Raw prompt: {}", &prompt_str);
 
+    let prompt_str = format!(
+        "<|im_start|>system\n\
+## Metadata\n\
+\n\
+Knowledge Cutoff Date: June 2025\n\
+Today Date: 05 November 2025\n\
+Reasoning Mode: /think\n\
+\n\
+## Custom Instructions\n\
+\n\
+You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
+\n\
+<|im_start|>user\n\
+{}<|im_end|>\n\
+<|im_start|>assistant\n\
+<think>\n\
+\n\
+</think>\n",
+        prompt_str
+    );
 
-    print!("Prompt: {}", &prompt_str);
-
+    // Encode WITHOUT adding special tokens or applying template
     let tokens = tos
         .tokenizer()
-        .encode(prompt_str, true)
+        .encode(prompt_str, false)  // false = don't add special tokens
         .map_err(anyhow::Error::msg)?;
 
     let tokens = tokens.get_ids();
-
-    //let mut tokens = vec![
-    //    128011, 9125, 198, 567, 34689, 271, 81434, 356, 28540, 2696, 25, 5651, 220, 2366, 20,
-    // //   198, 15724, 2696, 25, 220, 2304, 6841, 220, 2366, 20, 198, 26197, 287, 14904, 25, 611,
-    //    2201, 5978, 771, 271, 567, 8572, 39397, 271, 2675, 527, 264, 11190, 15592, 18328, 7086,
-    //    4487, 337, 11237, 11, 16572, 555, 473, 36368, 19109, 382, 128011, 882, 198, 2323, 128012,
-    // /   198, 128011, 78191, 198, 128002, 271, 128003, 198
-    //];
+    println!("Encoded {} tokens", tokens.len());
 
     let to_sample = args.sample_len.saturating_sub(1);
 
@@ -308,24 +322,24 @@ fn main() -> anyhow::Result<()> {
 
     all_tokens.push(next_token);
 
+    print!("Output: ");
     if let Some(t) = tos.next_token(next_token)? {
         print!("{t}");
         std::io::stdout().flush()?;
     }
 
-    // Get EOS token
+    // Get EOS token - SmolLM3 uses <|im_end|> for chat format
     let eos_token = if let Some(eos_id) = tos.tokenizer().get_vocab(true).get("<|im_end|>") {
         *eos_id
     } else if let Some(eos_id) = tos.tokenizer().get_vocab(true).get("<|endoftext|>") {
         *eos_id
     } else {
-        128001  // Default SmolLM3 EOS token
+        128012  // Default SmolLM3 EOS token (from GGUF metadata)
     };
 
     let start_post_prompt = std::time::Instant::now();
 
     let mut sampled = 0;
-    let mut generated_token_ids = Vec::new();
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
         let logits = model.forward(&input, tokens.len() + index)?;
@@ -342,7 +356,6 @@ fn main() -> anyhow::Result<()> {
         };
         next_token = logits_processor.sample(&logits)?;
         all_tokens.push(next_token);
-        generated_token_ids.push(next_token);
         if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
             std::io::stdout().flush()?;
@@ -368,6 +381,6 @@ fn main() -> anyhow::Result<()> {
         "{sampled:4} tokens generated: {:.2} token/s",
         sampled as f64 / dt.as_secs_f64(),
     );
-    println!("Generated token IDs: {:?}", generated_token_ids);
+
     Ok(())
 }
