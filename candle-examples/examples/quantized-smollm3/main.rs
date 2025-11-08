@@ -8,15 +8,15 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
-use candle::quantized::gguf_file;
 use candle::Tensor;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::smol::quantized_smollm3::ModelWeights as SmolLM3;
 
-// Note: Only SmolLM3-3B (chat-tuned) is available in GGUF format from unsloth.
-// The base model is not available as a quantized GGUF file.
+// Import your new quantized SmolLM3 implementation
+use candle_transformers::models::smol::quantized_smollm3;
+use candle_transformers::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
+
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
@@ -218,27 +218,25 @@ fn main() -> anyhow::Result<()> {
     );
 
     let model_path = args.model()?;
-    let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
     let device = candle_examples::device(false)?;
 
-    let mut model = {
-        let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
-        let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
-            let elem_count = tensor.shape.elem_count();
-            total_size_in_bytes +=
-                elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
-        }
-        println!(
-            "loaded {:?} tensors ({}) in {:.2}s",
-            model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
-            start.elapsed().as_secs_f32(),
-        );
-        SmolLM3::from_gguf(model, &mut file, &device)?
-    };
-    println!("model built");
+    // Load model using your new implementation - much simpler!
+    println!("Loading model from {:?}...", model_path);
+    let mut model = QuantizedModelForCausalLM::from_gguf(&model_path, &device)?;
+
+    println!(
+        "Model loaded in {:.2}s",
+        start.elapsed().as_secs_f32(),
+    );
+    println!("Model config:");
+    println!("  Vocab size: {}", model.config().vocab_size);
+    println!("  Hidden size: {}", model.config().hidden_size);
+    println!("  Num layers: {}", model.config().num_hidden_layers);
+    println!("  Num heads: {}", model.config().num_attention_heads);
+    println!("  Num KV heads: {}", model.config().num_key_value_heads);
+    println!("  Head dim: {}", model.config().head_dim());
+    println!("  RoPE theta: {:.0}", model.config().rope_theta);
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
@@ -247,12 +245,15 @@ fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
-    // Don't apply any chat template manually - just use the raw prompt
-    // The GGUF tokenizer has its own embedded chat template
     println!("Raw prompt: {}", &prompt_str);
 
-    let prompt_str = format!(
-        "<|im_start|>system\n\
+    let prompt_str = if args.no_chat_template {
+        // Use raw prompt without chat template
+        prompt_str
+    } else {
+        // Apply SmolLM3 chat template
+        format!(
+            "<|im_start|>system\n\
 ## Metadata\n\
 \n\
 Knowledge Cutoff Date: June 2025\n\
@@ -269,20 +270,20 @@ You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
 <think>\n\
 \n\
 </think>\n",
-        prompt_str
-    );
+            prompt_str
+        )
+    };
 
-    // Encode WITHOUT adding special tokens or applying template
+    // Encode without adding special tokens (they're already in the template)
     let tokens = tos
         .tokenizer()
-        .encode(prompt_str, false)  // false = don't add special tokens
+        .encode(prompt_str, false)
         .map_err(anyhow::Error::msg)?;
 
     let tokens = tokens.get_ids();
     println!("Encoded {} tokens", tokens.len());
 
     let to_sample = args.sample_len.saturating_sub(1);
-
     let mut all_tokens = vec![];
 
     let mut logits_processor = {
@@ -303,16 +304,18 @@ You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
     let start_prompt_processing = std::time::Instant::now();
 
     let mut next_token = if !args.split_prompt {
+        // Process entire prompt at once (recommended)
         let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
         let logits = model.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?;
+        let logits = logits.squeeze(0)?.squeeze(0)?;
         logits_processor.sample(&logits)?
     } else {
+        // Process prompt token by token (slower, for debugging)
         let mut next_token = 0;
         for (pos, token) in tokens.iter().enumerate() {
             let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, pos)?;
-            let logits = logits.squeeze(0)?;
+            let logits = logits.squeeze(0)?.squeeze(0)?;
             next_token = logits_processor.sample(&logits)?
         }
         next_token
@@ -334,7 +337,7 @@ You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
     } else if let Some(eos_id) = tos.tokenizer().get_vocab(true).get("<|endoftext|>") {
         *eos_id
     } else {
-        128012  // Default SmolLM3 EOS token (from GGUF metadata)
+        128012  // Default SmolLM3 EOS token (from GGUF metadata: tokenizer.ggml.eos_token_id)
     };
 
     let start_post_prompt = std::time::Instant::now();
@@ -343,7 +346,8 @@ You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
         let logits = model.forward(&input, tokens.len() + index)?;
-        let logits = logits.squeeze(0)?;
+        let logits = logits.squeeze(0)?.squeeze(0)?;
+
         let logits = if args.repeat_penalty == 1. {
             logits
         } else {
@@ -354,12 +358,15 @@ You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\
                 &all_tokens[start_at..],
             )?
         };
+
         next_token = logits_processor.sample(&logits)?;
         all_tokens.push(next_token);
+
         if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
             std::io::stdout().flush()?;
         }
+
         sampled += 1;
         if next_token == eos_token {
             break;
