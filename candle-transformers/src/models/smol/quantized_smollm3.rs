@@ -1,18 +1,13 @@
-//! SmolLM3 implementation with quantization support.
+//! SmolLM3 quantized implementation - FIXED VERSION
 //!
-//! Based on the SmolLM3 architecture with NoPE (No Positional Encoding) support.
-//! Implemented with quantized weights for reduced memory usage and faster inference.
-//!
-//! Key features:
-//! - Hybrid RoPE/NoPE: Every 4th layer skips rotary positional embeddings
-//! - Grouped Query Attention (GQA)
-//! - Optimized for long-context understanding
-//!
-//! References:
-//! - [SmolLM3 Models](https://huggingface.co/HuggingFaceTB/SmolLM3-3B)
-//!
+//! Key fixes:
+//! - Removed Q/K norm completely (SmolLM3 doesn't have it)
+//! - Better metadata key handling
+//! - Added debugging for NoPE layers
+//! - Improved error messages
+
 use crate::models::with_tracing::QMatMul;
-use crate::quantized_nn::RmsNorm;  // quantized_nn is at crate root, not in models
+use crate::quantized_nn::RmsNorm;
 use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Tensor};
@@ -107,18 +102,19 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        // Always compute in F32 for precision, then convert (like non-quantized)
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            // Compute sin/cos in F32, then convert to target dtype
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
         })
     }
 
-    /// Apply RoPE (q, k shape: B x H x L x D)
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
@@ -135,12 +131,11 @@ struct AttentionWeights {
     k_proj: QMatMul,
     v_proj: QMatMul,
     o_proj: QMatMul,
-    q_norm: Option<RmsNorm>,  // Optional: not all models have this
-    k_norm: Option<RmsNorm>,  // Optional: not all models have this
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    hidden_size: usize,  // Added: necessary for correct output projection
     rotary_emb: Option<Arc<RotaryEmbedding>>,
     kv_cache: KvCache,
     skip_rope: bool,  // SmolLM3: NoPE support
@@ -153,7 +148,6 @@ impl AttentionWeights {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        rms_norm_eps: f64,
         rotary_emb: Option<Arc<RotaryEmbedding>>,
         skip_rope: bool,
         prefix: &str,
@@ -165,27 +159,22 @@ impl AttentionWeights {
         let v_proj = gg.qmatmul(&format!("{prefix}.attn_v.weight"))?;
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
 
-        // Q/K normalization is optional - some models don't have it
-        let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps).ok();
-        let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps).ok();
-
-        // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
-        // The cache will grow in chunks of 512 tokens when needed.
         let kv_cache = KvCache::new(2, 512);
-
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
+
+        // Calculate hidden_size from attention heads (same as non-quantized version)
+        let hidden_size = head_dim * num_heads;
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-            q_norm,
-            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups,
             head_dim,
+            hidden_size,
             rotary_emb,
             kv_cache,
             skip_rope,
@@ -197,10 +186,12 @@ impl AttentionWeights {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
 
+        // 1. Project Q, K, V
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
+        // 2. Reshape to (B, H, L, D)
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -211,24 +202,9 @@ impl AttentionWeights {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply Q/K normalization if available - only flatten if needed
-        let (q, k) = if let (Some(ref q_norm), Some(ref k_norm)) = (&self.q_norm, &self.k_norm) {
-            // Only flatten when we need to apply normalization
-            let q_flat = q.flatten(0, 2)?;
-            let k_flat = k.flatten(0, 2)?;
-            let q_normed = q_norm.forward(&q_flat)?;
-            let k_normed = k_norm.forward(&k_flat)?;
-            let q = q_normed.reshape((b, self.num_heads, l, self.head_dim))?;
-            let k = k_normed.reshape((b, self.num_kv_heads, l, self.head_dim))?;
-            (q, k)
-        } else {
-            // No normalization - use tensors directly without extra operations
-            (q, k)
-        };
-
-        // SmolLM3: Conditionally apply RoPE based on NoPE pattern
+        // 3. SmolLM3: Conditionally apply RoPE (NO Q/K NORM)
         let (q, k) = if self.skip_rope {
-            // NoPE: Skip rotary embeddings, but ensure tensors are contiguous
+            // NoPE: Skip rotary embeddings
             (q.contiguous()?, k.contiguous()?)
         } else {
             // Apply RoPE
@@ -239,37 +215,34 @@ impl AttentionWeights {
             }
         };
 
-        // Reset KV cache if we're at the first position
+        // 4. Update KV cache
         if offset == 0 {
             self.kv_cache.reset();
         }
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
-        // Make tensor contiguous to avoid some strided copies
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
+        // 5. Repeat KV for GQA
+        let k = repeat_kv(k, self.num_kv_groups)?;
+        let v = repeat_kv(v, self.num_kv_groups)?;
 
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
+        // 6. Attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            let m_dtype = m.dtype();
-            let scores_dtype = scores.dtype();
-            let mask = if m_dtype != scores_dtype {
-                m.to_dtype(scores_dtype)?
-            } else {
-                m.clone()
-            };
-            scores = scores.broadcast_add(&mask)?;
+            scores = scores.broadcast_add(m)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
-        let reshaped_ctx = ctx
-            .transpose(1, 2)?
-            .reshape((b, l, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&reshaped_ctx)
+        let ctx = probs.matmul(&v)?;
+
+        // 7. Output projection
+        // CRITICAL: ensure tensor is contiguous before reshape
+        let ctx_transposed = ctx.transpose(1, 2)?;
+        let ctx_reshaped = ctx_transposed.contiguous()?.reshape((b, l, self.hidden_size))?;
+        ctx_reshaped.apply(&self.o_proj)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache.reset();
     }
 }
 
@@ -299,7 +272,6 @@ impl LayerWeights {
 
         // SmolLM3: Determine if this layer should skip RoPE (NoPE)
         let skip_rope = if let Some(interval) = no_rope_layer_interval {
-            // Every Nth layer (3,7,11...) skips RoPE
             (layer_idx + 1) % interval == 0
         } else {
             false
@@ -310,12 +282,12 @@ impl LayerWeights {
             num_attention_heads,
             num_key_value_heads,
             head_dim,
-            rms_norm_eps,
             rotary,
             skip_rope,
             &prefix,
         )?;
         let mlp = MlpWeights::new(gg, &prefix)?;
+
         Ok(Self {
             self_attn,
             mlp,
@@ -331,6 +303,10 @@ impl LayerWeights {
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
         x.add(&h2)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -354,62 +330,84 @@ impl ModelWeights {
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
 
+        // Try different metadata key formats
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 
-        // Read metadata from GGUF
-        let num_attention_heads_gguf = md_get("smollm3.attention.head_count")?.to_u32()? as usize;
-        let num_kv_heads_gguf = md_get("smollm3.attention.head_count_kv")?.to_u32()? as usize;
-        let rope_freq_base_gguf = md_get("smollm3.rope.freq_base")?.to_f32()? as f64;
-
-        // WORKAROUND: Some GGUF files (e.g., unsloth) have incorrect metadata
-        // SmolLM3-3B should have: 36 heads, 9 KV heads, rope_theta=500000
-        // If metadata looks wrong, use correct hardcoded values
-        let metadata_looks_correct =
-            num_attention_heads_gguf == 36 &&
-            num_kv_heads_gguf == 9 &&
-            (rope_freq_base_gguf - 500000.0).abs() < 1.0;
-
-        let (num_attention_heads, num_kv_heads, rope_freq_base) = if !metadata_looks_correct {
-            println!("⚠ WARNING: GGUF metadata appears incorrect!");
-            println!("  GGUF says: {} heads, {} KV heads, rope_theta={}",
-                num_attention_heads_gguf, num_kv_heads_gguf, rope_freq_base_gguf);
-            println!("  Using correct SmolLM3-3B values: 36 heads, 9 KV heads, rope_theta=500000");
-            (36, 9, 500000.0)
-        } else {
-            (num_attention_heads_gguf, num_kv_heads_gguf, rope_freq_base_gguf)
-        };
-
-        let head_dim = md_get("smollm3.rope.dimension_count")?.to_u32()? as usize; // head_dim = rope.dimension_count
-        let num_layers = md_get("smollm3.block_count")?.to_u32()? as usize;
-        let hidden_size = md_get("smollm3.embedding_length")?.to_u32()? as usize;
-        let max_position_embeddings = md_get("smollm3.context_length")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("smollm3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-
-        // SmolLM3: NoPE configuration - not in GGUF metadata, so we hardcode interval=4
-        // Based on SmolLM3 paper: every 4th layer skips RoPE
-        let no_rope_layer_interval = Some(4);
-
-        println!("SmolLM3 Config:");
-        println!("  - {} layers total", num_layers);
-        if let Some(interval) = no_rope_layer_interval {
-            let num_nope_layers = num_layers / interval;
-            let num_rope_layers = num_layers - num_nope_layers;
-            println!("  - RoPE: {} layers ({}%)", num_rope_layers, num_rope_layers * 100 / num_layers);
-            println!("  - NoPE: {} layers ({}%)", num_nope_layers, num_nope_layers * 100 / num_layers);
-            println!("  - Pattern: NoPE on every {}th layer", interval);
+        // Debug: Print all metadata keys
+        println!("Available metadata keys:");
+        for key in gg.metadata().keys() {
+            println!("  - {}", key);
         }
-        println!("  - GQA: {} attention heads, {} KV heads", num_attention_heads, num_kv_heads);
-        println!("  - rope_theta: {}", rope_freq_base);
 
-        // Check if Q/K normalization tensors exist (they may not in some quantized models)
-        let has_qk_norm = gg.metadata().keys().any(|k| k.contains("attn_q_norm"));
-        if has_qk_norm {
-            println!("  - Q/K normalization: enabled");
-        } else {
-            println!("  - Q/K normalization: not present (using standard attention)");
+        // Try to read metadata with fallbacks for different GGUF formats
+        let num_attention_heads = md_get("smollm3.attention.head_count")
+            .or_else(|_| md_get("llama.attention.head_count"))
+            .or_else(|_| md_get("attention.head_count"))?
+            .to_u32()? as usize;
+
+        let num_kv_heads = md_get("smollm3.attention.head_count_kv")
+            .or_else(|_| md_get("llama.attention.head_count_kv"))
+            .or_else(|_| md_get("attention.head_count_kv"))?
+            .to_u32()? as usize;
+
+        let rope_freq_base = md_get("smollm3.rope.freq_base")
+            .or_else(|_| md_get("llama.rope.freq_base"))
+            .or_else(|_| md_get("rope.freq_base"))?
+            .to_f32()? as f64;
+
+        let head_dim = md_get("smollm3.rope.dimension_count")
+            .or_else(|_| md_get("llama.rope.dimension_count"))
+            .or_else(|_| md_get("rope.dimension_count"))?
+            .to_u32()? as usize;
+
+        let num_layers = md_get("smollm3.block_count")
+            .or_else(|_| md_get("llama.block_count"))
+            .or_else(|_| md_get("block_count"))?
+            .to_u32()? as usize;
+
+        let hidden_size = md_get("smollm3.embedding_length")
+            .or_else(|_| md_get("llama.embedding_length"))
+            .or_else(|_| md_get("embedding_length"))?
+            .to_u32()? as usize;
+
+        let max_position_embeddings = md_get("smollm3.context_length")
+            .or_else(|_| md_get("llama.context_length"))
+            .or_else(|_| md_get("context_length"))?
+            .to_u32()? as usize;
+
+        let rms_norm_eps = md_get("smollm3.attention.layer_norm_rms_epsilon")
+            .or_else(|_| md_get("llama.attention.layer_norm_rms_epsilon"))
+            .or_else(|_| md_get("attention.layer_norm_rms_epsilon"))?
+            .to_f32()? as f64;
+
+        // SmolLM3: Try to read NoPE interval from metadata, fallback to 4
+        let no_rope_layer_interval = md_get("smollm3.no_rope_layer_interval")
+            .or_else(|_| md_get("llama.no_rope_layer_interval"))
+            .ok()
+            .and_then(|v| v.to_u32().ok())
+            .map(|v| v as usize)
+            .or(Some(4)); // Default to 4 for SmolLM3-3B
+
+        println!("\n=== SmolLM3 Configuration ===");
+        println!("Layers: {}", num_layers);
+        println!("Attention heads: {} (KV heads: {})", num_attention_heads, num_kv_heads);
+        println!("Head dim: {}", head_dim);
+        println!("Hidden size: {}", hidden_size);
+        println!("RoPE theta: {}", rope_freq_base);
+        println!("Max position: {}", max_position_embeddings);
+
+        if let Some(interval) = no_rope_layer_interval {
+            let nope_layers: Vec<_> = (0..num_layers)
+                .filter(|&i| (i + 1) % interval == 0)
+                .collect();
+            println!("\n=== NoPE Configuration ===");
+            println!("Interval: every {}th layer skips RoPE", interval);
+            println!("NoPE layers: {:?}", nope_layers);
+            println!("Total: {} RoPE layers, {} NoPE layers",
+                num_layers - nope_layers.len(), nope_layers.len());
         }
 
         let dtype = match gg.metadata().get("general.dtype") {
@@ -422,11 +420,21 @@ impl ModelWeights {
         };
 
         let embed_tensor = gg.tensor("token_embd.weight")?;
+        let embed_shape = embed_tensor.shape();
+        println!("GGUF token_embd.weight shape: {:?}", embed_shape);
+
+        let dequantized = embed_tensor.dequantize(device)?;
+        println!("Dequantized embedding shape: {:?}", dequantized.shape());
+
+        // Check a few actual values
+        let embed_flat = dequantized.flatten_all()?.to_vec1::<f32>()?;
+        println!("First 10 embedding values: {:?}", &embed_flat[0..10]);
+        println!("Values around token 12366 (Paris): {:?}",
+                 &embed_flat[12366*2048..12366*2048+10]);
         let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
 
         // Only create rotary embedding if at least one layer uses RoPE
         let needs_rope = if let Some(interval) = no_rope_layer_interval {
-            // At least one layer should use RoPE
             (0..num_layers).any(|i| (i + 1) % interval != 0)
         } else {
             true
@@ -458,15 +466,22 @@ impl ModelWeights {
             )?);
         }
 
+        println!("model built");
+
+        // NOW ADD THESE LINES:
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
+
+
+        // Add debug
+        let embed_tensor_debug = gg.tensor("token_embd.weight")?;
+        println!("GGUF token_embd.weight shape: {:?}", embed_tensor_debug.shape());
+
         // SmolLM3 uses tied embeddings
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
-        };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+        let lm_head = QMatMul::from_weights(embed_tensor.into())?;
+
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -485,6 +500,7 @@ impl ModelWeights {
         tgt: usize,
         offset: usize,
         sw: Option<usize>,
+        dtype: DType,  // Use actual tensor dtype instead of self.dtype
     ) -> Result<Tensor> {
         let minf = f32::NEG_INFINITY;
         let mask: Vec<_> = (0..tgt)
@@ -503,24 +519,74 @@ impl ModelWeights {
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
+
+        // DEBUG: Print input info
+        if offset <= 5 {
+            println!("\n=== Forward pass offset={} ===", offset);
+            println!("Input shape: {:?}", input.shape());
+            if l == 1 {
+                let token_id = input.to_vec2::<u32>()?[0][0];
+                println!("Processing single token: {}", token_id);
+            }
+        }
+
         let mut h = self.embed_tokens.forward(input)?;
+
+        if offset <= 5 {
+            let h_stats = h.flatten_all()?.to_vec1::<f32>()?;
+            let h_mean: f32 = h_stats.iter().sum::<f32>() / h_stats.len() as f32;
+            println!("After embeddings - mean: {:.6}", h_mean);
+        }
+
         let causal_mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            Some(self.causal_mask(b, l, offset, None, h.dtype())?)
         };
-        for layer in &mut self.layers {
+
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
+            if offset <= 5 && idx % 10 == 0 {
+                let h_stats = h.flatten_all()?.to_vec1::<f32>()?;
+                let h_mean: f32 = h_stats.iter().sum::<f32>() / h_stats.len() as f32;
+                println!("After layer {} - mean: {:.6}", idx, h_mean);
+            }
         }
+
         let h = self.norm.forward(&h)?;
+
+        if offset <= 5 {
+            let h_stats = h.flatten_all()?.to_vec1::<f32>()?;
+            let h_mean: f32 = h_stats.iter().sum::<f32>() / h_stats.len() as f32;
+            println!("After norm - mean: {:.6}", h_mean);
+        }
+
         let _enter = self.span_output.enter();
         let last_hidden = h.narrow(1, l - 1, 1)?;
-        self.lm_head.forward(&last_hidden)?.squeeze(1)
+        let logits = self.lm_head.forward(&last_hidden)?.squeeze(1)?;
+
+        if offset <= 5 {
+            let logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+            let mut indexed: Vec<_> = logits_vec.iter().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+            println!("Top 3 logits:");
+            for (idx, val) in indexed.iter().take(3) {
+                println!("  Token {}: {:.4}", idx, val);
+            }
+        }
+
+        Ok(logits)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
+        }
     }
 }

@@ -41,8 +41,8 @@ impl Config {
         // Method 1: Explicit array (some model variants may provide this)
         if let Some(ref no_rope_layers) = self.no_rope_layers {
             if layer_idx < no_rope_layers.len() {
-                // FIXED: 0 = skip RoPE (NoPE), 1 = use RoPE
-                return no_rope_layers[layer_idx] == 0;  // ← Changed from == 1 to == 0
+                // 0 = skip RoPE (NoPE), 1 = use RoPE
+                return no_rope_layers[layer_idx] == 0;
             }
         }
 
@@ -281,7 +281,7 @@ impl SmolLM3Attention {
             .apply(&self.o_proj)
     }
 
-    pub(crate) fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
 }
@@ -326,16 +326,16 @@ impl DecoderLayer {
         x + h2
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    pub(crate) embed_tokens: candle_nn::Embedding,
+    pub(crate) layers: Vec<DecoderLayer>,
+    pub(crate) norm: RmsNorm,
     device: Device,
     dtype: DType,
 }
@@ -367,7 +367,7 @@ impl Model {
         })
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }

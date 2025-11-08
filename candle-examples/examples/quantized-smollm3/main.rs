@@ -242,13 +242,12 @@ fn main() -> anyhow::Result<()> {
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
-    let prompt_str = args
+    let mut prompt_str = args
         .prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
-    // SmolLM3-3B uses chat template with /no_think to disable extended thinking mode
-    let prompt_str = format!("<|im_start|>system\n/no_think<|im_end|>\n<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
+    // SmolLM3-3B uses chat template - can be disabled with --no-chat-template flag
 
 
     print!("Prompt: {}", &prompt_str);
