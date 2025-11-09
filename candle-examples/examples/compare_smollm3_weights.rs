@@ -1,4 +1,4 @@
-// Specifically debug LM_HEAD / output layer
+// Comprehensive diagnostic - find EXACTLY where and why outputs diverge
 // Place in: candle-examples/examples/compare_smollm3_weights.rs
 
 use anyhow::Result;
@@ -15,6 +15,67 @@ struct Args {
     regular: String,
     #[arg(long)]
     quantized: String,
+}
+
+fn detailed_comparison(name: &str, t1: &Tensor, t2: &Tensor) -> Result<()> {
+    let t1 = t1.to_dtype(DType::F32)?;
+    let t2 = t2.to_dtype(DType::F32)?;
+
+    if t1.dims() != t2.dims() {
+        println!("❌ {} - SHAPE MISMATCH: {:?} vs {:?}", name, t1.dims(), t2.dims());
+        return Ok(());
+    }
+
+    let diff = (&t1 - &t2)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    let min_diff: f32 = diff.flatten_all()?.min(0)?.to_scalar()?;
+    let avg_diff: f32 = diff.flatten_all()?.mean(0)?.to_scalar()?;
+
+    // Get actual values
+    let t1_flat: Vec<f32> = t1.flatten_all()?.to_vec1()?;
+    let t2_flat: Vec<f32> = t2.flatten_all()?.to_vec1()?;
+
+    let t1_mean: f32 = t1_flat.iter().sum::<f32>() / t1_flat.len() as f32;
+    let t2_mean: f32 = t2_flat.iter().sum::<f32>() / t2_flat.len() as f32;
+    let t1_std: f32 = (t1_flat.iter().map(|&x| (x - t1_mean).powi(2)).sum::<f32>() / t1_flat.len() as f32).sqrt();
+    let t2_std: f32 = (t2_flat.iter().map(|&x| (x - t2_mean).powi(2)).sum::<f32>() / t2_flat.len() as f32).sqrt();
+
+    println!("\n=== {} ===", name);
+    println!("Shape: {:?}", t1.dims());
+    println!("Regular:   mean={:.6} std={:.6} min={:.6} max={:.6}",
+             t1_mean, t1_std, t1_flat.iter().copied().fold(f32::INFINITY, f32::min),
+             t1_flat.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+    println!("Quantized: mean={:.6} std={:.6} min={:.6} max={:.6}",
+             t2_mean, t2_std, t2_flat.iter().copied().fold(f32::INFINITY, f32::min),
+             t2_flat.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+    println!("Difference: min={:.6} avg={:.6} max={:.6}", min_diff, avg_diff, max_diff);
+
+    // Check if means/stds are very different (suggests systematic error)
+    let mean_ratio = (t1_mean - t2_mean).abs() / t1_mean.abs().max(0.0001);
+    let std_ratio = (t1_std - t2_std).abs() / t1_std.max(0.0001);
+
+    if mean_ratio > 0.01 {
+        println!("⚠️  MEAN MISMATCH: {:.2}% difference", mean_ratio * 100.0);
+    }
+    if std_ratio > 0.1 {
+        println!("⚠️  STD MISMATCH: {:.2}% difference", std_ratio * 100.0);
+    }
+
+    // Sample values from different regions
+    let n = t1_flat.len();
+    let indices = [0, n/4, n/2, 3*n/4, n-1];
+    print!("Sample values (regular):   ");
+    for &i in &indices {
+        print!("{:.6} ", t1_flat[i]);
+    }
+    println!();
+    print!("Sample values (quantized): ");
+    for &i in &indices {
+        print!("{:.6} ", t2_flat[i]);
+    }
+    println!();
+
+    Ok(())
 }
 
 fn load_safetensors(paths: &[PathBuf], device: &Device) -> Result<HashMap<String, Tensor>> {
@@ -51,124 +112,89 @@ fn main() -> Result<()> {
     };
 
     let regular_tensors = load_safetensors(&safetensors_files, &device)?;
+    println!("✅ Loaded {} tensors from regular model", regular_tensors.len());
 
     let mut file = File::open(&args.quantized)?;
     let gguf = gguf_file::Content::read(&mut file)?;
+    println!("✅ Loaded GGUF file with {} tensors", gguf.tensor_infos.len());
 
-    println!("=== SEARCHING FOR OUTPUT/LM_HEAD LAYER ===\n");
+    println!("\n{}", "=".repeat(80));
+    println!("CRITICAL LAYERS ANALYSIS");
+    println!("{}", "=".repeat(80));
 
-    // Search for lm_head in regular model
-    println!("Looking for lm_head in regular model:");
-    let lm_head_candidates = ["lm_head.weight", "lm_head", "output.weight", "model.lm_head.weight"];
-    let mut found_regular = None;
-
-    for candidate in lm_head_candidates {
-        if let Some(tensor) = regular_tensors.get(candidate) {
-            println!("  ✅ Found '{}' - shape: {:?}", candidate, tensor.dims());
-            found_regular = Some((candidate, tensor));
-            break;
-        } else {
-            println!("  ❌ Not found: '{}'", candidate);
+    // 1. Embeddings - absolutely critical
+    if let Some(reg_emb) = regular_tensors.get("model.embed_tokens.weight") {
+        if let Ok(quant_emb) = gguf.tensor(&mut file, "token_embd.weight", &device) {
+            let quant_emb_dq = quant_emb.dequantize(&device)?;
+            detailed_comparison("EMBEDDINGS", reg_emb, &quant_emb_dq)?;
         }
     }
 
-    // List all tensors with "lm" or "output" or "head" in name
-    println!("\nAll tensors in regular model containing 'lm', 'output', or 'head':");
-    for (name, tensor) in regular_tensors.iter() {
-        if name.to_lowercase().contains("lm") ||
-           name.to_lowercase().contains("output") ||
-           name.to_lowercase().contains("head") {
-            println!("  - {} : {:?}", name, tensor.dims());
+    // 2. Layer 0 norms - should be exact or near-exact
+    if let Some(reg_norm) = regular_tensors.get("model.layers.0.input_layernorm.weight") {
+        if let Ok(quant_norm) = gguf.tensor(&mut file, "blk.0.attn_norm.weight", &device) {
+            let quant_norm_dq = quant_norm.dequantize(&device)?;
+            detailed_comparison("LAYER 0 INPUT NORM", reg_norm, &quant_norm_dq)?;
         }
     }
 
-    // Search for output in GGUF
-    println!("\nLooking for output layer in GGUF:");
-    let gguf_candidates = ["output.weight", "lm_head.weight", "output_weight", "token_embd.weight"];
-    let mut found_gguf = None;
+    // 3. Attention weights - Q, K, V, O
+    let attn_weights = [
+        ("Q_PROJ", "model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
+        ("K_PROJ", "model.layers.0.self_attn.k_proj.weight", "blk.0.attn_k.weight"),
+        ("V_PROJ", "model.layers.0.self_attn.v_proj.weight", "blk.0.attn_v.weight"),
+        ("O_PROJ", "model.layers.0.self_attn.o_proj.weight", "blk.0.attn_output.weight"),
+    ];
 
-    for candidate in gguf_candidates {
-        match gguf.tensor(&mut file, candidate, &device) {
-            Ok(tensor) => {
-                let tensor_dq = tensor.dequantize(&device)?;
-                println!("  ✅ Found '{}' - shape: {:?}", candidate, tensor_dq.dims());
-                found_gguf = Some((candidate, tensor_dq));
-                break;
-            }
-            Err(_) => {
-                println!("  ❌ Not found: '{}'", candidate);
+    for (name, reg_key, quant_key) in attn_weights {
+        if let Some(reg_w) = regular_tensors.get(reg_key) {
+            if let Ok(quant_w) = gguf.tensor(&mut file, quant_key, &device) {
+                let quant_w_dq = quant_w.dequantize(&device)?;
+                detailed_comparison(&format!("LAYER 0 {}", name), reg_w, &quant_w_dq)?;
             }
         }
     }
 
-    // List all tensors in GGUF with "output" in name
-    println!("\nAll tensors in GGUF containing 'output':");
-    for (name, info) in gguf.tensor_infos.iter() {
-        if name.to_lowercase().contains("output") {
-            println!("  - {} : {:?}", name, info.shape);
-        }
-    }
+    // 4. MLP weights
+    let mlp_weights = [
+        ("GATE_PROJ", "model.layers.0.mlp.gate_proj.weight", "blk.0.ffn_gate.weight"),
+        ("UP_PROJ", "model.layers.0.mlp.up_proj.weight", "blk.0.ffn_up.weight"),
+        ("DOWN_PROJ", "model.layers.0.mlp.down_proj.weight", "blk.0.ffn_down.weight"),
+    ];
 
-    println!("\n=== COMPARISON ===\n");
-
-    if let Some((reg_name, reg_tensor)) = found_regular {
-        if let Some((gguf_name, gguf_tensor)) = found_gguf {
-            let reg_f32 = reg_tensor.to_dtype(DType::F32)?;
-            let gguf_f32 = gguf_tensor.to_dtype(DType::F32)?;
-
-            println!("Comparing:");
-            println!("  Regular: {} {:?}", reg_name, reg_f32.dims());
-            println!("  GGUF:    {} {:?}", gguf_name, gguf_f32.dims());
-
-            if reg_f32.dims() == gguf_f32.dims() {
-                let diff = (&reg_f32 - &gguf_f32)?.abs()?;
-                let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
-                let avg_diff: f32 = diff.flatten_all()?.mean(0)?.to_scalar()?;
-
-                let reg_vec: Vec<f32> = reg_f32.flatten_all()?.to_vec1()?;
-                let gguf_vec: Vec<f32> = gguf_f32.flatten_all()?.to_vec1()?;
-
-                let reg_mean: f32 = reg_vec.iter().sum::<f32>() / reg_vec.len() as f32;
-                let gguf_mean: f32 = gguf_vec.iter().sum::<f32>() / gguf_vec.len() as f32;
-
-                println!("\n  Regular mean:   {:.6}", reg_mean);
-                println!("  GGUF mean:      {:.6}", gguf_mean);
-                println!("  Avg difference: {:.6}", avg_diff);
-                println!("  Max difference: {:.6}", max_diff);
-
-                let n = reg_vec.len().min(10);
-                println!("\n  First 10 values:");
-                println!("    Regular: {:?}", &reg_vec[..n]);
-                println!("    GGUF:    {:?}", &gguf_vec[..n]);
-
-                if avg_diff > 0.01 {
-                    println!("\n  🚨 HIGH AVERAGE DIFFERENCE - This could cause wrong outputs!");
-                } else if max_diff > 0.1 {
-                    println!("\n  ⚠️  Some outliers but average is good");
-                } else {
-                    println!("\n  ✅ Excellent match!");
-                }
-
-                // Check if they're tied to embeddings
-                if let Some(embed) = regular_tensors.get("model.embed_tokens.weight") {
-                    let embed_f32 = embed.to_dtype(DType::F32)?;
-                    if embed_f32.dims() == reg_f32.dims() {
-                        let embed_diff = (&embed_f32 - &reg_f32)?.abs()?;
-                        let embed_avg: f32 = embed_diff.flatten_all()?.mean(0)?.to_scalar()?;
-                        if embed_avg < 0.0001 {
-                            println!("\n  📎 LM_HEAD is TIED to embeddings (weights are identical)");
-                        }
-                    }
-                }
-            } else {
-                println!("\n  ❌ SHAPE MISMATCH - tensors have different shapes!");
+    for (name, reg_key, quant_key) in mlp_weights {
+        if let Some(reg_w) = regular_tensors.get(reg_key) {
+            if let Ok(quant_w) = gguf.tensor(&mut file, quant_key, &device) {
+                let quant_w_dq = quant_w.dequantize(&device)?;
+                detailed_comparison(&format!("LAYER 0 {}", name), reg_w, &quant_w_dq)?;
             }
-        } else {
-            println!("❌ Could not find output layer in GGUF!");
         }
-    } else {
-        println!("❌ Could not find lm_head in regular model!");
     }
+
+    // 5. Final layer norm
+    if let Some(reg_norm) = regular_tensors.get("model.norm.weight") {
+        if let Ok(quant_norm) = gguf.tensor(&mut file, "output_norm.weight", &device) {
+            let quant_norm_dq = quant_norm.dequantize(&device)?;
+            detailed_comparison("FINAL NORM", reg_norm, &quant_norm_dq)?;
+        }
+    }
+
+    // 6. LM head - critical for output
+    if let Some(reg_lm) = regular_tensors.get("lm_head.weight") {
+        if let Ok(quant_lm) = gguf.tensor(&mut file, "output.weight", &device) {
+            let quant_lm_dq = quant_lm.dequantize(&device)?;
+            detailed_comparison("LM HEAD (OUTPUT)", reg_lm, &quant_lm_dq)?;
+        }
+    }
+
+    println!("\n{}", "=".repeat(80));
+    println!("DIAGNOSTIC SUMMARY");
+    println!("{}", "=".repeat(80));
+    println!("\nLook for:");
+    println!("  ⚠️  MEAN MISMATCH - suggests weights are scaled differently");
+    println!("  ⚠️  STD MISMATCH - suggests different value distributions");
+    println!("  Large max_diff but small avg_diff - normal Q8 outliers (OK)");
+    println!("  Large avg_diff - serious problem!");
 
     Ok(())
 }

@@ -3,7 +3,7 @@ use candle_nn::Activation;
 use candle::quantized::{gguf_file, QMatMul};
 use std::sync::Arc;
 use std::io::{Read, Seek};
-use candle_nn::Linear;
+use crate::models::with_tracing::Linear;
 
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -175,10 +175,10 @@ impl QuantizedMLP {
 
 #[derive(Debug, Clone)]
 struct QuantizedAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: Linear,  //QMatMul,
+    k_proj: Linear,  //QMatMul,
+    v_proj: Linear,  //QMatMul,
+    o_proj: Linear,  //QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -202,11 +202,40 @@ impl QuantizedAttention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
 
+         let q_weight = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
+            .dequantize(device)?
+            //.t()?                // Transpose first
+            .contiguous()?;      // Then make contiguous
+
+        println!("q_weight shape: {:?}", q_weight.dims());
+        let q_weight_vals: Vec<f32> = q_weight.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
+        println!("q_weight first 10: {:?}", q_weight_vals);
+
+        let k_weight = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
+            .dequantize(device)?
+            .contiguous()?;
+        let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
+            .dequantize(device)?
+            .contiguous()?;
+        let o_weight = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?
+            .dequantize(device)?
+            .t()?
+            .contiguous()?;
+
+        let q_proj = Linear::from_weights(q_weight, None);  // Will use with_tracing::Linear
+        let k_proj = Linear::from_weights(k_weight, None);
+        let v_proj = Linear::from_weights(v_weight, None);
+        let o_proj = Linear::from_weights(o_weight, None);
+
         Ok(Self {
-            q_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?,
-            k_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?,
-            v_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?,
-            o_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?,
+            //q_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?,
+            //k_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?,
+            //v_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?,
+            //o_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             num_heads,
             num_kv_heads,
             num_kv_groups: num_heads / num_kv_heads,
@@ -225,10 +254,21 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
 
+        println!("x shape: {:?}", x.dims());
+        let x = x.contiguous()?;
+
+        // Right before q_proj, manually compute what the output SHOULD be:
+        let x_flat: Vec<f32> = x.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("Input to q_proj: {:?}", x_flat);
+
         // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self.q_proj.forward(&x)?;
+        println!("Output shape: {:?}", q.dims());
+        let k = self.k_proj.forward(&x)?;
+        let v = self.v_proj.forward(&x)?;
+
+        let q_flat: Vec<f32> = q.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("Q output: {:?}", q_flat);
 
         // Reshape to (B, num_heads, seq_len, head_dim)
         let q = q
@@ -404,7 +444,8 @@ impl QuantizedModelForCausalLM {
         );
 
         // Load LM head - uses tied embeddings (same tensor as embed_tokens, but in F32 not Q8)
-        let lm_head = candle_nn::Linear::new(embed_tensor, None);
+        let lm_head = Linear::from_weights(embed_tensor.clone(), None);
+
 
         Ok(Self {
             embed_tokens,
@@ -419,8 +460,14 @@ impl QuantizedModelForCausalLM {
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
 
+        println!("=== FORWARD PASS DEBUG ===");
+        println!("Input: {:?}", input_ids.dims());
+
         // Embed tokens
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("After embed: first 4 = {:?}", vals);
 
         // Create causal mask if needed
         let mask = if seq_len > 1 {
@@ -432,15 +479,44 @@ impl QuantizedModelForCausalLM {
         // Forward through decoder layers
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, mask.as_ref(), offset)?;
+            let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+            println!("After norm: first 4 = {:?}", vals);
+
         }
 
         // Final norm
         hidden_states = self.norm.forward(&hidden_states)?;
+        println!("\n=== NARROW DEBUG ===");
+        println!("Full tensor shape: {:?}", hidden_states.dims());
+        println!("Narrowing: dim=1, start={}, len=1", seq_len - 1);
+
+        // Show a few values at different positions
+        for pos in [0, seq_len/2, seq_len-1] {
+            let slice = hidden_states.narrow(1, pos, 1)?;
+            let vals: Vec<f32> = slice.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+            println!("  Position {}: {:?}", pos, vals);
+        }
+
+        let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("After norm: first 4 = {:?}", vals);
 
         // LM head (only last token for generation)
-        let logits = hidden_states
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.lm_head)?;
+        //let logits = hidden_states
+        //    .narrow(1, seq_len - 1, 1)?
+        //    .apply(&self.lm_head)?;
+
+        // Narrow to last token
+        let last_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
+
+        // ADD THIS DEBUG:
+        let vals: Vec<f32> = last_hidden.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("After narrow: first 4 = {:?}", vals);
+
+        // LM head
+        let logits = last_hidden.apply(&self.lm_head)?;
+
+        let vals: Vec<f32> = logits.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
+        println!("Logits: first 10 = {:?}", vals);
 
         Ok(logits)
     }

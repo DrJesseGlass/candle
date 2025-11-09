@@ -14,7 +14,7 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_examples::token_output_stream::TokenOutputStream;
 
 // Import your new quantized SmolLM3 implementation
-use candle_transformers::models::smol::quantized_smollm3;
+//use candle_transformers::models::smol::quantized_smollm3;
 use candle_transformers::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
 
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
