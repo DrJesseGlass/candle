@@ -3,6 +3,7 @@ use candle_nn::Activation;
 use candle::quantized::{gguf_file, QMatMul};
 use std::sync::Arc;
 use std::io::{Read, Seek};
+use candle_nn::Linear;
 
 const MAX_SEQ_LEN: usize = 4096;
 
@@ -352,7 +353,7 @@ pub struct QuantizedModelForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<QuantizedDecoderLayer>,
     norm: RmsNorm,
-    lm_head: QMatMul,
+    lm_head: Linear,
     device: Device,
     config: QuantizedConfig,
 }
@@ -364,12 +365,11 @@ impl QuantizedModelForCausalLM {
 
         let config = QuantizedConfig::from_gguf(&content)?;
 
-        // Load embedding
-        let embed_tokens = {
-            let embed_tensor = content.tensor(&mut file, "token_embd.weight", device)?
-                .dequantize(device)?;
-            candle_nn::Embedding::new(embed_tensor, config.hidden_size)
-        };
+        // Load embedding tensor (will be used for both embed_tokens and lm_head - tied embeddings)
+        let embed_tensor = content.tensor(&mut file, "token_embd.weight", device)?
+            .dequantize(device)?;
+
+        let embed_tokens = candle_nn::Embedding::new(embed_tensor.clone(), config.hidden_size);
 
         // Create rotary embedding if needed
         let needs_rope = (0..config.num_hidden_layers)
@@ -403,8 +403,8 @@ impl QuantizedModelForCausalLM {
             config.rms_norm_eps,
         );
 
-        // Load LM head
-        let lm_head = QMatMul::from_qtensor(content.tensor(&mut file, "token_embd.weight", device)?)?;
+        // Load LM head - uses tied embeddings (same tensor as embed_tokens, but in F32 not Q8)
+        let lm_head = candle_nn::Linear::new(embed_tensor, None);
 
         Ok(Self {
             embed_tokens,

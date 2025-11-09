@@ -258,7 +258,7 @@ fn main() -> anyhow::Result<()> {
 \n\
 Knowledge Cutoff Date: June 2025\n\
 Today Date: 05 November 2025\n\
-Reasoning Mode: /think\n\
+Reasoning Mode: /no_think\n\
 \n\
 ## Custom Instructions\n\
 \n\

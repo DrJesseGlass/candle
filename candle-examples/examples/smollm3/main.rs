@@ -57,7 +57,7 @@ impl TextGeneration {
         let mut tokens = self
             .tokenizer
             .tokenizer()
-            .encode(prompt, true)  // true = add special tokens (matches quantized version)
+            .encode(prompt, false)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
