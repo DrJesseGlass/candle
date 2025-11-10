@@ -6,6 +6,17 @@ use std::io::{Read, Seek};
 use crate::models::with_tracing::Linear;
 
 const MAX_SEQ_LEN: usize = 4096;
+use candle::IndexOp;  // Add at top with other imports
+
+// Add this function:
+fn deinterleave_rows(weight: &Tensor) -> Result<Tensor> {
+    let (out_features, in_features) = weight.dims2()?;
+    let mut rows = Vec::new();
+    for i in (0..out_features).step_by(2) {
+        rows.push(weight.i(i)?);
+    }
+    Tensor::stack(&rows, 0)
+}
 
 #[derive(Debug, Clone)]
 pub struct QuantizedConfig {
@@ -202,25 +213,34 @@ impl QuantizedAttention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
 
-         let q_weight = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
-            .dequantize(device)?
+         //let q_weight = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
+         //   .dequantize(device)?;
             //.t()?                // Transpose first
-            .contiguous()?;      // Then make contiguous
+            //.contiguous()?;      // Then make contiguous
+
+        let q_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
+            .dequantize(device)?;
+        let q_weight = deinterleave_rows(&q_weight_raw)?;
 
         println!("q_weight shape: {:?}", q_weight.dims());
         let q_weight_vals: Vec<f32> = q_weight.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
         println!("q_weight first 10: {:?}", q_weight_vals);
 
-        let k_weight = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
-            .dequantize(device)?
-            .contiguous()?;
+        //let k_weight = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
+        //    .dequantize(device)?;
+            //.contiguous()?;
+
+        let k_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
+            .dequantize(device)?;
+        let k_weight = deinterleave_rows(&k_weight_raw)?;
+
         let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
-            .dequantize(device)?
-            .contiguous()?;
+            .dequantize(device)?;
+            //.contiguous()?;
+
         let o_weight = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?
-            .dequantize(device)?
-            .t()?
-            .contiguous()?;
+            .dequantize(device)?;
+            //.contiguous()?;
 
         let q_proj = Linear::from_weights(q_weight, None);  // Will use with_tracing::Linear
         let k_proj = Linear::from_weights(k_weight, None);
@@ -267,8 +287,12 @@ impl QuantizedAttention {
         let k = self.k_proj.forward(&x)?;
         let v = self.v_proj.forward(&x)?;
 
-        let q_flat: Vec<f32> = q.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        let q_flat: Vec<f32> = q.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
         println!("Q output: {:?}", q_flat);
+        let k_flat: Vec<f32> = k.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("K output: {:?}", q_flat);
+        let v_flat: Vec<f32> = v.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
+        println!("V output: {:?}", q_flat);
 
         // Reshape to (B, num_heads, seq_len, head_dim)
         let q = q

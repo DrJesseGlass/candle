@@ -173,6 +173,9 @@ impl SmolLM3Attention {
             attention_bias,
             vb.pp("q_proj"),
         )?;
+
+
+
         let k_proj = linear_b(
             cfg.hidden_size,
             num_kv_heads * head_dim,
@@ -240,8 +243,8 @@ impl SmolLM3Attention {
 
         // DEBUG: Check projection outputs
         println!("After q_proj shape: {:?}", q.dims());
-        let q_vals: Vec<f32> = q.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After q_proj first 4: {:?}", q_vals);
+        let q_vals: Vec<f32> = q.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
+        println!("After q_proj first 12: {:?}", q_vals);
 
         // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
         let q = q
