@@ -9,13 +9,57 @@ const MAX_SEQ_LEN: usize = 4096;
 use candle::IndexOp;  // Add at top with other imports
 
 // Add this function:
-fn deinterleave_rows(weight: &Tensor) -> Result<Tensor> {
+fn deinterleave_rows(weight: &Tensor, offset: usize) -> Result<Tensor> {
     let (out_features, in_features) = weight.dims2()?;
     let mut rows = Vec::new();
-    for i in (0..out_features).step_by(2) {
+    for i in (offset..out_features).step_by(2) {
         rows.push(weight.i(i)?);
     }
     Tensor::stack(&rows, 0)
+}
+
+fn deinterleave_and_reconstruct(weight: &Tensor) -> Result<Tensor> {
+    let (out_features, in_features) = weight.dims2()?;
+
+    // Extract even rows (first half)
+    let mut first_half = Vec::new();
+    for i in (0..out_features).step_by(2) {
+        first_half.push(weight.i(i)?);
+    }
+
+    // Extract odd rows (second half)
+    let mut second_half = Vec::new();
+    for i in (1..out_features).step_by(2) {
+        second_half.push(weight.i(i)?);
+    }
+
+    // Concatenate: [first_half..., second_half...]
+    let first = Tensor::stack(&first_half, 0)?;
+    let second = Tensor::stack(&second_half, 0)?;
+
+    Tensor::cat(&[first, second], 0)
+}
+
+fn deinterleave_and_concat(weight: &Tensor) -> Result<Tensor> {
+    let (out_features, in_features) = weight.dims2()?;
+
+    // Extract even rows (first half of Q)
+    let mut first_half = Vec::new();
+    for i in (0..out_features).step_by(2) {
+        first_half.push(weight.i(i)?);
+    }
+
+    // Extract odd rows (second half of Q)
+    let mut second_half = Vec::new();
+    for i in (1..out_features).step_by(2) {
+        second_half.push(weight.i(i)?);
+    }
+
+    // Concatenate: [first_half..., second_half...]
+    let first = Tensor::stack(&first_half, 0)?;
+    let second = Tensor::stack(&second_half, 0)?;
+
+    Tensor::cat(&[first, second], 0)
 }
 
 #[derive(Debug, Clone)]
@@ -220,19 +264,26 @@ impl QuantizedAttention {
 
         let q_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
             .dequantize(device)?;
-        let q_weight = deinterleave_rows(&q_weight_raw)?;
 
+        println!("\n=== CRITICAL DIAGNOSTIC ===");
+        println!("GGUF Q weight shape: {:?}", q_weight_raw.dims());
+        println!("Config says Q should be: {} × {} = {} features",
+                 cfg.num_attention_heads,
+                 cfg.head_dim(),
+                 cfg.num_attention_heads * cfg.head_dim());
+
+        println!("q_weight shape raw: {:?}", q_weight_raw.dims());
+        let q_weight = deinterleave_and_reconstruct(&q_weight_raw)?;
         println!("q_weight shape: {:?}", q_weight.dims());
         let q_weight_vals: Vec<f32> = q_weight.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
         println!("q_weight first 10: {:?}", q_weight_vals);
 
-        //let k_weight = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
-        //    .dequantize(device)?;
-            //.contiguous()?;
-
         let k_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
             .dequantize(device)?;
-        let k_weight = deinterleave_rows(&k_weight_raw)?;
+
+        println!("k_weight_raw shape raw: {:?}", k_weight_raw.dims());
+        let k_weight = deinterleave_rows(&k_weight_raw, 1_usize)?;
+        println!("k_weight shape: {:?}", k_weight.dims());
 
         let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
             .dequantize(device)?;
