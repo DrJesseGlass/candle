@@ -1,9 +1,9 @@
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::Activation;
-use candle::quantized::{gguf_file, QMatMul};
+use candle::quantized::{gguf_file};
 use std::sync::Arc;
 use std::io::{Read, Seek};
-use crate::models::with_tracing::Linear;
+use crate::models::with_tracing::QMatMul;
 
 const MAX_SEQ_LEN: usize = 4096;
 use candle::IndexOp;  // Add at top with other imports
@@ -228,9 +228,9 @@ impl QuantizedMLP {
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         Ok(Self {
-            gate_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?)?,
-            up_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?)?,
-            down_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?)?,
+            gate_proj: QMatMul::from_weights(Arc::new(ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?))?,
+            up_proj: QMatMul::from_weights(Arc::new(ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?))?,
+            down_proj: QMatMul::from_weights(Arc::new(ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?))?,
         })
     }
 
@@ -243,10 +243,10 @@ impl QuantizedMLP {
 
 #[derive(Debug, Clone)]
 struct QuantizedAttention {
-    q_proj: Linear,  //QMatMul,
-    k_proj: Linear,  //QMatMul,
-    v_proj: Linear,  //QMatMul,
-    o_proj: Linear,  //QMatMul,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -270,47 +270,35 @@ impl QuantizedAttention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
 
-         //let q_weight = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
-         //   .dequantize(device)?;
-            //.t()?                // Transpose first
-            //.contiguous()?;      // Then make contiguous
+        // For v and o weights, keep them quantized
+        let v_weight_qtensor = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+        let o_weight_qtensor = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
+        // For q and k weights, we need to dequantize for reconstruction,
+        // then we'll need to handle them differently (can't use QMatMul with reconstructed weights)
         let q_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
             .dequantize(device)?;
 
-        //println!("q_weight_raw shape: {:?}", q_weight_raw.dims());
         let q_weight = reconstruct_qk_weights(&q_weight_raw, 16)?;
-        //println!("q_weight reconstructed shape: {:?}", q_weight.dims());
 
         let k_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
             .dequantize(device)?;
 
-        //println!("k_weight_raw shape: {:?}", k_weight_raw.dims());
         let k_weight = reconstruct_qk_weights(&k_weight_raw, 4)?;
-        //println!("k_weight reconstructed shape: {:?}", k_weight.dims());
 
-        let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
-            .dequantize(device)?;
-            //.contiguous()?;
+        // Note: q_weight and k_weight are now regular Tensors, not QTensors
+        // We'll need to quantize them or use a different approach
+        // For now, let's try quantizing them back
+        use candle::quantized::{QTensor, GgmlDType};
 
-        let o_weight = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?
-            .dequantize(device)?;
-            //.contiguous()?;
-
-        let q_proj = Linear::from_weights(q_weight, None);  // Will use with_tracing::Linear
-        let k_proj = Linear::from_weights(k_weight, None);
-        let v_proj = Linear::from_weights(v_weight, None);
-        let o_proj = Linear::from_weights(o_weight, None);
+        let q_weight_qtensor = QTensor::quantize(&q_weight, GgmlDType::Q8_0)?;
+        let k_weight_qtensor = QTensor::quantize(&k_weight, GgmlDType::Q8_0)?;
 
         Ok(Self {
-            //q_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?,
-            //k_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?,
-            //v_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?,
-            //o_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            q_proj: QMatMul::from_weights(Arc::new(q_weight_qtensor))?,
+            k_proj: QMatMul::from_weights(Arc::new(k_weight_qtensor))?,
+            v_proj: QMatMul::from_weights(Arc::new(v_weight_qtensor))?,
+            o_proj: QMatMul::from_weights(Arc::new(o_weight_qtensor))?,
             num_heads,
             num_kv_heads,
             num_kv_groups: num_heads / num_kv_heads,
@@ -472,7 +460,7 @@ pub struct QuantizedModelForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<QuantizedDecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: QMatMul,
     device: Device,
     config: QuantizedConfig,
 }
@@ -522,8 +510,11 @@ impl QuantizedModelForCausalLM {
             config.rms_norm_eps,
         );
 
-        // Load LM head - uses tied embeddings (same tensor as embed_tokens, but in F32 not Q8)
-        let lm_head = Linear::from_weights(embed_tensor.clone(), None);
+        // Load LM head - for QMatMul we need a quantized tensor
+        // We'll quantize the embedding tensor
+        use candle::quantized::{QTensor as QT, GgmlDType};
+        let embed_qtensor = QT::quantize(&embed_tensor, GgmlDType::Q8_0)?;
+        let lm_head = QMatMul::from_weights(Arc::new(embed_qtensor))?;
 
 
         Ok(Self {
