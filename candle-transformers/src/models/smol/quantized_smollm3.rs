@@ -8,58 +8,71 @@ use crate::models::with_tracing::Linear;
 const MAX_SEQ_LEN: usize = 4096;
 use candle::IndexOp;  // Add at top with other imports
 
-// Add this function:
-fn deinterleave_rows(weight: &Tensor, offset: usize) -> Result<Tensor> {
-    let (out_features, in_features) = weight.dims2()?;
-    let mut rows = Vec::new();
-    for i in (offset..out_features).step_by(2) {
-        rows.push(weight.i(i)?);
-    }
-    Tensor::stack(&rows, 0)
-}
+// ===== WORKING RECONSTRUCTION FUNCTION =====
 
-fn deinterleave_and_reconstruct(weight: &Tensor) -> Result<Tensor> {
-    let (out_features, in_features) = weight.dims2()?;
+// ===== RECONSTRUCTION FUNCTION - CHANGE THIS TO TEST DIFFERENT STRATEGIES =====
+fn reconstruct_qk_weights(gguf_weight: &Tensor, num_heads: usize) -> Result<Tensor> {
+    // Strategy: 128-row chunks on first half, then second half
+    //
+    // For Q (16 heads, 2048 rows):
+    //   - First half (rows 0-1023): 8 chunks × 2 (even/odd) = 16 heads total... wait no
+    //   - Actually: 1024/128 = 8 chunks, each produces 2 heads = 16 heads in first half? No...
+    //   - First half: 1024 rows → 8 heads
+    //   - Second half: 1024 rows → 8 heads
+    //   - Total: 16 heads
+    //
+    // For K (4 heads, 512 rows):
+    //   - First half (rows 0-255): 2 chunks × 2 (even/odd) = 4 heads in first half? No...
+    //   - First half: 256 rows → 2 heads
+    //   - Second half: 256 rows → 2 heads
+    //   - Total: 4 heads
 
-    // Extract even rows (first half)
-    let mut first_half = Vec::new();
-    for i in (0..out_features).step_by(2) {
-        first_half.push(weight.i(i)?);
-    }
+    let total_rows = gguf_weight.dim(0)?;
+    let half_rows = total_rows / 2;
+    let chunk_size = 128;
+    let chunks_per_half = half_rows / chunk_size;
 
-    // Extract odd rows (second half)
-    let mut second_half = Vec::new();
-    for i in (1..out_features).step_by(2) {
-        second_half.push(weight.i(i)?);
-    }
+    let mut heads = Vec::new();
 
-    // Concatenate: [first_half..., second_half...]
-    let first = Tensor::stack(&first_half, 0)?;
-    let second = Tensor::stack(&second_half, 0)?;
+    // First half
+    for chunk_idx in 0..chunks_per_half {
+        let chunk_start = chunk_idx * chunk_size;
 
-    Tensor::cat(&[first, second], 0)
-}
+        // Even rows
+        let mut head_even = Vec::new();
+        for i in (chunk_start..chunk_start + chunk_size).step_by(2) {
+            head_even.push(gguf_weight.i(i)?);
+        }
+        heads.push(Tensor::stack(&head_even, 0)?);
 
-fn deinterleave_and_concat(weight: &Tensor) -> Result<Tensor> {
-    let (out_features, in_features) = weight.dims2()?;
-
-    // Extract even rows (first half of Q)
-    let mut first_half = Vec::new();
-    for i in (0..out_features).step_by(2) {
-        first_half.push(weight.i(i)?);
-    }
-
-    // Extract odd rows (second half of Q)
-    let mut second_half = Vec::new();
-    for i in (1..out_features).step_by(2) {
-        second_half.push(weight.i(i)?);
+        // Odd rows
+        let mut head_odd = Vec::new();
+        for i in (chunk_start + 1..chunk_start + chunk_size).step_by(2) {
+            head_odd.push(gguf_weight.i(i)?);
+        }
+        heads.push(Tensor::stack(&head_odd, 0)?);
     }
 
-    // Concatenate: [first_half..., second_half...]
-    let first = Tensor::stack(&first_half, 0)?;
-    let second = Tensor::stack(&second_half, 0)?;
+    // Second half
+    for chunk_idx in 0..chunks_per_half {
+        let chunk_start = half_rows + chunk_idx * chunk_size;
 
-    Tensor::cat(&[first, second], 0)
+        // Even rows
+        let mut head_even = Vec::new();
+        for i in (chunk_start..chunk_start + chunk_size).step_by(2) {
+            head_even.push(gguf_weight.i(i)?);
+        }
+        heads.push(Tensor::stack(&head_even, 0)?);
+
+        // Odd rows
+        let mut head_odd = Vec::new();
+        for i in (chunk_start + 1..chunk_start + chunk_size).step_by(2) {
+            head_odd.push(gguf_weight.i(i)?);
+        }
+        heads.push(Tensor::stack(&head_odd, 0)?);
+    }
+
+    Ok(Tensor::cat(&heads, 0)?)
 }
 
 #[derive(Debug, Clone)]
@@ -265,25 +278,16 @@ impl QuantizedAttention {
         let q_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
             .dequantize(device)?;
 
-        println!("\n=== CRITICAL DIAGNOSTIC ===");
-        println!("GGUF Q weight shape: {:?}", q_weight_raw.dims());
-        println!("Config says Q should be: {} × {} = {} features",
-                 cfg.num_attention_heads,
-                 cfg.head_dim(),
-                 cfg.num_attention_heads * cfg.head_dim());
-
-        println!("q_weight shape raw: {:?}", q_weight_raw.dims());
-        let q_weight = deinterleave_and_reconstruct(&q_weight_raw)?;
-        println!("q_weight shape: {:?}", q_weight.dims());
-        let q_weight_vals: Vec<f32> = q_weight.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
-        println!("q_weight first 10: {:?}", q_weight_vals);
+        //println!("q_weight_raw shape: {:?}", q_weight_raw.dims());
+        let q_weight = reconstruct_qk_weights(&q_weight_raw, 16)?;
+        //println!("q_weight reconstructed shape: {:?}", q_weight.dims());
 
         let k_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
             .dequantize(device)?;
 
-        println!("k_weight_raw shape raw: {:?}", k_weight_raw.dims());
-        let k_weight = deinterleave_rows(&k_weight_raw, 1_usize)?;
-        println!("k_weight shape: {:?}", k_weight.dims());
+        //println!("k_weight_raw shape: {:?}", k_weight_raw.dims());
+        let k_weight = reconstruct_qk_weights(&k_weight_raw, 4)?;
+        //println!("k_weight reconstructed shape: {:?}", k_weight.dims());
 
         let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
             .dequantize(device)?;
@@ -325,25 +329,25 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
 
-        println!("x shape: {:?}", x.dims());
+        //println!("x shape: {:?}", x.dims());
         let x = x.contiguous()?;
 
         // Right before q_proj, manually compute what the output SHOULD be:
         let x_flat: Vec<f32> = x.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("Input to q_proj: {:?}", x_flat);
+        //println!("Input to q_proj: {:?}", x_flat);
 
         // Project Q, K, V
         let q = self.q_proj.forward(&x)?;
-        println!("Output shape: {:?}", q.dims());
+        //println!("Output shape: {:?}", q.dims());
         let k = self.k_proj.forward(&x)?;
         let v = self.v_proj.forward(&x)?;
 
         let q_flat: Vec<f32> = q.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
-        println!("Q output: {:?}", q_flat);
+        //println!("Q output: {:?}", q_flat);
         let k_flat: Vec<f32> = k.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("K output: {:?}", q_flat);
+        //println!("K output: {:?}", q_flat);
         let v_flat: Vec<f32> = v.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("V output: {:?}", q_flat);
+        //println!("V output: {:?}", q_flat);
 
         // Reshape to (B, num_heads, seq_len, head_dim)
         let q = q
@@ -535,14 +539,14 @@ impl QuantizedModelForCausalLM {
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
 
-        println!("=== FORWARD PASS DEBUG ===");
-        println!("Input: {:?}", input_ids.dims());
+        //println!("=== FORWARD PASS DEBUG ===");
+        //println!("Input: {:?}", input_ids.dims());
 
         // Embed tokens
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After embed: first 4 = {:?}", vals);
+        //println!("After embed: first 4 = {:?}", vals);
 
         // Create causal mask if needed
         let mask = if seq_len > 1 {
@@ -555,25 +559,25 @@ impl QuantizedModelForCausalLM {
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, mask.as_ref(), offset)?;
             let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            println!("After norm: first 4 = {:?}", vals);
+            //println!("After norm: first 4 = {:?}", vals);
 
         }
 
         // Final norm
         hidden_states = self.norm.forward(&hidden_states)?;
-        println!("\n=== NARROW DEBUG ===");
-        println!("Full tensor shape: {:?}", hidden_states.dims());
-        println!("Narrowing: dim=1, start={}, len=1", seq_len - 1);
+        //println!("\n=== NARROW DEBUG ===");
+        //println!("Full tensor shape: {:?}", hidden_states.dims());
+        //println!("Narrowing: dim=1, start={}, len=1", seq_len - 1);
 
         // Show a few values at different positions
         for pos in [0, seq_len/2, seq_len-1] {
             let slice = hidden_states.narrow(1, pos, 1)?;
             let vals: Vec<f32> = slice.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            println!("  Position {}: {:?}", pos, vals);
+            //println!("  Position {}: {:?}", pos, vals);
         }
 
         let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After norm: first 4 = {:?}", vals);
+        //println!("After norm: first 4 = {:?}", vals);
 
         // LM head (only last token for generation)
         //let logits = hidden_states
@@ -585,13 +589,13 @@ impl QuantizedModelForCausalLM {
 
         // ADD THIS DEBUG:
         let vals: Vec<f32> = last_hidden.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After narrow: first 4 = {:?}", vals);
+        //println!("After narrow: first 4 = {:?}", vals);
 
         // LM head
         let logits = last_hidden.apply(&self.lm_head)?;
 
         let vals: Vec<f32> = logits.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
-        println!("Logits: first 10 = {:?}", vals);
+        //println!("Logits: first 10 = {:?}", vals);
 
         Ok(logits)
     }
