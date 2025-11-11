@@ -18,28 +18,6 @@ struct Args {
     quantized: String,
 }
 
-fn reconstruct_per_head(weight: &Tensor, num_heads: usize, head_dim: usize) -> Result<Tensor> {
-    let (total_rows, hidden_dim) = weight.dims2()?;
-    let rows_per_head = head_dim;  // 128 for SmolLM3
-    let half_heads = num_heads / 2;  // 8 heads
-
-    let mut reordered_chunks = Vec::new();
-
-    // Collect first half heads (0-7)
-    for head_idx in 0..half_heads {
-        let start_row = head_idx * 2 * rows_per_head;  // 0, 256, 512, ...
-        reordered_chunks.push(weight.narrow(0, start_row, rows_per_head)?);
-    }
-
-    // Collect second half heads (8-15)
-    for head_idx in 0..half_heads {
-        let start_row = head_idx * 2 * rows_per_head + rows_per_head;  // 128, 384, 640, ...
-        reordered_chunks.push(weight.narrow(0, start_row, rows_per_head)?);
-    }
-
-    Tensor::cat(&reordered_chunks, 0)
-}
-
 fn detailed_comparison(name: &str, t1: &Tensor, t2: &Tensor) -> Result<()> {
     let t1 = t1.to_dtype(DType::F32)?;
     let t2 = t2.to_dtype(DType::F32)?;
@@ -298,100 +276,6 @@ fn main() -> Result<()> {
                          i, 2*i, diff_even, if diff_even < 0.001 { "✓" } else { "✗" });
                 println!("Regular[{:4}] vs GGUF[{:4}]: {:.8} {}",
                          half_rows + i, 2*i + 1, diff_odd, if diff_odd < 0.001 { "✓" } else { "✗" });
-            }
-
-            // ===== TEST THE RECONSTRUCTION =====
-            println!("\n=== TESTING RECONSTRUCTION ===");
-
-            // Extract even rows (first half)
-            let mut first_half = Vec::new();
-            for i in (0..quant_q_dq.dim(0)?).step_by(2) {
-                first_half.push(quant_q_dq.i(i)?);
-            }
-
-            // Extract odd rows (second half)
-            let mut second_half = Vec::new();
-            for i in (1..quant_q_dq.dim(0)?).step_by(2) {
-                second_half.push(quant_q_dq.i(i)?);
-            }
-
-            // Concatenate
-            let first = Tensor::stack(&first_half, 0)?;
-            let second = Tensor::stack(&second_half, 0)?;
-            let reconstructed_q = Tensor::cat(&[first, second], 0)?;
-
-            println!("Original GGUF Q shape: {:?}", quant_q_dq.dims());
-            println!("Reconstructed Q shape: {:?}", reconstructed_q.dims());
-            println!("Expected (Regular Q) shape: {:?}", reg_q.dims());
-
-            // Compare reconstructed with original regular Q
-            println!("\n=== COMPARING RECONSTRUCTED Q WITH REGULAR Q ===");
-            detailed_comparison("RECONSTRUCTED Q_PROJ", &reg_q, &reconstructed_q)?;
-
-            // Check first few rows match exactly
-            println!("\nRow-by-row verification:");
-            let total_rows = reg_q.dim(0)?;
-            let test_rows = vec![0, 1, 2, 3, total_rows/2 - 1, total_rows/2, total_rows/2 + 1, total_rows - 2, total_rows - 1];
-
-            for &i in &test_rows {
-                let reg_row: Vec<f32> = reg_q.i(i)?.to_vec1()?;
-                let recon_row: Vec<f32> = reconstructed_q.i(i)?.to_vec1()?;
-
-                let diff: f32 = reg_row.iter().zip(recon_row.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .sum::<f32>() / reg_row.len() as f32;
-
-                println!("Row {:4}: diff = {:.8} {}", i, diff, if diff < 0.001 { "✓" } else { "✗" });
-            }
-        }
-    }
-
-    // ===== TEST K RECONSTRUCTION =====
-    if let Some(reg_k) = regular_tensors.get("model.layers.0.self_attn.k_proj.weight") {
-        if let Some(quant_k_dq) = gguf_tensors.get("blk.0.attn_k.weight") {
-            let reg_k = reg_k.to_dtype(DType::F32)?;
-            let quant_k_dq = quant_k_dq.to_dtype(DType::F32)?;
-
-            println!("\n{}", "=".repeat(80));
-            println!("=== TESTING K RECONSTRUCTION ===");
-            println!("{}", "=".repeat(80));
-
-            // Try the same reconstruction for K
-            let mut first_half = Vec::new();
-            for i in (0..quant_k_dq.dim(0)?).step_by(2) {
-                first_half.push(quant_k_dq.i(i)?);
-            }
-
-            let mut second_half = Vec::new();
-            for i in (1..quant_k_dq.dim(0)?).step_by(2) {
-                second_half.push(quant_k_dq.i(i)?);
-            }
-
-            let first = Tensor::stack(&first_half, 0)?;
-            let second = Tensor::stack(&second_half, 0)?;
-            let reconstructed_k = Tensor::cat(&[first, second], 0)?;
-
-            println!("Original GGUF K shape: {:?}", quant_k_dq.dims());
-            println!("Reconstructed K shape: {:?}", reconstructed_k.dims());
-            println!("Expected (Regular K) shape: {:?}", reg_k.dims());
-
-            println!("\n=== COMPARING RECONSTRUCTED K WITH REGULAR K ===");
-            detailed_comparison("RECONSTRUCTED K_PROJ", &reg_k, &reconstructed_k)?;
-
-            // Check first few rows
-            println!("\nRow-by-row verification:");
-            let total_rows = reg_k.dim(0)?;
-            let test_rows = vec![0, 1, 2, 3, total_rows/2 - 1, total_rows/2, total_rows/2 + 1, total_rows - 2, total_rows - 1];
-
-            for &i in &test_rows {
-                let reg_row: Vec<f32> = reg_k.i(i)?.to_vec1()?;
-                let recon_row: Vec<f32> = reconstructed_k.i(i)?.to_vec1()?;
-
-                let diff: f32 = reg_row.iter().zip(recon_row.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .sum::<f32>() / reg_row.len() as f32;
-
-                println!("Row {:4}: diff = {:.8} {}", i, diff, if diff < 0.001 { "✓" } else { "✗" });
             }
         }
     }
