@@ -4,6 +4,7 @@ use candle::quantized::gguf_file;
 use crate::quantized_var_builder::VarBuilder;
 use std::sync::Arc;
 use crate::models::with_tracing::QMatMul;
+use candle_nn::kv_cache::KvCache;
 
 const MAX_SEQ_LEN: usize = 4096;
 use candle::IndexOp;
@@ -233,7 +234,7 @@ struct QuantizedAttention {
     head_dim: usize,
     rotary_emb: Option<Arc<RotaryEmbedding>>,
     skip_rope: bool,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
 }
 
 impl QuantizedAttention {
@@ -280,7 +281,7 @@ impl QuantizedAttention {
             head_dim,
             rotary_emb,
             skip_rope: cfg.should_skip_rope(layer_idx),
-            kv_cache: None,
+            kv_cache: KvCache::new(2, cfg.max_position_embeddings),
         })
     }
 
@@ -310,15 +311,8 @@ impl QuantizedAttention {
             (q, k)
         };
 
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                let k = Tensor::cat(&[k_cache, &k], 2)?;
-                let v = Tensor::cat(&[v_cache, &v], 2)?;
-                (k, v)
-            }
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // can remove this continguous call if using ConcatKV-Cache https://github.com/huggingface/candle/pull/3143
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         let k = repeat_kv(k, self.num_kv_groups)?;
         let v = repeat_kv(v, self.num_kv_groups)?;
@@ -341,7 +335,7 @@ impl QuantizedAttention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 

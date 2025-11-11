@@ -1,32 +1,16 @@
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::Activation;
-use candle::quantized::{gguf_file, QMatMul};
+use candle::quantized::gguf_file;
+use crate::quantized_var_builder::VarBuilder;
 use std::sync::Arc;
-use std::io::{Read, Seek};
-use crate::models::with_tracing::Linear;
+use crate::models::with_tracing::QMatMul;
+use candle_nn::kv_cache::KvCache;
 
 const MAX_SEQ_LEN: usize = 4096;
-use candle::IndexOp;  // Add at top with other imports
+use candle::IndexOp;
 
-// ===== WORKING RECONSTRUCTION FUNCTION =====
-
-// ===== RECONSTRUCTION FUNCTION - CHANGE THIS TO TEST DIFFERENT STRATEGIES =====
+// ===== RECONSTRUCTION FUNCTION =====
 fn reconstruct_qk_weights(gguf_weight: &Tensor, num_heads: usize) -> Result<Tensor> {
-    // Strategy: 128-row chunks on first half, then second half
-    //
-    // For Q (16 heads, 2048 rows):
-    //   - First half (rows 0-1023): 8 chunks × 2 (even/odd) = 16 heads total... wait no
-    //   - Actually: 1024/128 = 8 chunks, each produces 2 heads = 16 heads in first half? No...
-    //   - First half: 1024 rows → 8 heads
-    //   - Second half: 1024 rows → 8 heads
-    //   - Total: 16 heads
-    //
-    // For K (4 heads, 512 rows):
-    //   - First half (rows 0-255): 2 chunks × 2 (even/odd) = 4 heads in first half? No...
-    //   - First half: 256 rows → 2 heads
-    //   - Second half: 256 rows → 2 heads
-    //   - Total: 4 heads
-
     let total_rows = gguf_weight.dim(0)?;
     let half_rows = total_rows / 2;
     let chunk_size = 128;
@@ -121,7 +105,6 @@ impl QuantizedConfig {
             rope_theta: get_f32("smollm3.rope.freq_base")?,
             rms_norm_eps: get_f32("smollm3.attention.layer_norm_rms_epsilon")?,
             rope_dimension_count: get_u32("smollm3.rope.dimension_count")?,
-            // SmolLM3-3B uses interval=4 (every 4th layer skips RoPE)
             no_rope_layer_interval: Some(4),
         })
     }
@@ -159,7 +142,6 @@ impl RmsNorm {
         let x = x.to_dtype(internal_dtype)?;
         let norm_x = (x.sqr()?.sum_keepdim(candle::D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        // Multiply by weight (F32) BEFORE converting back to original dtype
         let result = x_normed.broadcast_mul(&self.weight)?;
         result.to_dtype(x_dtype)
     }
@@ -220,17 +202,16 @@ struct QuantizedMLP {
 }
 
 impl QuantizedMLP {
-    fn new<R: Read + Seek>(
-        ct: &gguf_file::Content,
-        reader: &mut R,
-        layer_idx: usize,
-        device: &Device,
-    ) -> Result<Self> {
-        let prefix = format!("blk.{layer_idx}");
+    fn new(vb: VarBuilder, _layer_idx: usize) -> Result<Self> {
+        // VarBuilder.get_no_shape() returns Arc<QTensor> which QMatMul::from_weights expects
+        let gate_proj = QMatMul::from_weights(vb.get_no_shape("ffn_gate.weight")?)?;
+        let up_proj = QMatMul::from_weights(vb.get_no_shape("ffn_up.weight")?)?;
+        let down_proj = QMatMul::from_weights(vb.get_no_shape("ffn_down.weight")?)?;
+
         Ok(Self {
-            gate_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?)?,
-            up_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?)?,
-            down_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?)?,
+            gate_proj,
+            up_proj,
+            down_proj,
         })
     }
 
@@ -243,70 +224,53 @@ impl QuantizedMLP {
 
 #[derive(Debug, Clone)]
 struct QuantizedAttention {
-    q_proj: Linear,  //QMatMul,
-    k_proj: Linear,  //QMatMul,
-    v_proj: Linear,  //QMatMul,
-    o_proj: Linear,  //QMatMul,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Option<Arc<RotaryEmbedding>>,
     skip_rope: bool,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
 }
 
 impl QuantizedAttention {
-    fn new<R: Read + Seek>(
-        ct: &gguf_file::Content,
-        reader: &mut R,
+    fn new(
+        vb: VarBuilder,
         cfg: &QuantizedConfig,
         layer_idx: usize,
         rotary_emb: Option<Arc<RotaryEmbedding>>,
-        device: &Device,
     ) -> Result<Self> {
-        let prefix = format!("blk.{layer_idx}");
         let head_dim = cfg.head_dim();
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
 
-         //let q_weight = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
-         //   .dequantize(device)?;
-            //.t()?                // Transpose first
-            //.contiguous()?;      // Then make contiguous
+        // For v and o weights, use directly from VarBuilder (already quantized)
+        // VarBuilder.get_no_shape() returns Arc<QTensor>
+        let v_proj = QMatMul::from_weights(vb.get_no_shape("attn_v.weight")?)?;
+        let o_proj = QMatMul::from_weights(vb.get_no_shape("attn_output.weight")?)?;
 
-        let q_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?
-            .dequantize(device)?;
+        // For q and k weights, we need to dequantize, reconstruct, then re-quantize
+        let q_weight_qtensor = vb.get_no_shape("attn_q.weight")?;
+        let q_weight_raw = q_weight_qtensor.dequantize(vb.device())?;
+        let q_weight = reconstruct_qk_weights(&q_weight_raw, num_heads)?;
 
-        //println!("q_weight_raw shape: {:?}", q_weight_raw.dims());
-        let q_weight = reconstruct_qk_weights(&q_weight_raw, 16)?;
-        //println!("q_weight reconstructed shape: {:?}", q_weight.dims());
+        let k_weight_qtensor = vb.get_no_shape("attn_k.weight")?;
+        let k_weight_raw = k_weight_qtensor.dequantize(vb.device())?;
+        let k_weight = reconstruct_qk_weights(&k_weight_raw, num_kv_heads)?;
 
-        let k_weight_raw = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?
-            .dequantize(device)?;
+        // Re-quantize the reconstructed weights
+        use candle::quantized::{QTensor, GgmlDType};
+        let q_weight_qtensor = QTensor::quantize(&q_weight, GgmlDType::Q8_0)?;
+        let k_weight_qtensor = QTensor::quantize(&k_weight, GgmlDType::Q8_0)?;
 
-        //println!("k_weight_raw shape: {:?}", k_weight_raw.dims());
-        let k_weight = reconstruct_qk_weights(&k_weight_raw, 4)?;
-        //println!("k_weight reconstructed shape: {:?}", k_weight.dims());
-
-        let v_weight = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?
-            .dequantize(device)?;
-            //.contiguous()?;
-
-        let o_weight = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?
-            .dequantize(device)?;
-            //.contiguous()?;
-
-        let q_proj = Linear::from_weights(q_weight, None);  // Will use with_tracing::Linear
-        let k_proj = Linear::from_weights(k_weight, None);
-        let v_proj = Linear::from_weights(v_weight, None);
-        let o_proj = Linear::from_weights(o_weight, None);
+        let q_proj = QMatMul::from_weights(Arc::new(q_weight_qtensor))?;
+        let k_proj = QMatMul::from_weights(Arc::new(k_weight_qtensor))?;
 
         Ok(Self {
-            //q_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?,
-            //k_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?,
-            //v_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?,
-            //o_proj: QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?,
             q_proj,
             k_proj,
             v_proj,
@@ -317,7 +281,7 @@ impl QuantizedAttention {
             head_dim,
             rotary_emb,
             skip_rope: cfg.should_skip_rope(layer_idx),
-            kv_cache: None,
+            kv_cache: KvCache::new(2, cfg.max_position_embeddings),
         })
     }
 
@@ -329,78 +293,41 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
 
-        //println!("x shape: {:?}", x.dims());
-        let x = x.contiguous()?;
-
-        // Right before q_proj, manually compute what the output SHOULD be:
-        let x_flat: Vec<f32> = x.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("Input to q_proj: {:?}", x_flat);
-
-        // Project Q, K, V
-        let q = self.q_proj.forward(&x)?;
-        //println!("Output shape: {:?}", q.dims());
-        let k = self.k_proj.forward(&x)?;
-        let v = self.v_proj.forward(&x)?;
-
-        let q_flat: Vec<f32> = q.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
-        //println!("Q output: {:?}", q_flat);
-        let k_flat: Vec<f32> = k.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("K output: {:?}", q_flat);
-        let v_flat: Vec<f32> = v.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("V output: {:?}", q_flat);
-
-        // Reshape to (B, num_heads, seq_len, head_dim)
-        let q = q
+        let q = self.q_proj.forward(x)?
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
+        let k = self.k_proj.forward(x)?
             .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = v
+        let v = self.v_proj.forward(x)?
             .reshape((b, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply RoPE if this layer uses it (not NoPE)
         let (q, k) = if self.skip_rope {
-            (q.contiguous()?, k.contiguous()?)
+            (q, k)
+        } else if let Some(rope) = &self.rotary_emb {
+            rope.apply_rotary_emb(&q, &k, offset)?
         } else {
-            if let Some(ref rope) = self.rotary_emb {
-                rope.apply_rotary_emb(&q, &k, offset)?
-            } else {
-                (q, k)
-            }
+            (q, k)
         };
 
-        // Update KV cache
-        let (k, v) = if offset == 0 {
-            // First token - initialize cache
-            self.kv_cache = Some((k.clone(), v.clone()));
-            (k, v)
-        } else {
-            // Subsequent tokens - concatenate with cache
-            let (k_cache, v_cache) = self.kv_cache.as_ref().unwrap();
-            let k = Tensor::cat(&[k_cache, &k], 2)?;
-            let v = Tensor::cat(&[v_cache, &v], 2)?;
-            self.kv_cache = Some((k.clone(), v.clone()));
-            (k, v)
-        };
+        // can remove this continguous call if using ConcatKV-Cache https://github.com/huggingface/candle/pull/3143
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
-        // Repeat KV for GQA
         let k = repeat_kv(k, self.num_kv_groups)?;
         let v = repeat_kv(v, self.num_kv_groups)?;
 
-        // Attention computation
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn_weights = (q.matmul(&k.t()?)? * scale)?;
 
-        if let Some(mask) = mask {
-            attn_weights = attn_weights.broadcast_add(mask)?;
-        }
+        let mut attn_weights = match mask {
+            Some(mask) => attn_weights.broadcast_add(mask)?,
+            None => attn_weights,
+        };
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v)?;
 
-        // Output projection
         attn_output
             .transpose(1, 2)?
             .reshape((b, seq_len, self.num_heads * self.head_dim))?
@@ -408,7 +335,7 @@ impl QuantizedAttention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 
@@ -421,25 +348,23 @@ struct QuantizedDecoderLayer {
 }
 
 impl QuantizedDecoderLayer {
-    fn new<R: Read + Seek>(
-        ct: &gguf_file::Content,
-        reader: &mut R,
+    fn new(
+        vb: VarBuilder,
         cfg: &QuantizedConfig,
         layer_idx: usize,
         rotary_emb: Option<Arc<RotaryEmbedding>>,
-        device: &Device,
     ) -> Result<Self> {
-        let prefix = format!("blk.{layer_idx}");
+        let attn_vb = vb.pp(&format!("blk.{layer_idx}"));
 
         Ok(Self {
-            self_attn: QuantizedAttention::new(ct, reader, cfg, layer_idx, rotary_emb, device)?,
-            mlp: QuantizedMLP::new(ct, reader, layer_idx, device)?,
+            self_attn: QuantizedAttention::new(attn_vb.clone(), cfg, layer_idx, rotary_emb)?,
+            mlp: QuantizedMLP::new(attn_vb.clone(), layer_idx)?,
             input_layernorm: RmsNorm::new(
-                ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?.dequantize(device)?,
+                attn_vb.get_no_shape("attn_norm.weight")?.dequantize(vb.device())?,
                 cfg.rms_norm_eps,
             ),
             post_attention_layernorm: RmsNorm::new(
-                ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?.dequantize(device)?,
+                attn_vb.get_no_shape("ffn_norm.weight")?.dequantize(vb.device())?,
                 cfg.rms_norm_eps,
             ),
         })
@@ -472,22 +397,23 @@ pub struct QuantizedModelForCausalLM {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<QuantizedDecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: QMatMul,
     device: Device,
     config: QuantizedConfig,
 }
 
 impl QuantizedModelForCausalLM {
     pub fn from_gguf<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<Self> {
-        let mut file = std::fs::File::open(path)?;
+        // Open file once to read metadata
+        let mut file = std::fs::File::open(path.as_ref())?;
         let content = gguf_file::Content::read(&mut file)?;
-
         let config = QuantizedConfig::from_gguf(&content)?;
 
-        // Load embedding tensor (will be used for both embed_tokens and lm_head - tied embeddings)
-        let embed_tensor = content.tensor(&mut file, "token_embd.weight", device)?
-            .dequantize(device)?;
+        // Create VarBuilder for tensor loading
+        let vb = VarBuilder::from_gguf(path, device)?;
 
+        // Load embedding tensor (will be used for both embed_tokens and lm_head - tied embeddings)
+        let embed_tensor = vb.get_no_shape("token_embd.weight")?.dequantize(device)?;
         let embed_tokens = candle_nn::Embedding::new(embed_tensor.clone(), config.hidden_size);
 
         // Create rotary embedding if needed
@@ -507,24 +433,23 @@ impl QuantizedModelForCausalLM {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             layers.push(QuantizedDecoderLayer::new(
-                &content,
-                &mut file,
+                vb.clone(),
                 &config,
                 layer_idx,
                 rotary_emb.clone(),
-                device,
             )?);
         }
 
         // Load output norm
         let norm = RmsNorm::new(
-            content.tensor(&mut file, "output_norm.weight", device)?.dequantize(device)?,
+            vb.get_no_shape("output_norm.weight")?.dequantize(device)?,
             config.rms_norm_eps,
         );
 
-        // Load LM head - uses tied embeddings (same tensor as embed_tokens, but in F32 not Q8)
-        let lm_head = Linear::from_weights(embed_tensor.clone(), None);
-
+        // Load LM head - quantize the embedding tensor for QMatMul
+        use candle::quantized::{QTensor, GgmlDType};
+        let embed_qtensor = QTensor::quantize(&embed_tensor, GgmlDType::Q8_0)?;
+        let lm_head = QMatMul::from_weights(Arc::new(embed_qtensor))?;
 
         Ok(Self {
             embed_tokens,
@@ -539,14 +464,8 @@ impl QuantizedModelForCausalLM {
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
 
-        //println!("=== FORWARD PASS DEBUG ===");
-        //println!("Input: {:?}", input_ids.dims());
-
         // Embed tokens
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-
-        let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("After embed: first 4 = {:?}", vals);
 
         // Create causal mask if needed
         let mask = if seq_len > 1 {
@@ -558,44 +477,14 @@ impl QuantizedModelForCausalLM {
         // Forward through decoder layers
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, mask.as_ref(), offset)?;
-            let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            //println!("After norm: first 4 = {:?}", vals);
-
         }
 
         // Final norm
         hidden_states = self.norm.forward(&hidden_states)?;
-        //println!("\n=== NARROW DEBUG ===");
-        //println!("Full tensor shape: {:?}", hidden_states.dims());
-        //println!("Narrowing: dim=1, start={}, len=1", seq_len - 1);
-
-        // Show a few values at different positions
-        for pos in [0, seq_len/2, seq_len-1] {
-            let slice = hidden_states.narrow(1, pos, 1)?;
-            let vals: Vec<f32> = slice.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            //println!("  Position {}: {:?}", pos, vals);
-        }
-
-        let vals: Vec<f32> = hidden_states.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("After norm: first 4 = {:?}", vals);
 
         // LM head (only last token for generation)
-        //let logits = hidden_states
-        //    .narrow(1, seq_len - 1, 1)?
-        //    .apply(&self.lm_head)?;
-
-        // Narrow to last token
         let last_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
-
-        // ADD THIS DEBUG:
-        let vals: Vec<f32> = last_hidden.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        //println!("After narrow: first 4 = {:?}", vals);
-
-        // LM head
         let logits = last_hidden.apply(&self.lm_head)?;
-
-        let vals: Vec<f32> = logits.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
-        //println!("Logits: first 10 = {:?}", vals);
 
         Ok(logits)
     }
