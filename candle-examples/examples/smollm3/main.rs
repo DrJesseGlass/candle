@@ -317,9 +317,9 @@ fn format_prompt(prompt: &str, use_chat_template: bool, enable_thinking: bool) -
 
         // Build the assistant start with or without thinking tags
         let assistant_start = if enable_thinking {
-            "<|im_start|>assistant\n<think>\n\n</think>\n"
+            "<|im_start|>assistant\n<think>\n"  // Open for reasoning
         } else {
-            "<|im_start|>assistant\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n"  // Empty = skip reasoning
         };
 
         format!(
