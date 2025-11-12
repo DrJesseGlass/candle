@@ -174,24 +174,12 @@ impl SmolLM3Attention {
             vb.pp("q_proj"),
         )?;
 
-        println!("Q_proj config: hidden_size={}, num_heads={}, head_dim={}, out_features={}",
-                 cfg.hidden_size,
-                 num_heads,
-                 head_dim,
-                 num_heads * head_dim);
-
         let k_proj = linear_b(
             cfg.hidden_size,
             num_kv_heads * head_dim,
             attention_bias,
             vb.pp("k_proj"),
         )?;
-
-        println!("K_proj config: hidden_size={}, num_heads={}, head_dim={}, out_features={}",
-                 cfg.hidden_size,
-                 num_kv_heads,
-                 head_dim,
-                 num_kv_heads * head_dim);
 
         let v_proj = linear_b(
             cfg.hidden_size,
@@ -240,28 +228,10 @@ impl SmolLM3Attention {
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
-        println!("x shape: {:?}", x.dims());
-
-        // Right before q_proj, manually compute what the output SHOULD be:
-        let x_flat: Vec<f32> = x.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("Input to q_proj: {:?}", x_flat);
-
         // 1. Proj
         let q = self.q_proj.forward(x)?;
-        println!("Output shape: {:?}", q.dims());
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
-
-        // DEBUG: Check projection outputs
-        println!("After q_proj shape: {:?}", q.dims());
-        let q_vals: Vec<f32> = q.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
-        println!("After q_proj first 12: {:?}", q_vals);
-
-        // DEBUG: Check projection outputs
-        println!("After k_proj shape: {:?}", k.dims());
-        let k_vals: Vec<f32> = k.flatten_all()?.narrow(0, 0, 12)?.to_vec1()?;
-        println!("After k_proj first 12: {:?}", k_vals);
-
 
         // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
         let q = q
@@ -437,9 +407,6 @@ impl Model {
 
         let mut h = self.embed_tokens.forward(input)?;
 
-        let vals: Vec<f32> = h.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After embed: first 4 = {:?}", vals);
-
         let causal = if l == 1 {
             None
         } else {
@@ -448,11 +415,6 @@ impl Model {
 
         for layer in &mut self.layers {
             h = layer.forward(&h, causal.as_ref(), offset)?;
-
-            // After all layers (before narrow)
-            let vals: Vec<f32> = h.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            println!("After norm: first 4 = {:?}", vals);
-
         }
         self.norm.forward(&h)
     }
@@ -478,42 +440,10 @@ impl ModelForCausalLM {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
 
-        println!("=== FORWARD PASS DEBUG ===");
-        println!("Input: {:?}", input.dims());
-
-        /*
         self.base
             .forward(input, offset)?
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
-        */
-        let h = self.base.forward(input, offset)?;
-        println!("\n=== NARROW DEBUG ===");
-        println!("Full tensor shape: {:?}", h.dims());
-        println!("Narrowing: dim=1, start={}, len=1", l - 1);
-
-        // Show a few values at different positions
-        for pos in [0, l/2, l-1] {
-            let slice = h.narrow(1, pos, 1)?;
-            let vals: Vec<f32> = slice.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-            println!("  Position {}: {:?}", pos, vals);
-        }
-
-        // Debug: hidden states after all layers + norm
-        let vals: Vec<f32> = h.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After base (with norm): first 4 = {:?}", vals);
-
-        let h_last = h.narrow(1, l - 1, 1)?;
-
-        let vals: Vec<f32> = h_last.flatten_all()?.narrow(0, 0, 4)?.to_vec1()?;
-        println!("After narrow: first 4 = {:?}", vals);
-
-        let logits = h_last.apply(&self.lm_head)?;
-
-        let vals: Vec<f32> = logits.flatten_all()?.narrow(0, 0, 10)?.to_vec1()?;
-        println!("Logits: first 10 = {:?}", vals);
-
-        Ok(logits)
 
     }
 

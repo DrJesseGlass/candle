@@ -3,6 +3,7 @@ use candle_nn::Activation;
 use candle::quantized::gguf_file;
 use crate::quantized_var_builder::VarBuilder;
 use std::sync::Arc;
+use std::io::Write;
 use crate::models::with_tracing::QMatMul;
 use candle_nn::kv_cache::KvCache;
 
@@ -254,18 +255,30 @@ impl QuantizedAttention {
         let o_proj = QMatMul::from_weights(vb.get_no_shape("attn_output.weight")?)?;
 
         // For q and k weights, we need to dequantize, reconstruct, then re-quantize
+        // IMPORTANT: Do reconstruction on CPU to avoid VRAM exhaustion during model loading
+        let device = vb.device();
+        let cpu = Device::Cpu;
+
         let q_weight_qtensor = vb.get_no_shape("attn_q.weight")?;
-        let q_weight_raw = q_weight_qtensor.dequantize(vb.device())?;
-        let q_weight = reconstruct_qk_weights(&q_weight_raw, num_heads)?;
+        let q_weight_raw = q_weight_qtensor.dequantize(&cpu)?; // Dequantize to CPU
+        let q_weight = reconstruct_qk_weights(&q_weight_raw, num_heads)?; // Reconstruct on CPU
+        let q_weight = q_weight.to_device(device)?; // Move to GPU
 
-        let k_weight_qtensor = vb.get_no_shape("attn_k.weight")?;
-        let k_weight_raw = k_weight_qtensor.dequantize(vb.device())?;
-        let k_weight = reconstruct_qk_weights(&k_weight_raw, num_kv_heads)?;
-
-        // Re-quantize the reconstructed weights
+        // Re-quantize (now on GPU)
         use candle::quantized::{QTensor, GgmlDType};
         let q_weight_qtensor = QTensor::quantize(&q_weight, GgmlDType::Q8_0)?;
+        drop(q_weight_raw); // Explicitly free CPU memory
+        drop(q_weight);
+
+        let k_weight_qtensor = vb.get_no_shape("attn_k.weight")?;
+        let k_weight_raw = k_weight_qtensor.dequantize(&cpu)?; // Dequantize to CPU
+        let k_weight = reconstruct_qk_weights(&k_weight_raw, num_kv_heads)?; // Reconstruct on CPU
+        let k_weight = k_weight.to_device(device)?; // Move to GPU
+
+        // Re-quantize (now on GPU)
         let k_weight_qtensor = QTensor::quantize(&k_weight, GgmlDType::Q8_0)?;
+        drop(k_weight_raw); // Explicitly free CPU memory
+        drop(k_weight);
 
         let q_proj = QMatMul::from_weights(Arc::new(q_weight_qtensor))?;
         let k_proj = QMatMul::from_weights(Arc::new(k_weight_qtensor))?;
@@ -281,7 +294,7 @@ impl QuantizedAttention {
             head_dim,
             rotary_emb,
             skip_rope: cfg.should_skip_rope(layer_idx),
-            kv_cache: KvCache::new(2, cfg.max_position_embeddings),
+            kv_cache: KvCache::new(2, 512),
         })
     }
 
@@ -318,6 +331,8 @@ impl QuantizedAttention {
         let v = repeat_kv(v, self.num_kv_groups)?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Make q contiguous before matmul to avoid stride mismatch
+        let q = q.contiguous()?;
         let attn_weights = (q.matmul(&k.t()?)? * scale)?;
 
         let mut attn_weights = match mask {
@@ -404,6 +419,8 @@ pub struct QuantizedModelForCausalLM {
 
 impl QuantizedModelForCausalLM {
     pub fn from_gguf<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<Self> {
+        use candle::quantized::{QTensor, GgmlDType};
+
         // Open file once to read metadata
         let mut file = std::fs::File::open(path.as_ref())?;
         let content = gguf_file::Content::read(&mut file)?;
@@ -412,9 +429,12 @@ impl QuantizedModelForCausalLM {
         // Create VarBuilder for tensor loading
         let vb = VarBuilder::from_gguf(path, device)?;
 
-        // Load embedding tensor (will be used for both embed_tokens and lm_head - tied embeddings)
-        let embed_tensor = vb.get_no_shape("token_embd.weight")?.dequantize(device)?;
-        let embed_tokens = candle_nn::Embedding::new(embed_tensor.clone(), config.hidden_size);
+        // Load embedding tensor - dequantize on CPU first to save VRAM
+        // (will be used for both embed_tokens and lm_head - tied embeddings)
+        let cpu = Device::Cpu;
+        let embed_tensor = vb.get_no_shape("token_embd.weight")?.dequantize(&cpu)?;
+        let embed_tensor_gpu = embed_tensor.to_device(device)?; // Move to GPU for embedding layer
+        let embed_tokens = candle_nn::Embedding::new(embed_tensor_gpu, config.hidden_size);
 
         // Create rotary embedding if needed
         let needs_rope = (0..config.num_hidden_layers)
@@ -431,7 +451,12 @@ impl QuantizedModelForCausalLM {
 
         // Load decoder layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        println!("Loading {} decoder layers...", config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
+            if layer_idx % 4 == 0 || layer_idx == config.num_hidden_layers - 1 {
+                print!("  Layer {}/{}...\r", layer_idx + 1, config.num_hidden_layers);
+                std::io::stdout().flush().ok();
+            }
             layers.push(QuantizedDecoderLayer::new(
                 vb.clone(),
                 &config,
@@ -439,6 +464,7 @@ impl QuantizedModelForCausalLM {
                 rotary_emb.clone(),
             )?);
         }
+        println!("  Layer {}/{} - Done!    ", config.num_hidden_layers, config.num_hidden_layers);
 
         // Load output norm
         let norm = RmsNorm::new(
@@ -446,10 +472,12 @@ impl QuantizedModelForCausalLM {
             config.rms_norm_eps,
         );
 
-        // Load LM head - quantize the embedding tensor for QMatMul
-        use candle::quantized::{QTensor, GgmlDType};
-        let embed_qtensor = QTensor::quantize(&embed_tensor, GgmlDType::Q8_0)?;
+        // Load LM head - move CPU embedding tensor to GPU, then quantize
+        let embed_tensor_for_lm = embed_tensor.to_device(device)?;
+        let embed_qtensor = QTensor::quantize(&embed_tensor_for_lm, GgmlDType::Q8_0)?;
         let lm_head = QMatMul::from_weights(Arc::new(embed_qtensor))?;
+        drop(embed_tensor); // Free CPU memory
+        drop(embed_tensor_for_lm);
 
         Ok(Self {
             embed_tokens,
