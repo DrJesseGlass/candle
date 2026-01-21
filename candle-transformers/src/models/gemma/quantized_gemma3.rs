@@ -203,9 +203,23 @@ impl LayerWeights {
         let q = self.attention_q_norm.forward(&q.contiguous()?)?;
         let k = self.attention_k_norm.forward(&k.contiguous()?)?;
 
+        // Debug: pre-RoPE Q
+        if index_pos == 0 {
+            if let Ok(v) = q.i((0, 0, 0, ..5)).and_then(|t| t.to_vec1::<f32>()) {
+                eprintln!("quantized pre-rope Q first 5: {:?}", v);
+            }
+        }
+
         let (q, k) = self
             .rotary_embedding
             .apply_rotary_emb_qkv(&q, &k, index_pos)?;
+
+        // Debug: check post-RoPE Q values
+        if index_pos == 0 {
+            if let Ok(v) = q.i((0, 0, 0, ..5)).and_then(|t| t.to_vec1::<f32>()) {
+                eprintln!("quantized post-rope Q first 5: {:?}", v);
+            }
+        }
 
         let (k, v) = match &self.kv_cache {
             None => (k, v),
@@ -230,6 +244,13 @@ impl LayerWeights {
         let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
         if let Some(mask) = mask {
+            // Debug: check mask
+            if index_pos == 0 {
+                eprintln!("quantized mask shape: {:?}", mask.shape());
+                if let Ok(v) = mask.i((0, 0, 0, ..5)).and_then(|t| t.to_vec1::<f32>()) {
+                    eprintln!("quantized mask first 5: {:?}", v);
+                }
+            }
             let mask = mask.broadcast_as(attn_weights.shape())?;
             let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
             attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
@@ -311,6 +332,9 @@ impl ModelWeights {
         let _rope_freq_scaling_factor = md_get("rope.scaling.factor")
             .and_then(|m| m.to_f32())
             .unwrap_or(DEFAULT_ROPE_FREQUENCY_SCALE_FACTOR);
+
+        eprintln!("GGUF config: head_count={}, head_count_kv={}, block_count={}, embedding_length={}, sliding_window_size={}, sliding_window_type={}, rope_freq_base={}, rope_freq_base_sliding={}",
+            head_count, head_count_kv, block_count, embedding_length, sliding_window_size, sliding_window_type, rope_freq_base, rope_freq_base_sliding);
 
         // Compute the dimensions for queries, keys, and values
         // These are the total dimensions when projected across all heads
@@ -441,26 +465,31 @@ impl ModelWeights {
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        eprintln!("quantized forward: index_pos={}", index_pos);
         let (b_sz, seq_len) = x.dims2()?;
         let _enter = self.span.enter();
 
         let mut layer_in = self.tok_embeddings.forward(x)?;
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
 
-        for layer in self.layers.iter_mut() {
+        // Debug: check embedding output
+        if index_pos == 0 {
+            let first_embed: Vec<f32> = layer_in.i((0, 0, ..5))?.to_vec1()?;
+            eprintln!("quantized embed first 5: {:?}", first_embed);
+        }
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let attention_mask = if seq_len == 1 {
                 None
             } else {
                 Some(layer.mask(b_sz, seq_len, index_pos, x.dtype(), x.device())?)
             };
-
             // Attention block
             let residual = &layer_in;
             let x = layer.attention_norm.forward(&layer_in)?;
             let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
             let x = layer.post_attention_norm.forward(&x)?;
             let x = (x + residual)?;
-
             // Feed-forward block
             let _enter = layer.span_mlp.enter();
             let residual = &x;
@@ -468,7 +497,22 @@ impl ModelWeights {
             let x = layer.mlp.forward(&x)?;
             let x = layer.post_ffn_norm.forward(&x)?;
             let x = (x + residual)?;
+
+            // Debug: after attention, before MLP
+            if index_pos == 0 {
+                if let Ok(v) = x.i((0, 0, ..5)).and_then(|t| t.to_vec1::<f32>()) {
+                    eprintln!("quantized post-attn first 5: {:?}", v);
+                }
+            }
+
+            // Feed-forward block
             drop(_enter);
+
+            // Debug first layer output
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized layer 0 out first 5: {:?}", out);
+            }
 
             layer_in = x;
         }

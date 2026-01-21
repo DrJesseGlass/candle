@@ -4,10 +4,10 @@
 //!
 //! Based on implementations from HuggingFace transformers.
 
-use std::sync::Arc;
-
+use candle::IndexOp;
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear_b as linear, Activation, Linear, VarBuilder};
+use std::sync::Arc;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -239,6 +239,20 @@ impl Attention {
         let query_states = self.q_norm.forward(&query_states)?;
         let key_states = self.k_norm.forward(&key_states)?;
 
+        // Debug: pre-RoPE Q (single head)
+        if seqlen_offset == 0 {
+            if let Ok(v) = query_states
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 1))
+                .and_then(|t| t.narrow(3, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 pre-rope Q first 5: {:?}", v);
+            }
+        }
+
         let (query_states, key_states) =
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
@@ -273,7 +287,20 @@ impl Attention {
 
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
+                Some(mask) => {
+                    // Debug: check mask shape and values
+                    if seqlen_offset == 0 {
+                        eprintln!("gemma3 mask shape: {:?}", mask.shape());
+                        if let Ok(v) = mask
+                            .i((0, 0, 0, ..5))
+                            .and_then(|t| t.to_dtype(candle::DType::F32))
+                            .and_then(|t| t.to_vec1::<f32>())
+                        {
+                            eprintln!("gemma3 mask first 5: {:?}", v);
+                        }
+                    }
+                    attn_weights.broadcast_add(mask)?
+                }
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?
@@ -379,6 +406,20 @@ impl DecoderLayer {
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = (xs + residual)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 post-attn first 5: {:?}", v);
+            }
+        }
+
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
@@ -504,25 +545,50 @@ impl Model {
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        eprintln!("gemma3 forward: seqlen_offset={}", seqlen_offset);
         let (b_size, seq_len) = input_ids.dims2()?;
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
 
+        // Debug: check embedding output
+        if seqlen_offset == 0 {
+            let first_embed: Vec<f32> = xs
+                .narrow(1, 0, 1)?
+                .narrow(2, 0, 5)?
+                .flatten_all()?
+                .to_dtype(candle::DType::F32)?
+                .to_vec1()?;
+            eprintln!("gemma3 embed first 5: {:?}", first_embed);
+        }
+
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
-        for layer in self.layers.iter_mut() {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let mask = if layer.sliding_window.is_some() {
                 &sliding_attention_mask
             } else {
                 &attention_mask
             };
-            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?
+            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?;
+
+            // Debug first layer output
+            if seqlen_offset == 0 && layer_idx == 0 {
+                let out: Vec<f32> = xs
+                    .narrow(1, 0, 1)?
+                    .narrow(2, 0, 5)?
+                    .flatten_all()?
+                    .to_dtype(candle::DType::F32)?
+                    .to_vec1()?;
+                eprintln!("gemma3 layer 0 out first 5: {:?}", out);
+            }
         }
+
         let logits = xs
             .narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
             .apply(&self.lm_head)?;
+
         let logits = match self.final_logit_softcapping {
             None => logits,
             Some(sc) => ((logits / sc)?.tanh()? * sc)?,

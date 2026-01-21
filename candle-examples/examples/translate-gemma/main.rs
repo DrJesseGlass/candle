@@ -387,6 +387,14 @@ impl Translator {
             let logits = self.model.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
+            if index == 0 {
+                eprintln!(
+                    "First forward: start_pos={}, context_len={}",
+                    start_pos,
+                    ctxt.len()
+                );
+            }
+
             let logits = if self.repeat_penalty == 1.0 {
                 logits
             } else {
@@ -400,6 +408,28 @@ impl Translator {
 
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
+
+            if index == 0 {
+                // Get top 5 logits
+                let logits_vec: Vec<f32> = logits.to_vec1()?;
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                eprintln!("Top 5 tokens:");
+                for (idx, score) in indexed.iter().take(5) {
+                    eprintln!(
+                        "  {} ({:.2}) -> {:?}",
+                        idx,
+                        score,
+                        self.tokenizer.decode(&[*idx as u32], false)
+                    );
+                }
+                eprintln!(
+                    "Selected: {} -> {:?}",
+                    next_token,
+                    self.tokenizer.decode(&[next_token], false)
+                );
+            }
 
             if next_token == self.eos_token || next_token == self.eot_token {
                 break;
@@ -422,6 +452,16 @@ impl Translator {
             .tokenizer
             .decode(&output_tokens, true)
             .map_err(E::msg)?;
+
+        let tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+        // Debug: show first tokens and their decoded values
+        eprintln!("=== DEBUG ===");
+        eprintln!("First 10 token IDs: {:?}", &tokens[..tokens.len().min(10)]);
+        for &t in &tokens[..tokens.len().min(10)] {
+            eprintln!("  {} -> {:?}", t, self.tokenizer.decode(&[t], false));
+        }
+        eprintln!("=============");
 
         // Clean up output
         let result = result
@@ -627,7 +667,9 @@ fn main() -> Result<()> {
                     .or_insert(serde_json::Value::Number(6.into()));
             }
 
-            let text_config = serde_json::from_value(text_config_value.clone())?;
+            let text_config: candle_transformers::models::gemma::gemma3::Config =
+                serde_json::from_value(text_config_value.clone())?;
+            eprintln!("Full config: {:?}", text_config);
 
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
             let vb = vb.pp("language_model");
