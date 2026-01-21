@@ -247,16 +247,23 @@ impl Qwen3Attention {
     }
 
     /// GPU flash attention path (requires flash-attn feature)
+    ///
+    /// FIX: The original implementation ignored the KV cache offset, causing
+    /// flash_attn's causal mask to only allow the query to see position 0
+    /// instead of all cached tokens. We now use the varlen API with proper
+    /// cumulative sequence lengths to handle the offset correctly.
     #[cfg(feature = "flash-attn")]
     fn forward_flash_attn(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        _offset: usize,
+        offset: usize,
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
+        let kv_len = k.dim(2)?; // Full KV cache length (offset + l)
+
         // Flash attention expects (B, S, H, D) format
         let q = q.transpose(1, 2)?.contiguous()?;
         let k = k.transpose(1, 2)?.contiguous()?;
@@ -264,9 +271,47 @@ impl Qwen3Attention {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        let ctx = candle_flash_attn::flash_attn(&q, &k, &v, scale, true)?;
+        // Use varlen API to properly handle KV cache offset
+        // This tells flash-attn the actual sequence positions so causal masking
+        // correctly allows query tokens to attend to all prior cached tokens.
+        //
+        // For a single sequence with q_len=l and kv_len=offset+l:
+        // - q_seqlens: [0, l] (query spans positions 0..l within this call)
+        // - kv_seqlens: [0, kv_len] (KV spans positions 0..kv_len including cache)
+        //
+        // The max_seqlen parameters tell flash-attn the maximum sequence length
+        // for memory allocation purposes.
+        let q_seqlens = Tensor::from_vec(
+            (0..=b).map(|i| (i * l) as u32).collect::<Vec<_>>(),
+            (b + 1,),
+            q.device(),
+        )?;
+        let kv_seqlens = Tensor::from_vec(
+            (0..=b).map(|i| (i * kv_len) as u32).collect::<Vec<_>>(),
+            (b + 1,),
+            k.device(),
+        )?;
 
-        // Output: (B, S, H, D) -> (B, L, hidden_size)
+        // Reshape to (total_tokens, num_heads, head_dim) for varlen API
+        let q_flat = q.reshape((b * l, self.num_heads, self.head_dim))?;
+        let k_flat = k.reshape((b * kv_len, self.num_kv_heads, self.head_dim))?;
+        let v_flat = v.reshape((b * kv_len, self.num_kv_heads, self.head_dim))?;
+
+        // Use flash_attn_varlen which properly handles different Q and KV lengths
+        // The window_size_left parameter can implement sliding window if needed
+        let ctx = candle_flash_attn::flash_attn_varlen(
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            &q_seqlens,
+            &kv_seqlens,
+            l,      // max_seqlen_q
+            kv_len, // max_seqlen_k
+            scale,
+            true, // causal - now correctly applied with proper sequence lengths
+        )?;
+
+        // Output: (total_q_tokens, num_heads, head_dim) -> (B, L, hidden_size)
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
@@ -348,20 +393,63 @@ impl Qwen3Attention {
         ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
-    /// Stub for when flash-attn is enabled (CPU path not needed)
+    /// CPU fallback when flash-attn feature IS enabled but running on CPU
+    ///
+    /// FIX: The original implementation passed `None` for the attention mask,
+    /// but Model::forward skipped building the mask when use_flash_attn=true.
+    /// This resulted in bidirectional attention on CPU.
+    ///
+    /// Solution: Build the causal mask here since we need it for standard attention.
     #[cfg(feature = "flash-attn")]
     fn forward_cpu_flash_attn(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        _offset: usize,
+        offset: usize,
         b: usize,
         l: usize,
     ) -> Result<Tensor> {
-        // When flash-attn feature is enabled, fall back to standard attention for CPU
-        // This path is rarely hit since GPU is typically used with flash-attn
-        self.forward_standard_attn(q, k, v, None, b, l)
+        // Build causal mask since Model::forward skipped it when use_flash_attn=true
+        let kv_len = k.dim(2)?;
+        let attn_mask = self.build_causal_mask(b, l, kv_len, q.device(), q.dtype())?;
+        self.forward_standard_attn(q, k, v, Some(&attn_mask), b, l)
+    }
+
+    /// Build a causal attention mask for standard attention
+    ///
+    /// Creates a mask of shape (B, 1, q_len, kv_len) where:
+    /// - Positions that can be attended to have value 0
+    /// - Positions that should be masked have value -inf
+    #[cfg(feature = "flash-attn")]
+    fn build_causal_mask(
+        &self,
+        b: usize,
+        q_len: usize,
+        kv_len: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let offset = kv_len - q_len; // Infer offset from sequence lengths
+        let minf = f32::NEG_INFINITY;
+
+        let mask: Vec<f32> = (0..q_len)
+            .flat_map(|i| {
+                (0..kv_len).map(move |j| {
+                    // Query at position i (relative) is at absolute position i + offset
+                    // It can attend to KV positions 0..=(i + offset)
+                    if j <= i + offset {
+                        0.0
+                    } else {
+                        minf
+                    }
+                })
+            })
+            .collect();
+
+        Tensor::from_slice(&mask, (1, 1, q_len, kv_len), device)?
+            .broadcast_as((b, 1, q_len, kv_len))?
+            .to_dtype(dtype)
     }
 
     /// Standard matmul-based attention (works on any device)
@@ -505,8 +593,14 @@ impl Model {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
 
-        // Build causal mask for standard attention path
-        // Flash attention (CPU or GPU) handles masking internally
+        // Build causal mask for standard attention path.
+        //
+        // When use_flash_attn is true:
+        // - GPU path: flash_attn_varlen handles masking with proper offset
+        // - CPU path (with flash-attn feature): forward_cpu_flash_attn builds its own mask
+        //
+        // So we only need to build a mask here for the non-flash standard attention path.
+        // Also skip mask for single-token decoding (l == 1) as it's unnecessary.
         let needs_mask = !self.use_flash_attn && l > 1;
         let causal = if needs_mask {
             Some(self.causal_mask(b, l, offset, None)?)
