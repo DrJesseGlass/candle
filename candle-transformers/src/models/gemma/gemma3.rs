@@ -132,7 +132,8 @@ impl MLP {
             gate_proj,
             up_proj,
             down_proj,
-            act_fn: cfg.hidden_activation,
+            //act_fn: cfg.hidden_activation,
+            act_fn: candle_nn::Activation::Silu,
         })
     }
 }
@@ -403,8 +404,50 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 pre-attn post norm first 5: {:?}", v);
+            }
+        }
+
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 post-attn prenorm first 5: {:?}", v);
+            }
+        }
+
         let xs = xs.apply(&self.post_attention_layernorm)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("post norm first 5: {:?}", v);
+            }
+        }
+
         let xs = (xs + residual)?;
 
         // Debug: after attention, before MLP
@@ -416,15 +459,72 @@ impl DecoderLayer {
                 .and_then(|t| t.to_dtype(candle::DType::F32))
                 .and_then(|t| t.to_vec1::<f32>())
             {
-                eprintln!("gemma3 post-attn first 5: {:?}", v);
+                eprintln!("gemma3 after resid added post-attn first 5: {:?}", v);
             }
         }
 
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 pre mlp norm first 5: {:?}", v);
+            }
+        }
+
         let xs = xs.apply(&self.mlp)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 after mlp first 5: {:?}", v);
+            }
+        }
+
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
-        residual + xs
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 after post mlp norm  first 5: {:?}", v);
+            }
+        }
+
+        let xs = (residual + xs)?;
+
+        // Debug: after attention, before MLP
+        if seqlen_offset == 0 {
+            if let Ok(v) = xs
+                .narrow(1, 0, 1)
+                .and_then(|t| t.narrow(2, 0, 5))
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(candle::DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("gemma3 after second resid added  first 5: {:?}", v);
+            }
+        }
+
+        Ok(xs)
     }
 
     fn clear_kv_cache(&mut self) {

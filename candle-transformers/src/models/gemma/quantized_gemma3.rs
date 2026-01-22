@@ -487,21 +487,69 @@ impl ModelWeights {
             // Attention block
             let residual = &layer_in;
             let x = layer.attention_norm.forward(&layer_in)?;
+
+            // Debug first layer output
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized first norm layer 0 out first 5: {:?}", out);
+            }
+
             let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
+
+            // Debug first layer output
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized attn out layer 0 out first 5: {:?}", out);
+            }
+
             let x = layer.post_attention_norm.forward(&x)?;
+            // Debug first layer output
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized post attn norm layer 0 out first 5: {:?}", out);
+            }
+
             let x = (x + residual)?;
+
+            // Debug first layer output
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized after resid added ayer 0 out first 5: {:?}", out);
+            }
+
             // Feed-forward block
             let _enter = layer.span_mlp.enter();
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
+
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized after pre mlp norm out first 5: {:?}", out);
+            }
+
             let x = layer.mlp.forward(&x)?;
+
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!("quantized after mlp  ayer 0 out first 5: {:?}", out);
+            }
+
             let x = layer.post_ffn_norm.forward(&x)?;
+
+            if index_pos == 0 && layer_idx == 0 {
+                let out: Vec<f32> = x.i((0, 0, ..5))?.to_vec1()?;
+                eprintln!(
+                    "quantized after post mlp norm  yer 0 out first 5: {:?}",
+                    out
+                );
+            }
+
             let x = (x + residual)?;
 
             // Debug: after attention, before MLP
             if index_pos == 0 {
                 if let Ok(v) = x.i((0, 0, ..5)).and_then(|t| t.to_vec1::<f32>()) {
-                    eprintln!("quantized post-attn first 5: {:?}", v);
+                    eprintln!("quantized second resid added first 5: {:?}", v);
                 }
             }
 
