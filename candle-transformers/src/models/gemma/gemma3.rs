@@ -132,8 +132,8 @@ impl MLP {
             gate_proj,
             up_proj,
             down_proj,
-            //act_fn: cfg.hidden_activation,
-            act_fn: candle_nn::Activation::Silu,
+            act_fn: cfg.hidden_activation,
+            //act_fn: candle_nn::Activation::Silu,
         })
     }
 }
