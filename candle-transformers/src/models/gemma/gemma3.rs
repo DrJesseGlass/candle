@@ -1,13 +1,66 @@
-//! Gemma LLM architecture (Google) inference implementation.
+//! Gemma3 with layer-by-layer debug output.
+//! Debug output format matches dump_layers.py for easy comparison.
 //!
-//! See ["Introducing Gemma 3: The most capable model you can run on a single GPU or TPU"](https://blog.google/technology/developers/gemma-3/)
-//!
-//! Based on implementations from HuggingFace transformers.
+//! Enable debug with: DEBUG_LAYER=1 (or -1 for all layers)
 
-use candle::IndexOp;
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear_b as linear, Activation, Linear, VarBuilder};
 use std::sync::Arc;
+
+// =============================================================================
+// DEBUG CONFIGURATION
+// =============================================================================
+
+/// Set to true to enable debug output
+const DEBUG_ENABLED: bool = true;
+
+/// Which layer to debug (-1 = all layers, 0 = layer 0 only, etc.)
+const DEBUG_LAYER: i32 = 1; // Debug layers 0 and 1
+
+/// Helper to print debug values in matching format
+fn debug_print(name: &str, t: &Tensor, token_idx: usize) {
+    if !DEBUG_ENABLED {
+        return;
+    }
+
+    if let Ok(vals) = t
+        .narrow(1, token_idx, 1)
+        .and_then(|t| t.narrow(2, 0, 5))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        let rounded: Vec<f32> = vals.iter().map(|v| (v * 1e6).round() / 1e6).collect();
+        eprintln!("{:30}: {:?}", name, rounded);
+    }
+}
+
+fn debug_print_4d(name: &str, t: &Tensor, head_idx: usize, token_idx: usize) {
+    if !DEBUG_ENABLED {
+        return;
+    }
+
+    // t is [batch, heads, seq, head_dim]
+    if let Ok(vals) = t
+        .narrow(1, head_idx, 1) // Select head
+        .and_then(|t| t.narrow(2, token_idx, 1)) // Select token
+        .and_then(|t| t.narrow(3, 0, 5)) // First 5 dims
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        let rounded: Vec<f32> = vals.iter().map(|v| (v * 1e6).round() / 1e6).collect();
+        eprintln!("{:30}: {:?}", name, rounded);
+    }
+}
+
+fn should_debug_layer(layer_idx: usize) -> bool {
+    DEBUG_ENABLED && (DEBUG_LAYER < 0 || layer_idx as i32 <= DEBUG_LAYER)
+}
+
+// =============================================================================
+// CONFIG
+// =============================================================================
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -30,6 +83,10 @@ pub struct Config {
     pub sliding_window_pattern: usize,
     pub max_position_embeddings: usize,
 }
+
+// =============================================================================
+// RMS NORM (Gemma adds 1 to weight)
+// =============================================================================
 
 #[derive(Debug, Clone)]
 struct RmsNorm {
@@ -55,11 +112,16 @@ impl Module for RmsNorm {
         let x = x.to_dtype(internal_dtype)?;
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        // Gemma: weight is (1 + weight), not just weight
         x_normed
             .to_dtype(x_dtype)?
             .broadcast_mul(&(&self.weight + 1.0)?)
     }
 }
+
+// =============================================================================
+// ROTARY EMBEDDING
+// =============================================================================
 
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
@@ -112,13 +174,27 @@ impl RotaryEmbedding {
     }
 }
 
+// =============================================================================
+// MLP
+// =============================================================================
+
+fn gelu_pytorch_tanh(x: &Tensor) -> Result<Tensor> {
+    // GELU with tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    const SQRT_2_OVER_PI: f64 = 0.7978845608028654;
+    const COEF: f64 = 0.044715;
+
+    let x_cubed = x.powf(3.0)?;
+    let inner = ((x + (&x_cubed * COEF)?)? * SQRT_2_OVER_PI)?;
+    let tanh_val = inner.tanh()?;
+    let one_plus_tanh = (&tanh_val + 1.0)?;
+    x.mul(&one_plus_tanh)?.affine(0.5, 0.0)
+}
+
 #[derive(Debug, Clone)]
-#[allow(clippy::upper_case_acronyms)]
 struct MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    act_fn: candle_nn::Activation,
 }
 
 impl MLP {
@@ -132,25 +208,63 @@ impl MLP {
             gate_proj,
             up_proj,
             down_proj,
-            //act_fn: cfg.hidden_activation,
-            act_fn: candle_nn::Activation::Silu,
         })
+    }
+
+    fn forward_debug(&self, xs: &Tensor, layer_idx: usize) -> Result<Tensor> {
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
+
+        if should_debug_layer(layer_idx) {
+            debug_print(&format!("L{} gate_proj out", layer_idx), &gate, 0);
+            debug_print(&format!("L{} up_proj out", layer_idx), &up, 0);
+        }
+
+        // Use GELU with tanh approximation
+        let activated = gelu_pytorch_tanh(&gate)?;
+
+        if should_debug_layer(layer_idx) {
+            debug_print(&format!("L{} after gelu_tanh", layer_idx), &activated, 0);
+        }
+
+        let gate_up = (&activated * &up)?;
+
+        if should_debug_layer(layer_idx) {
+            debug_print(&format!("L{} gate * up", layer_idx), &gate_up, 0);
+        }
+
+        let out = gate_up.apply(&self.down_proj)?;
+
+        if should_debug_layer(layer_idx) {
+            debug_print(&format!("L{} down_proj (mlp out)", layer_idx), &out, 0);
+        }
+
+        Ok(out)
     }
 }
 
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
+        let activated = gelu_pytorch_tanh(&gate)?;
+        (&activated * &up)?.apply(&self.down_proj)
     }
 }
+
+// =============================================================================
+// KV CACHE
+// =============================================================================
 
 #[derive(Debug, Clone)]
 enum KvCache {
     Normal(candle_nn::kv_cache::KvCache),
     Rotating(candle_nn::kv_cache::RotatingKvCache),
 }
+
+// =============================================================================
+// ATTENTION
+// =============================================================================
 
 #[derive(Debug, Clone)]
 struct Attention {
@@ -216,100 +330,112 @@ impl Attention {
         })
     }
 
-    fn forward(
+    fn forward_debug(
         &mut self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        layer_idx: usize,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        let debug = seqlen_offset == 0 && should_debug_layer(layer_idx);
 
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
+        // Q, K, V projections
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
 
-        let query_states = query_states
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let query_states = self.q_norm.forward(&query_states)?;
-        let key_states = self.k_norm.forward(&key_states)?;
-
-        // Debug: pre-RoPE Q (single head)
-        if seqlen_offset == 0 {
-            if let Ok(v) = query_states
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 1))
-                .and_then(|t| t.narrow(3, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 pre-rope Q first 5: {:?}", v);
-            }
+        if debug {
+            debug_print(&format!("L{} q_proj out", layer_idx), &q, 0);
+            debug_print(&format!("L{} k_proj out", layer_idx), &k, 0);
+            debug_print(&format!("L{} v_proj out", layer_idx), &v, 0);
         }
 
-        let (query_states, key_states) =
-            self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+        // Reshape to [batch, heads, seq, head_dim]
+        let q = q
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
-        let key_states = key_states.contiguous()?;
-        let value_states = value_states.contiguous()?;
+        // Q, K norms
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
 
-        let (key_states, value_states) = match &mut self.kv_cache {
-            KvCache::Normal(cache) => cache.append(&key_states, &value_states)?,
-            KvCache::Rotating(cache) => cache.append(&key_states, &value_states)?,
+        if debug {
+            debug_print_4d(&format!("L{} q after norm", layer_idx), &q, 0, 0);
+            debug_print_4d(&format!("L{} k after norm", layer_idx), &k, 0, 0);
+        }
+
+        // RoPE
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
+
+        if debug {
+            debug_print_4d(&format!("L{} q after RoPE", layer_idx), &q, 0, 0);
+            debug_print_4d(&format!("L{} k after RoPE", layer_idx), &k, 0, 0);
+        }
+
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
+        // KV cache
+        let (k, v) = match &mut self.kv_cache {
+            KvCache::Normal(cache) => cache.append(&k, &v)?,
+            KvCache::Rotating(cache) => cache.append(&k, &v)?,
         };
 
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states =
-            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        // Expand K, V for GQA
+        let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+        let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
+        // Attention computation
         let attn_output = if self.use_flash_attn {
-            // flash-attn expects (b_sz, seq_len, nheads, head_dim)
-            let q = query_states.transpose(1, 2)?;
-            let k = key_states.transpose(1, 2)?;
-            let v = value_states.transpose(1, 2)?;
-            let scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, scale, attention_mask.is_some())?.transpose(1, 2)?
+            #[cfg(feature = "flash-attn")]
+            {
+                let q = q.transpose(1, 2)?;
+                let k = k.transpose(1, 2)?;
+                let v = v.transpose(1, 2)?;
+                let scale = 1f32 / (self.head_dim as f32).sqrt();
+                flash_attn(&q, &k, &v, scale, attention_mask.is_some())?.transpose(1, 2)?
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            candle::bail!("flash-attn feature not enabled")
         } else {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+            let scale = 1f64 / (self.head_dim as f64).sqrt();
+            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
+            // Softcapping
             let attn_weights = match self.attn_logit_softcapping {
                 None => attn_weights,
                 Some(sc) => ((attn_weights / sc)?.tanh()? * sc)?,
             };
 
+            // Apply mask
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => {
-                    // Debug: check mask shape and values
-                    if seqlen_offset == 0 {
-                        eprintln!("gemma3 mask shape: {:?}", mask.shape());
-                        if let Ok(v) = mask
-                            .i((0, 0, 0, ..5))
-                            .and_then(|t| t.to_dtype(candle::DType::F32))
-                            .and_then(|t| t.to_vec1::<f32>())
-                        {
-                            eprintln!("gemma3 mask first 5: {:?}", v);
-                        }
-                    }
-                    attn_weights.broadcast_add(mask)?
-                }
+                Some(mask) => attn_weights.broadcast_add(mask)?,
             };
+
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&value_states)?
+            attn_weights.matmul(&v)?
         };
-        attn_output
+
+        let out = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj)
+            .apply(&self.o_proj)?;
+
+        if debug {
+            debug_print(&format!("L{} self_attn out", layer_idx), &out, 0);
+        }
+
+        Ok(out)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -320,30 +446,18 @@ impl Attention {
     }
 }
 
-#[cfg(feature = "flash-attn")]
-fn flash_attn(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> Result<Tensor> {
-    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
-}
-
-#[cfg(not(feature = "flash-attn"))]
-fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
-    unimplemented!("compile with '--features flash-attn'")
-}
+// =============================================================================
+// DECODER LAYER
+// =============================================================================
 
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
     mlp: MLP,
     input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
     pre_feedforward_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
     sliding_window: Option<usize>,
 }
 
@@ -370,6 +484,11 @@ impl DecoderLayer {
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
         let pre_feedforward_layernorm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -380,18 +499,13 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
         )?;
-        let post_attention_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
+            post_attention_layernorm,
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
-            post_attention_layernorm,
             sliding_window,
         })
     }
@@ -401,127 +515,60 @@ impl DecoderLayer {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        layer_idx: usize,
     ) -> Result<Tensor> {
+        let debug = seqlen_offset == 0 && should_debug_layer(layer_idx);
+
+        // Input layernorm
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 pre-attn post norm first 5: {:?}", v);
-            }
+        if debug {
+            debug_print(&format!("L{} input_layernorm", layer_idx), &xs, 0);
         }
 
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        // Self attention
+        let xs = self
+            .self_attn
+            .forward_debug(&xs, attention_mask, seqlen_offset, layer_idx)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 post-attn prenorm first 5: {:?}", v);
-            }
+        // Post attention layernorm
+        let xs = self.post_attention_layernorm.forward(&xs)?;
+
+        if debug {
+            debug_print(&format!("L{} post_attn_layernorm", layer_idx), &xs, 0);
         }
 
-        let xs = xs.apply(&self.post_attention_layernorm)?;
-
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("post norm first 5: {:?}", v);
-            }
-        }
-
+        // Add residual
         let xs = (xs + residual)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 after resid added post-attn first 5: {:?}", v);
-            }
+        if debug {
+            debug_print(&format!("L{} after attn residual", layer_idx), &xs, 0);
         }
 
+        // Pre-feedforward layernorm
         let residual = &xs;
-        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+        let xs_mlp = self.pre_feedforward_layernorm.forward(&xs)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 pre mlp norm first 5: {:?}", v);
-            }
+        if debug {
+            debug_print(&format!("L{} pre_feedforward_ln", layer_idx), &xs_mlp, 0);
         }
 
-        let xs = xs.apply(&self.mlp)?;
+        // MLP
+        let xs_mlp = self.mlp.forward_debug(&xs_mlp, layer_idx)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 after mlp first 5: {:?}", v);
-            }
+        // Post feedforward layernorm
+        let xs_mlp = self.post_feedforward_layernorm.forward(&xs_mlp)?;
+
+        if debug {
+            debug_print(&format!("L{} post_feedforward_ln", layer_idx), &xs_mlp, 0);
         }
 
-        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        // Add residual
+        let xs = (residual + xs_mlp)?;
 
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 after post mlp norm  first 5: {:?}", v);
-            }
-        }
-
-        let xs = (residual + xs)?;
-
-        // Debug: after attention, before MLP
-        if seqlen_offset == 0 {
-            if let Ok(v) = xs
-                .narrow(1, 0, 1)
-                .and_then(|t| t.narrow(2, 0, 5))
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_dtype(candle::DType::F32))
-                .and_then(|t| t.to_vec1::<f32>())
-            {
-                eprintln!("gemma3 after second resid added  first 5: {:?}", v);
-            }
+        if debug {
+            debug_print(&format!("L{} layer output", layer_idx), &xs, 0);
         }
 
         Ok(xs)
@@ -531,6 +578,10 @@ impl DecoderLayer {
         self.self_attn.clear_kv_cache()
     }
 }
+
+// =============================================================================
+// PREPARE ATTENTION MASK
+// =============================================================================
 
 fn prepare_decoder_attention_mask(
     b_size: usize,
@@ -568,6 +619,10 @@ fn prepare_decoder_attention_mask(
         .to_dtype(dtype)
 }
 
+// =============================================================================
+// MODEL
+// =============================================================================
+
 #[derive(Debug, Clone)]
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
@@ -600,6 +655,15 @@ impl Model {
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
+
+        if DEBUG_ENABLED {
+            eprintln!(
+                "Model loaded: {} layers, hidden_size={}",
+                layers.len(),
+                cfg.hidden_size
+            );
+        }
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -645,50 +709,52 @@ impl Model {
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        eprintln!("gemma3 forward: seqlen_offset={}", seqlen_offset);
         let (b_size, seq_len) = input_ids.dims2()?;
+
+        if DEBUG_ENABLED && seqlen_offset == 0 {
+            eprintln!("\n{}", "=".repeat(70));
+            eprintln!("CANDLE FORWARD PASS (token 0 values)");
+            eprintln!("{}", "=".repeat(70));
+        }
+
+        // Embedding with scaling
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
 
-        // Debug: check embedding output
         if seqlen_offset == 0 {
-            let first_embed: Vec<f32> = xs
-                .narrow(1, 0, 1)?
-                .narrow(2, 0, 5)?
-                .flatten_all()?
-                .to_dtype(candle::DType::F32)?
-                .to_vec1()?;
-            eprintln!("gemma3 embed first 5: {:?}", first_embed);
+            debug_print("embed (after scaling)", &xs, 0);
         }
 
+        // Prepare attention masks
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
+        // Process layers
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            if seqlen_offset == 0 && should_debug_layer(layer_idx) {
+                eprintln!("\n--- Layer {} ---", layer_idx);
+            }
+
             let mask = if layer.sliding_window.is_some() {
                 &sliding_attention_mask
             } else {
                 &attention_mask
             };
-            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?;
-
-            // Debug first layer output
-            if seqlen_offset == 0 && layer_idx == 0 {
-                let out: Vec<f32> = xs
-                    .narrow(1, 0, 1)?
-                    .narrow(2, 0, 5)?
-                    .flatten_all()?
-                    .to_dtype(candle::DType::F32)?
-                    .to_vec1()?;
-                eprintln!("gemma3 layer 0 out first 5: {:?}", out);
-            }
+            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset, layer_idx)?;
         }
 
-        let logits = xs
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.norm)?
-            .apply(&self.lm_head)?;
+        // Final norm (only on last token)
+        let xs = xs.narrow(1, seq_len - 1, 1)?;
+        let xs = self.norm.forward(&xs)?;
 
+        if seqlen_offset == 0 && DEBUG_ENABLED {
+            debug_print("final_norm (last token)", &xs, 0);
+        }
+
+        // LM head
+        let logits = xs.apply(&self.lm_head)?;
+
+        // Final softcapping
         let logits = match self.final_logit_softcapping {
             None => logits,
             Some(sc) => ((logits / sc)?.tanh()? * sc)?,
@@ -702,4 +768,15 @@ impl Model {
             layer.clear_kv_cache()
         }
     }
+}
+
+#[cfg(feature = "flash-attn")]
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }

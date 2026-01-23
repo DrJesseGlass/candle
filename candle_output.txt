@@ -1,0 +1,5 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/jesse/Documents/solo/candle/candle-wasm-examples/quant-qwen3/Cargo.toml
+workspace: /home/jesse/Documents/solo/candle/Cargo.toml
+error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.
+available binaries: app, app, app, m, m, m, m, m, m, m, m, m, m-quantized, tensor-tools, worker, worker, worker

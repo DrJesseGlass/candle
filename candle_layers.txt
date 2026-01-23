@@ -1,0 +1,414 @@
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/jesse/Documents/solo/candle/candle-wasm-examples/quant-qwen3/Cargo.toml
+workspace: /home/jesse/Documents/solo/candle/Cargo.toml
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.42
+   Compiling unicode-ident v1.0.22
+   Compiling libc v0.2.178
+   Compiling cfg-if v1.0.4
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.5
+   Compiling autocfg v1.5.0
+   Compiling libm v0.2.15
+   Compiling once_cell v1.21.3
+   Compiling pkg-config v0.3.32
+   Compiling memchr v2.7.6
+   Compiling zerocopy v0.8.31
+   Compiling vcpkg v0.2.15
+   Compiling bitflags v2.10.0
+   Compiling serde_core v1.0.228
+   Compiling stable_deref_trait v1.2.1
+   Compiling itoa v1.0.15
+   Compiling getrandom v0.3.4
+   Compiling icu_normalizer_data v2.1.1
+   Compiling icu_properties_data v2.1.1
+   Compiling crc32fast v1.5.0
+   Compiling serde v1.0.228
+   Compiling pin-project-lite v0.2.16
+   Compiling crossbeam-utils v0.8.21
+   Compiling openssl v0.10.75
+   Compiling serde_json v1.0.145
+   Compiling version_check v0.9.5
+   Compiling hashbrown v0.16.1
+   Compiling equivalent v1.0.2
+   Compiling futures-core v0.3.31
+   Compiling paste v1.0.15
+   Compiling either v1.15.0
+   Compiling httparse v1.10.1
+   Compiling bytes v1.11.0
+   Compiling native-tls v0.2.14
+   Compiling rayon-core v1.13.0
+   Compiling num-traits v0.2.19
+   Compiling fnv v1.0.7
+   Compiling futures-sink v0.3.31
+   Compiling indexmap v2.12.1
+   Compiling smallvec v1.15.1
+   Compiling slab v0.4.11
+   Compiling ryu v1.0.20
+   Compiling futures-channel v0.3.31
+   Compiling pulp v0.21.5
+   Compiling crossbeam-epoch v0.9.18
+   Compiling writeable v0.6.2
+   Compiling litemap v0.8.1
+   Compiling pin-utils v0.1.0
+   Compiling http v1.4.0
+   Compiling syn v2.0.111
+   Compiling jobserver v0.1.34
+   Compiling mio v1.1.1
+   Compiling socket2 v0.6.1
+   Compiling crossbeam-deque v0.8.6
+   Compiling tracing-core v0.1.35
+   Compiling rand_core v0.9.3
+   Compiling cc v1.2.48
+   Compiling dyn-stack-macros v0.1.3
+   Compiling futures-io v0.3.31
+   Compiling log v0.4.29
+   Compiling reborrow v0.5.5
+   Compiling futures-task v0.3.31
+   Compiling getrandom v0.2.16
+   Compiling rayon v1.11.0
+   Compiling raw-cpuid v11.6.0
+   Compiling object v0.37.3
+   Compiling foreign-types-shared v0.1.1
+   Compiling rustls v0.23.35
+   Compiling rustversion v1.0.22
+   Compiling portable-atomic v1.11.1
+   Compiling seq-macro v0.3.6
+   Compiling simd-adler32 v0.3.7
+   Compiling percent-encoding v2.3.2
+   Compiling zeroize v1.8.2
+   Compiling foreign-types v0.3.2
+   Compiling http-body v1.0.1
+   Compiling rustls-pki-types v1.13.1
+   Compiling winnow v0.7.14
+   Compiling adler2 v2.0.1
+   Compiling thiserror v2.0.17
+   Compiling miniz_oxide v0.8.9
+   Compiling tracing v0.1.43
+   Compiling openssl-probe v0.1.6
+   Compiling toml_datetime v0.7.3
+   Compiling tower-service v0.3.3
+   Compiling atomic-waker v1.1.2
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling form_urlencoded v1.2.2
+   Compiling utf8_iter v1.0.4
+   Compiling strsim v0.11.1
+   Compiling untrusted v0.9.0
+   Compiling base64 v0.22.1
+   Compiling ident_case v1.0.1
+   Compiling sync_wrapper v1.0.2
+   Compiling aho-corasick v1.1.4
+   Compiling thiserror v1.0.69
+   Compiling toml_parser v1.0.4
+   Compiling openssl-sys v0.9.111
+   Compiling ring v0.17.14
+   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+   Compiling byteorder v1.5.0
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.11.0
+   Compiling regex-syntax v0.8.8
+   Compiling anyhow v1.0.100
+   Compiling toml_edit v0.23.7
+   Compiling flate2 v1.1.7
+   Compiling webpki-roots v1.0.4
+   Compiling proc-macro-crate v3.4.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling http-body-util v0.1.3
+   Compiling num-integer v0.1.46
+   Compiling zip v1.1.4
+   Compiling subtle v2.6.1
+   Compiling gimli v0.32.3
+   Compiling iri-string v0.7.9
+   Compiling unicode-width v0.2.2
+   Compiling option-ext v0.2.0
+   Compiling socks v0.3.4
+   Compiling dirs-sys v0.5.0
+   Compiling console v0.15.11
+   Compiling rand_chacha v0.9.0
+   Compiling regex-automata v0.4.13
+   Compiling webpki-roots v0.26.11
+   Compiling onig_sys v69.9.1
+   Compiling num_cpus v1.17.0
+   Compiling encoding_rs v0.8.35
+   Compiling number_prefix v0.4.0
+   Compiling rustc-demangle v0.1.26
+   Compiling mime v0.3.17
+   Compiling indicatif v0.17.11
+   Compiling rand v0.9.2
+   Compiling dirs v6.0.0
+   Compiling num-bigint v0.4.6
+   Compiling addr2line v0.25.1
+   Compiling fdeflate v0.3.7
+   Compiling rand_core v0.6.4
+   Compiling pxfm v0.1.26
+   Compiling memmap2 v0.9.9
+   Compiling matrixmultiply v0.3.10
+   Compiling ahash v0.8.12
+   Compiling typenum v1.19.0
+   Compiling zune-core v0.5.0
+   Compiling utf8parse v0.2.2
+   Compiling bit-vec v0.6.3
+   Compiling esaxx-rs v0.1.10
+   Compiling bit-vec v0.8.0
+   Compiling minimal-lexical v0.2.1
+   Compiling bit-set v0.5.3
+   Compiling zune-jpeg v0.5.5
+   Compiling anstyle-parse v0.2.7
+   Compiling nom v7.1.3
+   Compiling bit-set v0.8.0
+   Compiling num-rational v0.4.2
+   Compiling png v0.18.0
+   Compiling backtrace v0.3.76
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.1
+   Compiling displaydoc v0.2.5
+   Compiling zerovec-derive v0.11.2
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.6.0
+   Compiling zerocopy-derive v0.8.31
+   Compiling bytemuck_derive v1.10.2
+   Compiling futures-macro v0.3.31
+   Compiling openssl-macros v0.1.1
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror-impl v2.0.17
+   Compiling thiserror-impl v1.0.69
+   Compiling num_enum_derive v0.7.5
+   Compiling darling_macro v0.20.11
+   Compiling zerofrom v0.1.6
+   Compiling yoke v0.8.1
+   Compiling zerovec v0.11.5
+   Compiling tokio v1.48.0
+   Compiling zerotrie v0.2.3
+   Compiling futures-util v0.3.31
+   Compiling tinystr v0.8.2
+   Compiling potential_utf v0.1.4
+   Compiling icu_locale_core v2.1.1
+   Compiling bytemuck v1.24.0
+   Compiling icu_collections v2.1.1
+   Compiling num-complex v0.4.6
+   Compiling dyn-stack v0.13.2
+   Compiling icu_provider v2.1.1
+   Compiling icu_normalizer v2.1.1
+   Compiling icu_properties v2.1.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling rustls-webpki v0.103.8
+   Compiling serde_urlencoded v0.7.1
+   Compiling url v2.5.7
+   Compiling futures-executor v0.3.31
+   Compiling rand_distr v0.5.1
+   Compiling tokio-util v0.7.17
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.2
+   Compiling half v2.7.1
+   Compiling h2 v0.4.12
+   Compiling tower-http v0.6.7
+   Compiling num_enum v0.7.5
+   Compiling darling v0.20.11
+   Compiling gemm-common v0.18.2
+   Compiling yoke-derive v0.7.5
+   Compiling derive_builder_core v0.20.2
+   Compiling float8 v0.5.0
+   Compiling futures v0.3.31
+   Compiling safetensors v0.6.2
+   Compiling gemm-f32 v0.18.2
+   Compiling gemm-c32 v0.18.2
+   Compiling gemm-f16 v0.18.2
+   Compiling hyper v1.8.1
+   Compiling gemm-c64 v0.18.2
+   Compiling gemm-f64 v0.18.2
+   Compiling yoke v0.7.5
+   Compiling ureq v2.12.1
+   Compiling hyper-util v0.1.19
+   Compiling gemm v0.18.2
+   Compiling safe_arch v0.7.4
+   Compiling wide v0.7.33
+   Compiling candle-core v0.9.2-alpha.2 (/home/jesse/Documents/solo/candle/candle-core)
+   Compiling derive_builder_macro v0.20.2
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.24
+   Compiling rand_chacha v0.3.1
+   Compiling moxcms v0.7.10
+   Compiling monostate-impl v0.1.18
+   Compiling castaway v0.2.4
+   Compiling approx v0.5.1
+   Compiling itertools v0.14.0
+   Compiling hf-hub v0.4.3
+   Compiling base64 v0.13.1
+   Compiling unicode-segmentation v1.12.0
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle v1.0.13
+   Compiling static_assertions v1.1.0
+   Compiling lazy_static v1.5.0
+   Compiling rawpointer v0.2.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling byteorder-lite v0.1.0
+   Compiling colorchoice v1.0.4
+   Compiling ttf-parser v0.25.1
+   Compiling anstream v0.6.21
+   Compiling rayon-cond v0.4.0
+   Compiling sharded-slab v0.1.7
+   Compiling macro_rules_attribute v0.2.2
+   Compiling compact_str v0.9.0
+   Compiling spm_precompiled v0.1.4
+   Compiling monostate v0.1.18
+   Compiling simba v0.8.1
+   Compiling rand v0.8.5
+   Compiling owned_ttf_parser v0.25.1
+   Compiling image v0.25.9
+   Compiling derive_builder v0.20.2
+   Compiling onig v6.5.1
+   Compiling dary_heap v0.3.8
+   Compiling serde_plain v1.0.2
+   Compiling regex v1.12.2
+   Compiling fancy-regex v0.14.0
+   Compiling fancy-regex v0.13.0
+   Compiling candle-nn v0.9.2-alpha.2 (/home/jesse/Documents/solo/candle/candle-nn)
+   Compiling candle-examples v0.9.2-alpha.2 (/home/jesse/Documents/solo/candle/candle-examples)
+   Compiling num-iter v0.1.45
+   Compiling tracing-log v0.2.0
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling csv-core v0.1.13
+   Compiling thread_local v1.1.9
+   Compiling unicode_categories v0.1.1
+   Compiling heck v0.5.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling iana-time-zone v0.1.64
+   Compiling clap_lex v0.7.6
+   Compiling self_cell v1.2.2
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling custom_derive v0.1.7
+   Compiling memo-map v0.3.3
+   Compiling clap_builder v4.5.53
+   Compiling conv v0.3.3
+   Compiling minijinja v2.14.0
+   Compiling ab_glyph v0.2.32
+   Compiling chrono v0.4.42
+   Compiling tracing-subscriber v0.3.22
+   Compiling clap_derive v4.5.49
+   Compiling tokenizers v0.21.4
+   Compiling candle-transformers v0.9.2-alpha.2 (/home/jesse/Documents/solo/candle/candle-transformers)
+   Compiling nalgebra v0.32.6
+   Compiling csv v1.4.0
+   Compiling num v0.4.3
+   Compiling rand_distr v0.4.3
+   Compiling itertools v0.12.1
+   Compiling clap v4.5.53
+   Compiling tracing-chrome v0.7.2
+   Compiling imageproc v0.24.0
+    Finished `release` profile [optimized] target(s) in 33.78s
+     Running `target/release/examples/translate-gemma --text Hello --source en --target uk`
+avx: false, neon: true, simd128: false, f16c: false
+Model: google/translategemma-4b-it
+Translation: English (en) → Ukrainian (uk)
+
+Loading model...
+Running on CPU, to run on GPU, build this example with `--features cuda`
+Full config: Config { attention_bias: false, head_dim: 256, hidden_activation: GeluPytorchTanh, hidden_size: 2560, intermediate_size: 10240, num_attention_heads: 8, num_hidden_layers: 34, num_key_value_heads: 4, rms_norm_eps: 1e-6, rope_theta: 1000000.0, rope_local_base_freq: 10000.0, vocab_size: 262208, final_logit_softcapping: None, attn_logit_softcapping: None, query_pre_attn_scalar: 256, sliding_window: 1024, sliding_window_pattern: 6, max_position_embeddings: 131072 }
+Model loaded: 34 layers, hidden_size=2560
+Loaded model in 12.127854343s
+
+======================================================================
+CANDLE FORWARD PASS (token 0 values)
+======================================================================
+embed (after scaling)         : [0.172165, -0.11349, -0.055587, 0.086469, 0.161356]
+
+--- Layer 0 ---
+L0 input_layernorm            : [1.281226, -0.731737, -0.338305, 0.521041, 0.952854]
+L0 q_proj out                 : [-4.506562, 2.443456, 6.241471, 3.768526, -4.291124]
+L0 k_proj out                 : [0.162271, 0.078788, 0.811959, -0.397296, -0.535725]
+L0 v_proj out                 : [0.077333, -2.101335, -0.205635, -4.074332, -0.930278]
+L0 q after norm               : [-1.369963, 0.500688, 1.333982, 0.698897, -0.49029]
+L0 k after norm               : [0.019447, 0.008348, 0.071202, -0.031065, -0.039475]
+L0 q after RoPE               : [-1.369963, 0.500688, 1.333982, 0.698897, -0.49029]
+L0 k after RoPE               : [0.019447, 0.008348, 0.071202, -0.031065, -0.039475]
+L0 self_attn out              : [4.207766, -4.995241, -2.906999, -0.769608, -5.543557]
+L0 post_attn_layernorm        : [-0.008374, -0.147465, -0.055926, 0.004084, 0.033098]
+L0 after attn residual        : [0.163791, -0.260955, -0.111513, 0.090553, 0.194455]
+L0 pre_feedforward_ln         : [0.133204, -0.182641, -0.0742, 0.0607, 0.127472]
+L0 gate_proj out              : [-0.469282, -0.222986, -0.636924, -1.084931, 0.210384]
+L0 up_proj out                : [-2.361883, 0.035152, 0.155375, 0.258953, 0.289717]
+L0 after gelu_tanh            : [-0.149918, -0.09182, -0.16697, -0.150961, 0.12272]
+L0 gate * up                  : [0.35409, -0.003228, -0.025943, -0.039092, 0.035554]
+L0 down_proj (mlp out)        : [0.50329, 0.316644, -0.069176, 0.034172, 0.121119]
+L0 post_feedforward_ln        : [0.587118, 0.419631, -0.071204, 0.032634, 0.099735]
+L0 layer output               : [0.750908, 0.158676, -0.182718, 0.123187, 0.29419]
+
+--- Layer 1 ---
+L1 input_layernorm            : [0.066618, 0.013236, -0.013919, 0.009563, 0.022553]
+L1 q_proj out                 : [0.032164, -0.067461, 0.170659, -0.212633, -0.088035]
+L1 k_proj out                 : [0.069283, 0.00903, -0.013746, -0.009122, 0.014585]
+L1 v_proj out                 : [0.255429, 0.038451, 0.084425, 0.013833, -0.031925]
+L1 q after norm               : [0.18415, -0.491327, 1.057022, -1.758984, -0.717143]
+L1 k after norm               : [0.096672, 0.012581, -0.02321, -0.013335, 0.026082]
+L1 q after RoPE               : [0.18415, -0.491327, 1.057022, -1.758984, -0.717143]
+L1 k after RoPE               : [0.096672, 0.012581, -0.02321, -0.013335, 0.026082]
+L1 self_attn out              : [-0.063407, 0.193696, -0.061063, -0.07921, -0.130302]
+L1 post_attn_layernorm        : [-0.030346, 0.213834, -0.018704, -0.029317, -0.03908]
+L1 after attn residual        : [0.720562, 0.37251, -0.201421, 0.09387, 0.25511]
+L1 pre_feedforward_ln         : [0.04301, 0.021521, -0.011974, 0.005491, 0.014738]
+L1 gate_proj out              : [-0.02307, 0.049201, -0.007716, 0.02324, 0.037206]
+L1 up_proj out                : [-0.011495, 0.047107, 0.006203, -0.014352, -0.039631]
+L1 after gelu_tanh            : [-0.011323, 0.025566, -0.003834, 0.011835, 0.019155]
+L1 gate * up                  : [0.00013, 0.001204, -2.4e-5, -0.00017, -0.000759]
+L1 down_proj (mlp out)        : [-0.008361, 0.003702, -0.004429, -0.000889, -0.000156]
+L1 post_feedforward_ln        : [-1.134983, 0.85847, -0.687498, -0.132998, -0.02305]
+L1 layer output               : [-0.41442, 1.23098, -0.888919, -0.039128, 0.23206]
+final_norm (last token)       : [-2.447342, 1.13277, 1.333214, 4.206121, -5.284055]
+First forward: start_pos=0, context_len=28
+Top 5 tokens:
+  21545 (30.90) -> Ok("При")
+  122409 (24.63) -> Ok("Ві")
+  150917 (22.83) -> Ok("Ciao")
+  116130 (21.33) -> Ok("Привет")
+  237304 (20.98) -> Ok("Д")
+Selected: 21545 -> Ok("При")
+L0 gate_proj out              : [-0.034292, 0.062237, 0.190629, -1.180391, 1.036443]
+L0 up_proj out                : [-1.223788, -0.379838, -0.607472, 0.947791, 0.765445]
+L0 after gelu_tanh            : [-0.016677, 0.032663, 0.109724, -0.140584, 0.880813]
+L0 gate * up                  : [0.020409, -0.012407, -0.066654, -0.133244, 0.674214]
+L0 down_proj (mlp out)        : [0.238419, 0.005867, -0.259144, -0.286078, -0.245501]
+L1 gate_proj out              : [-0.961069, -3.317262, -1.957506, -2.338695, -0.723007]
+L1 up_proj out                : [-0.890717, 0.852493, -0.341457, 0.196892, 0.113589]
+L1 after gelu_tanh            : [-0.161847, -0.001231, -0.049158, -0.022265, -0.169851]
+L1 gate * up                  : [0.14416, -0.00105, 0.016785, -0.004384, -0.019293]
+L1 down_proj (mlp out)        : [0.11219, -0.177947, -0.021435, -0.113322, -0.089921]
+L0 gate_proj out              : [-0.354987, -1.376269, -1.47918, -1.694456, 0.10082]
+L0 up_proj out                : [-2.301679, 1.778571, 0.733213, -1.358867, -0.33585]
+L0 after gelu_tanh            : [-0.128261, -0.116348, -0.103093, -0.076538, 0.054458]
+L0 gate * up                  : [0.295216, -0.206934, -0.075589, 0.104005, -0.01829]
+L0 down_proj (mlp out)        : [0.229948, -0.011459, -0.112012, -0.676844, -0.11771]
+L1 gate_proj out              : [-1.286889, -2.33758, -1.806485, -1.128858, -1.857571]
+L1 up_proj out                : [-0.226138, -1.804949, -0.966986, -0.039021, 0.564573]
+L1 after gelu_tanh            : [-0.127717, -0.022323, -0.064049, -0.146358, -0.058749]
+L1 gate * up                  : [0.028882, 0.040291, 0.061935, 0.005711, -0.033168]
+L1 down_proj (mlp out)        : [-0.070656, 0.009869, -0.178877, -0.17251, -0.139976]
+L0 gate_proj out              : [-1.725044, -1.110605, -1.150706, -1.620368, -0.689017]
+L0 up_proj out                : [3.84738, -0.515568, 0.089821, 0.512189, 1.083387]
+L0 after gelu_tanh            : [-0.073017, -0.14831, -0.143955, -0.085369, -0.169142]
+L0 gate * up                  : [-0.280926, 0.076464, -0.01293, -0.043725, -0.183246]
+L0 down_proj (mlp out)        : [-1.077906, -0.390298, 0.652936, -0.831191, 0.98466]
+L1 gate_proj out              : [-2.13314, -0.847773, -1.996809, -2.359223, -2.118122]
+L1 up_proj out                : [-0.020356, 1.521451, -0.36747, -0.191605, -0.14937]
+L1 after gelu_tanh            : [-0.034892, -0.168198, -0.045678, -0.021227, -0.035983]
+L1 gate * up                  : [0.00071, -0.255905, 0.016785, 0.004067, 0.005375]
+L1 down_proj (mlp out)        : [0.108668, 0.063412, 0.025099, 0.028707, 0.07721]
+[3 tokens in 2.53s (1.19 tok/s)]
+=== DEBUG ===
+First 10 token IDs: [2, 105, 2364, 107, 236820, 20905, 3738, 236779, 10694, 236784]
+  2 -> Ok("<bos>")
+  105 -> Ok("<start_of_turn>")
+  2364 -> Ok("user")
+  107 -> Ok("\n")
+  236820 -> Ok("<")
+  20905 -> Ok("translate")
+  3738 -> Ok(" source")
+  236779 -> Ok("_")
+  10694 -> Ok("lang")
+  236784 -> Ok("=")
+=============
+
+Привіт
