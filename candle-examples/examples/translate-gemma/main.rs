@@ -376,6 +376,8 @@ impl Translator {
         let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
         let mut output_tokens = Vec::new();
 
+        eprintln!("Input has {} tokens", tokens.len());
+
         let start = std::time::Instant::now();
 
         for index in 0..self.max_tokens {
@@ -405,6 +407,21 @@ impl Translator {
                     &tokens[start_at..],
                 )?
             };
+
+            // After getting logits, before sampling
+            if index < 15 {
+                // First 5 tokens
+                let logits_vec: Vec<f32> = logits.to_vec1()?;
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                eprintln!(
+                    "Step {} top token: {} ({:?})",
+                    index,
+                    indexed[0].0,
+                    self.tokenizer.decode(&[indexed[0].0 as u32], false)
+                );
+            }
 
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);

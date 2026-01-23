@@ -12,7 +12,7 @@ use std::sync::Arc;
 // =============================================================================
 
 /// Set to true to enable debug output
-const DEBUG_ENABLED: bool = true;
+const DEBUG_ENABLED: bool = false; // Disable prefill debug
 
 /// Which layer to debug (-1 = all layers, 0 = layer 0 only, etc.)
 const DEBUG_LAYER: i32 = 1; // Debug layers 0 and 1
@@ -340,6 +340,9 @@ impl Attention {
         let (b_sz, q_len, _) = xs.dims3()?;
         let debug = seqlen_offset == 0 && should_debug_layer(layer_idx);
 
+        // Debug during generation for layer 0 only
+        let gen_debug = seqlen_offset > 0 && seqlen_offset < 55 && layer_idx == 0;
+
         // Q, K, V projections
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
@@ -371,6 +374,13 @@ impl Attention {
             debug_print_4d(&format!("L{} k after norm", layer_idx), &k, 0, 0);
         }
 
+        if gen_debug {
+            eprintln!(
+                "=== GEN DEBUG L{}: seqlen_offset={}, q_len={} ===",
+                layer_idx, seqlen_offset, q_len
+            );
+        }
+
         // RoPE
         let (q, k) = self
             .rotary_emb
@@ -381,14 +391,38 @@ impl Attention {
             debug_print_4d(&format!("L{} k after RoPE", layer_idx), &k, 0, 0);
         }
 
+        if gen_debug {
+            debug_print_4d(
+                &format!("GEN q after RoPE (pos={})", seqlen_offset),
+                &q,
+                0,
+                0,
+            );
+        }
+
         let k = k.contiguous()?;
         let v = v.contiguous()?;
+
+        // Get cache state before append
+        let cache_len_before = match &self.kv_cache {
+            KvCache::Normal(cache) => cache.current_seq_len(),
+            KvCache::Rotating(cache) => cache.current_seq_len(),
+        };
 
         // KV cache
         let (k, v) = match &mut self.kv_cache {
             KvCache::Normal(cache) => cache.append(&k, &v)?,
             KvCache::Rotating(cache) => cache.append(&k, &v)?,
         };
+
+        if gen_debug {
+            eprintln!(
+                "GEN: cache {} -> {}, k shape {:?}",
+                cache_len_before,
+                k.dim(2)?,
+                k.shape()
+            );
+        }
 
         // Expand K, V for GQA
         let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
@@ -421,6 +455,14 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
+
+            if gen_debug {
+                eprintln!(
+                    "GEN: attn_weights shape {:?}, mask={}",
+                    attn_weights.shape(),
+                    attention_mask.is_some()
+                );
+            }
 
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&v)?
@@ -683,10 +725,10 @@ impl Model {
         seq_len: usize,
         seqlen_offset: usize,
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        if seq_len <= 1 {
-            return Ok((None, None));
-        }
+        // DEBUG: Always create masks to see if this fixes the 50-token bug
+        // Original code skipped mask creation when seq_len <= 1
 
+        // Global attention mask (standard causal)
         let mask = prepare_decoder_attention_mask(
             batch_size,
             seq_len,
@@ -696,6 +738,7 @@ impl Model {
             &self.device,
         )?;
 
+        // Sliding window attention mask
         let sliding_mask = prepare_decoder_attention_mask(
             batch_size,
             seq_len,
@@ -711,19 +754,16 @@ impl Model {
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
 
-        if DEBUG_ENABLED && seqlen_offset == 0 {
-            eprintln!("\n{}", "=".repeat(70));
-            eprintln!("CANDLE FORWARD PASS (token 0 values)");
-            eprintln!("{}", "=".repeat(70));
+        // Debug for prefill
+        let prefill_debug = seqlen_offset == 0 && seq_len > 40;
+
+        if prefill_debug {
+            eprintln!("\n=== PREFILL DEBUG: {} tokens ===", seq_len);
         }
 
         // Embedding with scaling
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
-
-        if seqlen_offset == 0 {
-            debug_print("embed (after scaling)", &xs, 0);
-        }
 
         // Prepare attention masks
         let (attention_mask, sliding_attention_mask) =
@@ -731,10 +771,6 @@ impl Model {
 
         // Process layers
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            if seqlen_offset == 0 && should_debug_layer(layer_idx) {
-                eprintln!("\n--- Layer {} ---", layer_idx);
-            }
-
             let mask = if layer.sliding_window.is_some() {
                 &sliding_attention_mask
             } else {
@@ -747,8 +783,16 @@ impl Model {
         let xs = xs.narrow(1, seq_len - 1, 1)?;
         let xs = self.norm.forward(&xs)?;
 
-        if seqlen_offset == 0 && DEBUG_ENABLED {
-            debug_print("final_norm (last token)", &xs, 0);
+        if prefill_debug {
+            // Show final hidden state before lm_head
+            if let Ok(vals) = xs
+                .narrow(2, 0, 5)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                eprintln!("PREFILL final hidden[:5]: {:?}", vals);
+            }
         }
 
         // LM head
@@ -759,6 +803,24 @@ impl Model {
             None => logits,
             Some(sc) => ((logits / sc)?.tanh()? * sc)?,
         };
+
+        if prefill_debug {
+            // Show top predictions after prefill
+            if let Ok(logits_vec) = logits
+                .squeeze(0)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| t.to_vec1::<f32>())
+            {
+                let mut indexed: Vec<(usize, f32)> =
+                    logits_vec.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                eprintln!("PREFILL top 5 logits:");
+                for i in 0..5.min(indexed.len()) {
+                    eprintln!("  {} -> {:.2}", indexed[i].0, indexed[i].1);
+                }
+            }
+            eprintln!("=== END PREFILL DEBUG ===\n");
+        }
 
         Ok(logits)
     }
