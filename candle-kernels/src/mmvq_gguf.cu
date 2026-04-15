@@ -671,6 +671,9 @@ static __device__ void mmvq_core_impl(
 #pragma unroll
       for (int i = 0; i < rows_per_cuda_block; ++i) {
         const int row = row0 + i;
+        if (row >= nrows_x) {
+          continue;
+        }
         const int weight_kbx = row * blocks_per_row_x + kbx;
         tmp[j][i] +=
             vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], weight_kbx, kqs);
