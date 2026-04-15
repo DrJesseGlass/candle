@@ -105,10 +105,18 @@ impl LoraConfig {
 /// A frozen [`Linear`] layer wrapped with a trainable low-rank `B @ A`
 /// adapter.
 ///
-/// The base layer's weights are *not* [`candle::Var`]s, so they receive no
-/// gradients during backpropagation. The `A` and `B` matrices are loaded
-/// from the provided [`VarBuilder`] and are the only trainable parameters
-/// of a `LoraLinear`.
+/// `from_linear` detaches the base layer's weight and bias from the autograd
+/// graph, so even if the caller built them from a [`crate::VarMap`] they are
+/// no longer [`candle::Var`] leaves and `backward()` allocates no gradients
+/// for them. The `A` and `B` matrices loaded from the provided [`VarBuilder`]
+/// are the only trainable parameters of a `LoraLinear`.
+///
+/// # Numerics
+///
+/// When the input is `BF16` or `F16`, the adapter matmul runs in `F32` for
+/// numerical stability and the delta is cast back to the input dtype before
+/// being added to the base output. Users training in half precision should
+/// expect the LoRA path itself to run in `F32`.
 #[derive(Clone, Debug)]
 pub struct LoraLinear {
     base: Linear,
@@ -128,6 +136,11 @@ impl LoraLinear {
     /// The adapter variables live under `vb` at paths `"lora_a"` and
     /// `"lora_b"`. Use `vb.pp("some_prefix")` to namespace them.
     pub fn from_linear(base: Linear, config: &LoraConfig, vb: VarBuilder) -> Result<Self> {
+        // Detach the base tensors so that if the caller built them from a
+        // VarMap they are no longer Var leaves — otherwise `backward()`
+        // would allocate full-size gradients for them every step, defeating
+        // the memory savings that are the whole point of LoRA.
+        let base = Linear::new(base.weight().detach(), base.bias().map(|b| b.detach()));
         let w = base.weight();
         let dims = w.dims();
         if dims.len() != 2 {
@@ -204,61 +217,22 @@ impl LoraLinear {
 impl Module for LoraLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let base_out = self.base.forward(x)?;
-        // LoRA delta path: x @ A^T @ B^T, scaled by (alpha/rank).
-        //
-        // We deliberately do not route this through `Linear::forward` on a
-        // bias-less `Linear`, because the extra reshape logic there is
-        // tuned for the common path; LoRA's rank dimension is small enough
-        // that a pair of matmuls is fine and keeps the code obvious.
-        let x_dtype = x.dtype();
-        let compute_dtype = promote_to_f32(x_dtype);
-        let x_c = if x.dtype() != compute_dtype {
-            x.to_dtype(compute_dtype)?
-        } else {
-            x.clone()
-        };
-        let a = if self.lora_a.dtype() != compute_dtype {
-            self.lora_a.to_dtype(compute_dtype)?
-        } else {
-            self.lora_a.clone()
-        };
-        let b = if self.lora_b.dtype() != compute_dtype {
-            self.lora_b.to_dtype(compute_dtype)?
-        } else {
-            self.lora_b.clone()
-        };
-
-        // x @ A^T: last dim (in_features) → rank.
-        let xa = match *x_c.dims() {
-            [b1, b2, m, _] => x_c.reshape((b1 * b2 * m, ()))?.matmul(&a.t()?)?.reshape((
-                b1,
-                b2,
-                m,
-                self.config.rank,
-            ))?,
-            [bsize, m, _] => x_c.reshape((bsize * m, ()))?.matmul(&a.t()?)?.reshape((
-                bsize,
-                m,
-                self.config.rank,
-            ))?,
-            _ => x_c.matmul(&a.t()?)?,
-        };
-
-        // (x @ A^T) @ B^T: rank → out_features.
-        let delta = match *xa.dims() {
-            [b1, b2, m, _] => {
-                xa.reshape((b1 * b2 * m, ()))?
-                    .matmul(&b.t()?)?
-                    .reshape((b1, b2, m, ()))?
+        // LoRA delta path: x @ A^T @ B^T, scaled by (alpha/rank). We wrap
+        // `A` and `B` in bias-less `Linear`s so we reuse `Linear::forward`'s
+        // existing 2D/3D/4D reshape handling instead of reimplementing it.
+        let compute_dtype = promote_to_f32(x.dtype());
+        let cast = |t: &Tensor| -> Result<Tensor> {
+            if t.dtype() != compute_dtype {
+                t.to_dtype(compute_dtype)
+            } else {
+                Ok(t.clone())
             }
-            [bsize, m, _] => {
-                xa.reshape((bsize * m, ()))?
-                    .matmul(&b.t()?)?
-                    .reshape((bsize, m, ()))?
-            }
-            _ => xa.matmul(&b.t()?)?,
         };
+        let x_c = cast(x)?;
+        let a = Linear::new(cast(&self.lora_a)?, None);
+        let b = Linear::new(cast(&self.lora_b)?, None);
 
+        let delta = b.forward(&a.forward(&x_c)?)?;
         let delta = delta.affine(self.config.scale(), 0.0)?;
         let delta = if delta.dtype() != base_out.dtype() {
             delta.to_dtype(base_out.dtype())?
@@ -290,6 +264,27 @@ mod tests {
         let vs = VarMap::new();
         let vb = VarBuilder::from_varmap(&vs, DType::F32, dev);
         linear(in_dim, out_dim, vb)
+    }
+
+    /// Overwrite the var in `vs` whose name contains `name_contains` with
+    /// `value`, then return a fresh tensor handle reflecting the update
+    /// (used to re-point `layer.lora_b` after mutating the backing var).
+    fn overwrite_var(vs: &VarMap, name_contains: &str, value: &Tensor) -> Tensor {
+        {
+            let data = vs.data().lock().unwrap();
+            for (name, var) in data.iter() {
+                if name.contains(name_contains) {
+                    var.set(value).unwrap();
+                }
+            }
+        }
+        let data = vs.data().lock().unwrap();
+        data.iter()
+            .find(|(n, _)| n.contains(name_contains))
+            .unwrap()
+            .1
+            .as_tensor()
+            .clone()
     }
 
     #[test]
@@ -332,22 +327,7 @@ mod tests {
 
         // Overwrite B with a non-trivial tensor so delta_weight isn't zero.
         let b_new = Tensor::randn(0f32, 1.0, (8, 4), &dev).unwrap();
-        for (name, var) in vs.data().lock().unwrap().iter() {
-            if name.contains("lora_b") {
-                var.set(&b_new).unwrap();
-            }
-        }
-        // Re-create the layer handle so lora_b picks up the update.
-        let layer_b = {
-            let data = vs.data().lock().unwrap();
-            data.iter()
-                .find(|(n, _)| n.contains("lora_b"))
-                .unwrap()
-                .1
-                .as_tensor()
-                .clone()
-        };
-        layer.lora_b = layer_b;
+        layer.lora_b = overwrite_var(&vs, "lora_b", &b_new);
 
         let delta = layer.delta_weight().unwrap();
         assert_eq!(delta.dims(), &[8, 8]);
@@ -375,21 +355,7 @@ mod tests {
 
         // Perturb B so there's something non-trivial to merge.
         let b_new = Tensor::randn(0f32, 0.1, (32, 4), &dev).unwrap();
-        for (name, var) in vs.data().lock().unwrap().iter() {
-            if name.contains("lora_b") {
-                var.set(&b_new).unwrap();
-            }
-        }
-        let layer_b = {
-            let data = vs.data().lock().unwrap();
-            data.iter()
-                .find(|(n, _)| n.contains("lora_b"))
-                .unwrap()
-                .1
-                .as_tensor()
-                .clone()
-        };
-        layer.lora_b = layer_b;
+        layer.lora_b = overwrite_var(&vs, "lora_b", &b_new);
 
         let merged = layer.merge().unwrap();
 
@@ -417,6 +383,43 @@ mod tests {
         let x = Tensor::randn(0f32, 1.0, (2, 5, 12), &dev).unwrap();
         let y = layer.forward(&x).unwrap();
         assert_eq!(y.dims(), &[2, 5, 24]);
+    }
+
+    #[test]
+    fn base_weights_detached_from_autograd() {
+        // Regression: from_linear must detach base weight/bias so backward
+        // does not accumulate gradients on the frozen base.
+        let dev = Device::Cpu;
+        let base_vs = VarMap::new();
+        let base_vb = VarBuilder::from_varmap(&base_vs, DType::F32, &dev);
+        let base = linear(8, 4, base_vb).unwrap();
+
+        let lora_vs = VarMap::new();
+        let lora_vb = VarBuilder::from_varmap(&lora_vs, DType::F32, &dev);
+        let mut layer = LoraLinear::from_linear(base, &LoraConfig::new(2, 4.0), lora_vb).unwrap();
+
+        // Push B off zero so the LoRA path actually contributes to the loss.
+        let b_new = Tensor::randn(0f32, 0.1, (4, 2), &dev).unwrap();
+        layer.lora_b = overwrite_var(&lora_vs, "lora_b", &b_new);
+
+        let x = Tensor::randn(0f32, 1.0, (3, 8), &dev).unwrap();
+        let y = layer.forward(&x).unwrap();
+        let loss = y.sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+
+        // Every var in the base VarMap must be absent from the grad store.
+        for var in base_vs.all_vars() {
+            assert!(
+                grads.get(var.as_tensor()).is_none(),
+                "base var unexpectedly received a gradient — detach is not working"
+            );
+        }
+        // And at least one LoRA var must actually have a gradient.
+        let lora_vars = lora_vs.all_vars();
+        assert!(
+            lora_vars.iter().any(|v| grads.get(v.as_tensor()).is_some()),
+            "no LoRA var received a gradient — test is not exercising the path"
+        );
     }
 
     #[test]
