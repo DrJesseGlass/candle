@@ -201,13 +201,12 @@ fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
 
         let available = (total_embeds - embed_offset).min(num_masked);
 
-        // Build a lookup table: index 0 → zero vector, indices 1..=available → embeds
+        // Lookup table: index 0 → zero vector, indices 1..=available → embeds.
         let zero_row = Tensor::zeros((1, hidden), dtype, device)?;
         let embed_slice = embeds.narrow(0, embed_offset, available)?;
         let lookup = Tensor::cat(&[&zero_row, &embed_slice], 0)?;
 
-        // Map each sequence position to a lookup index:
-        // non-masked → 0 (zeros), masked → 1-based sequential index
+        // Non-masked → 0, masked → 1-based sequential index into lookup.
         let mut indices = vec![0u32; seq_len];
         let mut counter = 0u32;
         for (pos, &m) in mask_b.iter().enumerate() {
