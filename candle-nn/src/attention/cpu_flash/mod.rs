@@ -34,6 +34,103 @@ pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     res.to_f64() as f32
 }
 
+/// Dot product of an f32 query row against an f16 KV row, f32 accumulation.
+///
+/// Decode attention is bandwidth-bound on the KV cache; storing KV in f16 halves
+/// the bytes streamed per token. The f16 elements are widened in-register
+/// (`fcvtl`, baseline aarch64 NEON) so there is no scratch buffer and no
+/// precision loss beyond the f16 storage itself.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn dot_f32_f16(a: &[f32], b: &[half::f16]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 8;
+    unsafe {
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        let mut ap = a.as_ptr();
+        let mut bp = b.as_ptr();
+        for _ in 0..chunks {
+            let lo: float32x4_t;
+            let hi: float32x4_t;
+            // f16 NEON intrinsics are unstable; widen via asm and FMA via intrinsics.
+            std::arch::asm!(
+                "ldr {kv:q}, [{bp}]",
+                "fcvtl {lo:v}.4s, {kv:v}.4h",
+                "fcvtl2 {hi:v}.4s, {kv:v}.8h",
+                bp = in(reg) bp,
+                kv = out(vreg) _,
+                lo = out(vreg) lo,
+                hi = out(vreg) hi,
+                options(nostack, pure, readonly),
+            );
+            sum0 = vfmaq_f32(sum0, vld1q_f32(ap), lo);
+            sum1 = vfmaq_f32(sum1, vld1q_f32(ap.add(4)), hi);
+            ap = ap.add(8);
+            bp = bp.add(8);
+        }
+        let mut acc = vaddvq_f32(vaddq_f32(sum0, sum1));
+        for i in (chunks * 8)..n {
+            acc += a[i] * b[i].to_f32();
+        }
+        acc
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn dot_f32_f16(a: &[f32], b: &[half::f16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| x * y.to_f32()).sum()
+}
+
+/// `acc[i] += v[i] * w` with an f16 value row widened in-register (f32 accumulator).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn axpy_f16(acc: &mut [f32], v: &[half::f16], w: f32) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(acc.len(), v.len());
+    let n = acc.len();
+    let chunks = n / 8;
+    unsafe {
+        let wv = vdupq_n_f32(w);
+        let mut ap = acc.as_mut_ptr();
+        let mut vp = v.as_ptr();
+        for _ in 0..chunks {
+            let lo: float32x4_t;
+            let hi: float32x4_t;
+            std::arch::asm!(
+                "ldr {kv:q}, [{vp}]",
+                "fcvtl {lo:v}.4s, {kv:v}.4h",
+                "fcvtl2 {hi:v}.4s, {kv:v}.8h",
+                vp = in(reg) vp,
+                kv = out(vreg) _,
+                lo = out(vreg) lo,
+                hi = out(vreg) hi,
+                options(nostack, pure, readonly),
+            );
+            vst1q_f32(ap, vfmaq_f32(vld1q_f32(ap), lo, wv));
+            vst1q_f32(ap.add(4), vfmaq_f32(vld1q_f32(ap.add(4)), hi, wv));
+            ap = ap.add(8);
+            vp = vp.add(8);
+        }
+        for i in (chunks * 8)..n {
+            acc[i] += v[i].to_f32() * w;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn axpy_f16(acc: &mut [f32], v: &[half::f16], w: f32) {
+    debug_assert_eq!(acc.len(), v.len());
+    for (a, x) in acc.iter_mut().zip(v) {
+        *a += x.to_f32() * w;
+    }
+}
+
 /// Flash attention with automatic dispatch.
 ///
 /// Selects optimal implementation based on batch size, mask type, and dtype:

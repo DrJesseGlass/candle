@@ -474,22 +474,31 @@ impl candle::CustomOp2 for RmsNorm {
             let dims = layout.shape().dims();
             let dim_m1 = dims[dims.len() - 1];
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(src, dst)| {
-                    let sum2 = src
-                        .iter()
-                        .map(|&v| {
-                            let v = v.as_();
-                            v * v
-                        })
-                        .sum::<f32>();
-                    let m = (sum2 / dim_m1 as f32 + eps).sqrt();
-                    let m = T::from_f32(m).unwrap_or_else(T::nan);
-                    for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
-                        *d = *s / m * *alpha
-                    }
-                });
+            let norm_row = |src: &[T], dst: &mut [T]| {
+                let sum2 = src
+                    .iter()
+                    .map(|&v| {
+                        let v = v.as_();
+                        v * v
+                    })
+                    .sum::<f32>();
+                let m = (sum2 / dim_m1 as f32 + eps).sqrt();
+                let m = T::from_f32(m).unwrap_or_else(T::nan);
+                for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
+                    *d = *s / m * *alpha
+                }
+            };
+            // Decode-sized inputs (a handful of KB) lose more to rayon fork/join
+            // latency than the whole normalization costs; keep them on this thread.
+            if el_count <= 8192 {
+                src.chunks(dim_m1)
+                    .zip(dst.chunks_mut(dim_m1))
+                    .for_each(|(src, dst)| norm_row(src, dst));
+            } else {
+                src.par_chunks(dim_m1)
+                    .zip(dst.par_chunks_mut(dim_m1))
+                    .for_each(|(src, dst)| norm_row(src, dst));
+            }
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }

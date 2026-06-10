@@ -237,7 +237,7 @@ fn standard_with_mask_b1() -> Result<()> {
 
 #[test]
 fn interleaved_kv_decode() -> Result<()> {
-    use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+    use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
 
     let (h_q, h_kv, d, kv_len) = (8, 2, 16, 20);
     let scale = 1.0 / (d as f32).sqrt();
@@ -264,7 +264,12 @@ fn interleaved_kv_decode() -> Result<()> {
     let v_seq = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
     let kv = Tensor::cat(&[&k_seq, &v_seq], 2)?.contiguous()?; // (kv_len, h_kv, 2*d)
 
-    let kv_data: Vec<f32> = kv.flatten_all()?.to_vec1()?;
+    let kv_data: Vec<half::f16> = kv
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .map(half::f16::from_f32)
+        .collect();
     let q_flat: Vec<f32> = q
         .squeeze(0)?
         .squeeze(1)?
@@ -272,8 +277,9 @@ fn interleaved_kv_decode() -> Result<()> {
         .flatten_all()?
         .to_vec1()?;
 
-    let out = causal_decode_f32_interleaved(&q_flat, &kv_data, h_q, h_kv, d, kv_len, scale)?;
+    let out = causal_decode_f16kv_interleaved(&q_flat, &kv_data, h_q, h_kv, d, kv_len, scale)?;
 
     let out = out.unsqueeze(0)?;
-    assert_close(&out, &expected, 1e-5, "interleaved_kv_decode")
+    // f16 KV storage rounds K/V to ~1e-3 relative; the reference uses f32 throughout.
+    assert_close(&out, &expected, 2e-2, "interleaved_kv_decode")
 }

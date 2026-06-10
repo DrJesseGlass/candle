@@ -9,8 +9,8 @@
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
-use candle::{DType, Device, Result, Storage, Tensor};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use candle::{DType, Device, Result, Storage, Tensor, D};
+use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Embedding, Module};
@@ -47,10 +47,55 @@ impl<R: Read + Seek> Gguf<R> {
     }
 }
 
+/// Two projections of the same input, fused into one quantized matmul when their
+/// weights share a dtype. Rows are quantized independently in every ggml format, so
+/// the fusion is a bit-exact row concatenation; it halves the dispatch / fork-join
+/// cost and shares one activation quantization. CPU only; other devices keep the
+/// split projections.
+#[derive(Debug, Clone)]
+enum FusedPairProj {
+    Fused { proj: QMatMul, n1: usize, n2: usize },
+    Split(QMatMul, QMatMul),
+}
+
+impl FusedPairProj {
+    fn load<R: Read + Seek>(gg: &mut Gguf<R>, name1: &str, name2: &str) -> Result<Self> {
+        let t1 = gg.tensor(name1)?;
+        let t2 = gg.tensor(name2)?;
+        let (n1, k1) = t1.shape().dims2()?;
+        let (n2, k2) = t2.shape().dims2()?;
+        if gg.device.is_cpu() && t1.dtype() == t2.dtype() && k1 == k2 {
+            let fused = QTensor::cat_rows(&[&t1, &t2])?;
+            Ok(Self::Fused {
+                proj: QMatMul::from_weights(fused.into())?,
+                n1,
+                n2,
+            })
+        } else {
+            Ok(Self::Split(
+                QMatMul::from_weights(t1.into())?,
+                QMatMul::from_weights(t2.into())?,
+            ))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Fused { proj, n1, n2 } => {
+                let y = proj.forward(x)?;
+                Ok((
+                    y.narrow(D::Minus1, 0, *n1)?.contiguous()?,
+                    y.narrow(D::Minus1, *n1, *n2)?.contiguous()?,
+                ))
+            }
+            Self::Split(p1, p2) => Ok((p1.forward(x)?, p2.forward(x)?)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MlpWeights {
-    gate_proj: QMatMul,
-    up_proj: QMatMul,
+    gate_up: FusedPairProj,
     down_proj: QMatMul,
     act_fn: Activation,
     span: tracing::Span,
@@ -58,14 +103,16 @@ struct MlpWeights {
 
 impl MlpWeights {
     fn new<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str) -> Result<Self> {
-        let gate_proj = gg.qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
-        let up_proj = gg.qmatmul(&format!("{prefix}.ffn_up.weight"))?;
+        let gate_up = FusedPairProj::load(
+            gg,
+            &format!("{prefix}.ffn_gate.weight"),
+            &format!("{prefix}.ffn_up.weight"),
+        )?;
         let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
         let act_fn = Activation::Silu;
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up,
             down_proj,
             act_fn,
             span,
@@ -76,8 +123,8 @@ impl MlpWeights {
 impl Module for MlpWeights {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?;
-        let up = self.up_proj.forward(x)?;
+        let (gate, up) = self.gate_up.forward(x)?;
+        let gate = gate.apply(&self.act_fn)?;
         let gated = (gate * up)?;
         self.down_proj.forward(&gated)
     }
@@ -153,8 +200,7 @@ impl RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 struct AttentionWeights {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
+    qk_proj: FusedPairProj,
     v_proj: QMatMul,
     o_proj: QMatMul,
     q_norm: RmsNorm,
@@ -186,8 +232,13 @@ impl AttentionWeights {
         let num_kv_groups = num_heads / num_kv_heads;
         let hidden_size = num_heads * head_dim;
 
-        let q_proj = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
-        let k_proj = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
+        // attn_v is often promoted to a wider quant (e.g. Q6_K in *_M files), so only
+        // q/k — which share a dtype — are fused; v stays separate.
+        let qk_proj = FusedPairProj::load(
+            gg,
+            &format!("{prefix}.attn_q.weight"),
+            &format!("{prefix}.attn_k.weight"),
+        )?;
         let v_proj = gg.qmatmul(&format!("{prefix}.attn_v.weight"))?;
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
 
@@ -216,8 +267,7 @@ impl AttentionWeights {
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
         Ok(Self {
-            q_proj,
-            k_proj,
+            qk_proj,
             v_proj,
             o_proj,
             q_norm,
@@ -239,9 +289,8 @@ impl AttentionWeights {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
 
-        // QKV projections
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
+        // QKV projections (q/k in one fused matmul when dtypes match)
+        let (q, k) = self.qk_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         let q = q
@@ -302,7 +351,7 @@ impl AttentionWeights {
                 let q_len = self.num_heads * self.head_dim;
                 let ctx = {
                     let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
-                    causal_decode_f32_interleaved(
+                    causal_decode_f16kv_interleaved(
                         &q_data[..q_len],
                         rc.data(),
                         self.num_heads,

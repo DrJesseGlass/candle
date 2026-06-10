@@ -2,7 +2,7 @@ use crate::models::with_tracing::QMatMul;
 use crate::quantized_var_builder::VarBuilder;
 use candle::quantized::gguf_file;
 use candle::{DType, Device, Module, Result, Storage, Tensor};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{rope_i_inplace, InterleavedKvCache, KvCache, RawInterleavedKvCache};
 use candle_nn::Activation;
@@ -454,7 +454,7 @@ impl QuantizedAttention {
             // 5. Run interleaved decode kernel
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let kv_len = rc.len();
-            let ctx = causal_decode_f32_interleaved(
+            let ctx = causal_decode_f16kv_interleaved(
                 &self.q_rope_buf[..q_len],
                 rc.data(),
                 self.num_heads,

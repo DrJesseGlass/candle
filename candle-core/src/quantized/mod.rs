@@ -501,6 +501,40 @@ impl QTensor {
         Ok(Self { storage, shape })
     }
 
+    /// Concatenate 2D quantized tensors along the output (row) dimension.
+    ///
+    /// Every ggml quantization format quantizes rows independently (blocks never span
+    /// rows), so this is a bit-exact byte-level concatenation: a matmul against the
+    /// result equals the concatenation of the per-tensor matmul outputs. All inputs
+    /// must share the same dtype and inner (k) dimension.
+    pub fn cat_rows(ts: &[&QTensor]) -> Result<Self> {
+        let first = match ts.first() {
+            Some(t) => t,
+            None => crate::bail!("cat_rows called with no tensors"),
+        };
+        let dtype = first.dtype();
+        let (_, k) = first.shape().dims2()?;
+        let mut rows = 0;
+        let mut data = Vec::with_capacity(ts.iter().map(|t| t.storage_size_in_bytes()).sum());
+        for t in ts {
+            let (r, kt) = t.shape().dims2()?;
+            if t.dtype() != dtype {
+                crate::bail!(
+                    "cat_rows dtype mismatch: {:?} vs {:?}",
+                    t.dtype(),
+                    dtype
+                )
+            }
+            if kt != k {
+                crate::bail!("cat_rows inner dim mismatch: {kt} vs {k}")
+            }
+            rows += r;
+            data.extend_from_slice(&t.data()?);
+        }
+        let storage = QStorage::from_data(Cow::Owned(data), &first.device(), dtype)?;
+        Self::new(storage, (rows, k))
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();

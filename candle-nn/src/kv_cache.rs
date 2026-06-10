@@ -1038,9 +1038,14 @@ impl InterleavedKvCache {
 }
 
 // Work with KV cache directly in interleaved space.
+//
+// Storage is f16: decode attention streams the whole cache every token and is
+// bandwidth-bound, so halving the bytes is worth the (negligible) precision cost —
+// f16 KV is also llama.cpp's default. Projections still produce f32; conversion
+// happens on write, and the decode kernel widens back in-register.
 #[derive(Debug, Clone)]
 pub struct RawInterleavedKvCache {
-    buf: Vec<f32>,
+    buf: Vec<half::f16>,
     h_kv: usize,
     d: usize,
     pos_stride: usize,
@@ -1052,7 +1057,7 @@ impl RawInterleavedKvCache {
     pub fn new(h_kv: usize, d: usize, max_seq: usize) -> Self {
         let pos_stride = h_kv * 2 * d;
         Self {
-            buf: vec![0f32; max_seq * pos_stride],
+            buf: vec![half::f16::ZERO; max_seq * pos_stride],
             h_kv,
             d,
             pos_stride,
@@ -1080,15 +1085,19 @@ impl RawInterleavedKvCache {
 
         // Grow buffer if needed
         if base + self.pos_stride > self.buf.len() {
-            self.buf.resize(self.buf.len() * 2, 0.0);
+            self.buf.resize(self.buf.len() * 2, half::f16::ZERO);
         }
 
         for h in 0..self.h_kv {
             let k_src = h * d;
             let v_src = h * d;
             let dst = base + h * 2 * d;
-            self.buf[dst..dst + d].copy_from_slice(&k_flat[k_src..k_src + d]);
-            self.buf[dst + d..dst + 2 * d].copy_from_slice(&v_flat[v_src..v_src + d]);
+            for (o, &x) in self.buf[dst..dst + d].iter_mut().zip(&k_flat[k_src..]) {
+                *o = half::f16::from_f32(x);
+            }
+            for (o, &x) in self.buf[dst + d..dst + 2 * d].iter_mut().zip(&v_flat[v_src..]) {
+                *o = half::f16::from_f32(x);
+            }
         }
 
         self.len += 1;
@@ -1107,7 +1116,7 @@ impl RawInterleavedKvCache {
     }
 
     /// Get the active portion of the cache as a slice: `(len * H_kv * 2 * D)` elements.
-    pub fn data(&self) -> &[f32] {
+    pub fn data(&self) -> &[half::f16] {
         &self.buf[..self.len * self.pos_stride]
     }
 

@@ -6,13 +6,13 @@
 use candle::{DType, Device, Result, Storage, Tensor, WithDType};
 use rayon::prelude::*;
 
-use super::dot_f32;
 use super::online_softmax::online_softmax_step;
 use super::standard::{FLASH_ATTN_POOL, FLASH_DECODE_POOL};
+use super::{axpy_f16, dot_f32, dot_f32_f16};
 
 /// Prefetch a cache line for read.
 #[inline(always)]
-fn prefetch_read(ptr: *const f32) {
+fn prefetch_read<T>(ptr: *const T) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
@@ -331,9 +331,9 @@ fn causal_decode_f32_lean(
 
 /// Decode with interleaved KV cache. No ALiBi, no softcap.
 #[allow(clippy::too_many_arguments)]
-pub fn causal_decode_f32_interleaved(
+pub fn causal_decode_f16kv_interleaved(
     q_data: &[f32],
-    kv_data: &[f32],
+    kv_data: &[half::f16],
     h_q: usize,
     h_kv: usize,
     d: usize,
@@ -369,12 +369,10 @@ pub fn causal_decode_f32_interleaved(
                         prefetch_read(kv_data[kv_base + kv_seq_stride..].as_ptr());
                     }
 
-                    let score = dot_f32(q_row, k_row) * scale;
+                    let score = dot_f32_f16(q_row, k_row) * scale;
 
                     online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                        for t in 0..d {
-                            acc[t] += v_row[t] * w;
-                        }
+                        axpy_f16(acc, v_row, w);
                     });
                 }
 
