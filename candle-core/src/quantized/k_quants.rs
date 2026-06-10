@@ -2265,6 +2265,64 @@ impl GgmlType for BlockQ8K {
 }
 
 // https://github.com/ggml-org/llama.cpp/blob/aa3ee0eb0b80efca126cedf9bcb4fb5864b46ce3/ggml/src/ggml-cpu/ggml-cpu.c#L1205
+// --- lightweight matmul profiling (set CANDLE_MATMUL_PROFILE=1) -----------------
+// Splits matmul wall-time into the activation-quant (alloc + from_float) phase vs the
+// parallel dot-loop. Zero overhead when the env flag is unset.
+pub static MATMUL_QUANT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MATMUL_DOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MATMUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MATMUL_PROFILE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_MATMUL_PROFILE").is_ok());
+// Min columns per rayon task. Larger => fewer tasks => less fork-join overhead on the
+// tiny per-token (m=1) GEMVs, which are badly over-parallelized at the default 128.
+static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_MIN_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128)
+});
+
+fn env_threads(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+        .max(1)
+}
+
+// Dedicated pools for quantized matmul. The global rayon pool spans all logical cores,
+// including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
+// GEMVs are memory-bandwidth bound and saturate at ~2 threads; prefill (m>1) is compute
+// bound and wants the performance cores (~cores/2). Routed by `m` in `matmul`.
+static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+    std::sync::LazyLock::new(|| {
+        let n = env_threads("CANDLE_QMATMUL_DECODE_THREADS", 2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("Failed to build qmatmul decode pool")
+    });
+static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+    std::sync::LazyLock::new(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let n = env_threads("CANDLE_QMATMUL_PREFILL_THREADS", (cores / 2).max(1));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("Failed to build qmatmul prefill pool")
+    });
+
+/// Reset the matmul profiling counters (e.g. to isolate decode from prefill).
+pub fn matmul_profile_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    MATMUL_QUANT_NS.store(0, Relaxed);
+    MATMUL_DOT_NS.store(0, Relaxed);
+    MATMUL_CALLS.store(0, Relaxed);
+}
+
 pub fn matmul<T: GgmlType>(
     (m, k, n): (usize, usize, usize),
     lhs: &[f32],
@@ -2282,6 +2340,8 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    let prof = *MATMUL_PROFILE;
+    let t_quant = if prof { Some(std::time::Instant::now()) } else { None };
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
 
     // TODO: Pre-allocate this.
@@ -2297,19 +2357,39 @@ pub fn matmul<T: GgmlType>(
         }
     }
 
-    for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
+    let t_dot = if let Some(t) = t_quant {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_QUANT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
-        dst_row
-            .into_par_iter()
-            .enumerate()
-            .with_min_len(128)
-            .with_max_len(512)
-            .for_each(|(col_idx, dst)| {
-                let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
-                *dst = T::vec_dot(k, rhs_col, lhs_row);
-            });
+    let pool = if m == 1 {
+        &*QMATMUL_DECODE_POOL
+    } else {
+        &*QMATMUL_PREFILL_POOL
+    };
+    pool.install(|| {
+        for row_idx in 0..m {
+            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
+
+            dst_row
+                .into_par_iter()
+                .enumerate()
+                .with_min_len(*MATMUL_MIN_LEN)
+                .for_each(|(col_idx, dst)| {
+                    let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                    *dst = T::vec_dot(k, rhs_col, lhs_row);
+                });
+        }
+    });
+
+    if let Some(t) = t_dot {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        MATMUL_CALLS.fetch_add(1, Relaxed);
     }
     Ok(())
 }
