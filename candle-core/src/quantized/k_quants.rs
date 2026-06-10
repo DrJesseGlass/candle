@@ -2293,11 +2293,21 @@ fn env_threads(name: &str, default: usize) -> usize {
 
 // Dedicated pools for quantized matmul. The global rayon pool spans all logical cores,
 // including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
-// GEMVs are memory-bandwidth bound and saturate at ~2 threads; prefill (m>1) is compute
-// bound and wants the performance cores (~cores/2). Routed by `m` in `matmul`.
+// GEMVs are memory-bandwidth bound; prefill (m>1) is compute bound and wants the
+// performance cores (~cores/2). Routed by `m` in `matmul`.
 static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
-        let n = env_threads("CANDLE_QMATMUL_DECODE_THREADS", 2);
+        // P-cores minus one: the orchestrating thread wakes between the ~200
+        // per-token dispatches, and a pool owning every P-core gets one worker
+        // preempted at each wake — a straggler in every join. Measured faster
+        // than both 2 (bandwidth-starved) and cores/2 (preemption) on M-series.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let n = env_threads(
+            "CANDLE_QMATMUL_DECODE_THREADS",
+            (cores / 2).saturating_sub(1).max(2),
+        );
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()
