@@ -1494,7 +1494,30 @@ impl Map2 for MatMul {
         let mut dst = vec![T::zero(); b * m * n];
         match T::DTYPE {
             DType::F16 => {
-                crate::bail!("the accelerate backend does not support f16 matmul")
+                // Accelerate has no f16 gemm; widen to f32, sgemm, narrow back.
+                for step in 0..b {
+                    let lhs_p = &lhs[step * a_skip..];
+                    let rhs_p = &rhs[step * b_skip..];
+                    let dst_p = &mut dst[step * c_skip..];
+                    unsafe {
+                        let a = std::slice::from_raw_parts(rhs_p.as_ptr() as *const f16, a_skip);
+                        let bm = std::slice::from_raw_parts(lhs_p.as_ptr() as *const f16, b_skip);
+                        let c =
+                            std::slice::from_raw_parts_mut(dst_p.as_mut_ptr() as *mut f16, c_skip);
+                        let a32: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
+                        let b32: Vec<f32> = bm.iter().map(|v| v.to_f32()).collect();
+                        let mut c32 = vec![0f32; c_skip];
+                        crate::accelerate::sgemm(
+                            transa, transb, /* m= */ n as i32, /* n= */ m as i32,
+                            /* k= */ k as i32, /* alpha= */ 1., /* a= */ &a32,
+                            /* lda= */ lda, /* b= */ &b32, /* ldb= */ ldb,
+                            /* beta= */ 0., /* c= */ &mut c32, /* ldc= */ n as i32,
+                        );
+                        for (o, v) in c.iter_mut().zip(c32) {
+                            *o = f16::from_f32(v);
+                        }
+                    }
+                }
             }
             DType::F32 => {
                 for step in 0..b {

@@ -2350,6 +2350,14 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    // Wide prefill GEMMs beat the integer-dot path on Accelerate's AMX units once
+    // `m` amortizes the per-call weight dequantization, mirroring llama.cpp's BLAS
+    // route. Decode (m=1) and short prompts stay on the quantized path.
+    #[cfg(feature = "accelerate")]
+    if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 {
+        return matmul_blas((m, k, n), lhs, rhs_t, dst);
+    }
+
     let prof = *MATMUL_PROFILE;
     let t_quant = if prof { Some(std::time::Instant::now()) } else { None };
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
@@ -2397,6 +2405,77 @@ pub fn matmul<T: GgmlType>(
     });
 
     if let Some(t) = t_dot {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        MATMUL_CALLS.fetch_add(1, Relaxed);
+    }
+    Ok(())
+}
+
+/// Minimum `m` (token count) before prefill matmuls route through BLAS.
+#[cfg(feature = "accelerate")]
+static MATMUL_BLAS_MIN_M: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_BLAS_MIN_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32)
+});
+
+/// `dst(m,n) = lhs(m,k) x rhs_t(n,k)^T` via per-tile weight dequantization and
+/// Accelerate sgemm. Activations are used in f32 directly (no Q8 quantization),
+/// so this path is slightly *more* accurate than the integer-dot path. The weight
+/// is dequantized in row tiles to bound scratch memory.
+#[cfg(feature = "accelerate")]
+fn matmul_blas<T: GgmlType>(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_t: &[T],
+    dst: &mut [f32],
+) -> Result<()> {
+    let prof = *MATMUL_PROFILE;
+    let t_all = if prof { Some(std::time::Instant::now()) } else { None };
+    let k_in_blocks = k / T::BLCK_SIZE;
+
+    // Tile rows so the f32 scratch stays ~8 MB regardless of n.
+    let tile_rows = ((8 << 20) / (4 * k)).clamp(64, n.max(64));
+    let mut scratch = vec![0f32; tile_rows * k];
+
+    let mut row = 0;
+    while row < n {
+        let nc = tile_rows.min(n - row);
+        let tile = &rhs_t[row * k_in_blocks..(row + nc) * k_in_blocks];
+        QMATMUL_PREFILL_POOL.install(|| {
+            scratch[..nc * k]
+                .par_chunks_mut(k)
+                .zip(tile.par_chunks(k_in_blocks))
+                .for_each(|(out_row, q_row)| T::to_float(q_row, out_row));
+        });
+
+        // Row-major D = L * W^T  <=>  column-major D^T(nc x m) = W(nc x k) * L^T.
+        // The scratch buffer is W in row-major = W^T column-major, hence 'T'; the
+        // lhs buffer is L row-major = L^T column-major, hence 'N'. Output columns
+        // land in dst rows at stride n (ldc), offset by the tile's first row.
+        unsafe {
+            crate::accelerate::sgemm(
+                b'T',
+                b'N',
+                nc as i32,
+                m as i32,
+                k as i32,
+                1.0,
+                &scratch[..nc * k],
+                k as i32,
+                lhs,
+                k as i32,
+                0.0,
+                &mut dst[row..],
+                n as i32,
+            );
+        }
+        row += nc;
+    }
+
+    if let Some(t) = t_all {
         use std::sync::atomic::Ordering::Relaxed;
         MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         MATMUL_CALLS.fetch_add(1, Relaxed);
