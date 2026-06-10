@@ -300,15 +300,18 @@ impl AttentionWeights {
                 // Run interleaved decode kernel
                 let kv_len = rc.len();
                 let q_len = self.num_heads * self.head_dim;
-                let ctx = causal_decode_f32_interleaved(
-                    &q_data[..q_len],
-                    rc.data(),
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    kv_len,
-                    scale,
-                )?;
+                let ctx = {
+                    let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
+                    causal_decode_f32_interleaved(
+                        &q_data[..q_len],
+                        rc.data(),
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        kv_len,
+                        scale,
+                    )?
+                };
 
                 let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
@@ -341,15 +344,18 @@ impl AttentionWeights {
                 let k = kv_k.contiguous()?;
                 let v = kv_v.contiguous()?;
 
-                let ctx = flash_attn::<f32>(
-                    &q,
-                    &k,
-                    &v,
-                    scale,
-                    AttnMask::causal_with_offset(offset),
-                    None,
-                    None,
-                )?;
+                let ctx = {
+                    let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
+                    flash_attn::<f32>(
+                        &q,
+                        &k,
+                        &v,
+                        scale,
+                        AttnMask::causal_with_offset(offset),
+                        None,
+                        None,
+                    )?
+                };
                 let ctx = ctx.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }

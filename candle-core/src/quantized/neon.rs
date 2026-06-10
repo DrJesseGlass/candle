@@ -11,9 +11,30 @@ use core::arch::arm::*;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+// Dot of two int8x16 vectors, grouped into four int32 lane-sums. Callers always reduce
+// across lanes afterwards, so the lane grouping is irrelevant — only the total matters.
+// Uses the hardware ARMv8.2 DotProd `SDOT` instruction when available (it is on Apple
+// Silicon / any `-Ctarget-feature=+dotprod` build), replacing ~5 emulation ops with one;
+// otherwise falls back to the widening-multiply emulation.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 #[inline(always)]
 unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    // TODO: dotprod
+    // The `vdotq_s32` std intrinsic is still unstable (stdarch_neon_dotprod), so emit the
+    // SDOT instruction directly. Safe on stable because `dotprod` is in the target features.
+    let mut acc = vdupq_n_s32(0);
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
     vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
