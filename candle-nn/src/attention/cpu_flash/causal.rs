@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use super::dot_f32;
 use super::online_softmax::online_softmax_step;
-use super::standard::FLASH_ATTN_POOL;
+use super::standard::{FLASH_ATTN_POOL, FLASH_DECODE_POOL};
 
 /// Prefetch a cache line for read.
 #[inline(always)]
@@ -204,7 +204,7 @@ fn causal_decode_f32(
 
     let mut out = vec![0f32; h_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
+    FLASH_DECODE_POOL.install(|| {
         out.par_chunks_mut(d).enumerate().for_each_init(
             || vec![0f32; d],
             |acc, (h_i, out_chunk)| {
@@ -278,7 +278,7 @@ fn causal_decode_f32_lean(
 
     let mut out = vec![0f32; h_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
+    FLASH_DECODE_POOL.install(|| {
         out.par_chunks_mut(d).enumerate().for_each_init(
             || vec![0f32; d],
             |acc, (h_i, out_chunk)| {
@@ -346,7 +346,7 @@ pub fn causal_decode_f32_interleaved(
 
     let mut out = vec![0f32; h_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
+    FLASH_DECODE_POOL.install(|| {
         out.par_chunks_mut(d).enumerate().for_each_init(
             || vec![0f32; d],
             |acc, (h_i, out_chunk)| {
@@ -613,7 +613,7 @@ fn causal_decode_generic<T: WithDType>(
 
     let mut out = vec![0f32; h_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
+    FLASH_DECODE_POOL.install(|| {
         out.par_chunks_mut(d).enumerate().for_each_init(
             || vec![0f32; d],
             |acc, (h_i, out_chunk)| {
