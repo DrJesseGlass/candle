@@ -354,6 +354,7 @@ impl AttentionWeights {
                     causal_decode_f16kv_interleaved(
                         &q_data[..q_len],
                         rc.data(),
+                        rc.head_stride(),
                         self.num_heads,
                         self.num_kv_heads,
                         self.head_dim,

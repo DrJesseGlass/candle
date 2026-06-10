@@ -457,6 +457,7 @@ impl QuantizedAttention {
             let ctx = causal_decode_f16kv_interleaved(
                 &self.q_rope_buf[..q_len],
                 rc.data(),
+                rc.head_stride(),
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,

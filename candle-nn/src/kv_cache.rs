@@ -1043,24 +1043,28 @@ impl InterleavedKvCache {
 // bandwidth-bound, so halving the bytes is worth the (negligible) precision cost —
 // f16 KV is also llama.cpp's default. Projections still produce f32; conversion
 // happens on write, and the decode kernel widens back in-register.
+//
+// Layout is head-major: `[head][pos][K(d), V(d)]`, with `cap` positions reserved
+// per head block. The decode kernel walks one kv-head per task, so its stream is
+// fully contiguous — position-major interleaving made every task read 2*d
+// elements and then skip the other heads' data, defeating the prefetcher.
 #[derive(Debug, Clone)]
 pub struct RawInterleavedKvCache {
     buf: Vec<half::f16>,
     h_kv: usize,
     d: usize,
-    pos_stride: usize,
+    cap: usize,
     len: usize,
 }
 
 impl RawInterleavedKvCache {
     /// Create a new cache with space for `max_seq` positions.
     pub fn new(h_kv: usize, d: usize, max_seq: usize) -> Self {
-        let pos_stride = h_kv * 2 * d;
         Self {
-            buf: vec![half::f16::ZERO; max_seq * pos_stride],
+            buf: vec![half::f16::ZERO; h_kv * max_seq * 2 * d],
             h_kv,
             d,
-            pos_stride,
+            cap: max_seq,
             len: 0,
         }
     }
@@ -1074,33 +1078,46 @@ impl RawInterleavedKvCache {
         self.len == 0
     }
 
+    /// Elements between consecutive kv-head blocks in [`Self::data`].
+    pub fn head_stride(&self) -> usize {
+        self.cap * 2 * self.d
+    }
+
     /// Write one position of K and V into the cache.
     ///
     /// `k_flat` and `v_flat` are flat `(H_kv * D)` slices from the projection output.
-    /// They are interleaved per-head into the buffer: `[H0_K, H0_V, H1_K, H1_V, ...]`.
     pub fn write_kv(&mut self, k_flat: &[f32], v_flat: &[f32]) {
-        let pos = self.len;
-        let base = pos * self.pos_stride;
-        let d = self.d;
-
-        // Grow buffer if needed
-        if base + self.pos_stride > self.buf.len() {
-            self.buf.resize(self.buf.len() * 2, half::f16::ZERO);
+        if self.len == self.cap {
+            self.grow();
         }
-
+        let d = self.d;
+        let pos_off = self.len * 2 * d;
         for h in 0..self.h_kv {
-            let k_src = h * d;
-            let v_src = h * d;
-            let dst = base + h * 2 * d;
-            for (o, &x) in self.buf[dst..dst + d].iter_mut().zip(&k_flat[k_src..]) {
+            let src = h * d;
+            let dst = h * self.cap * 2 * d + pos_off;
+            for (o, &x) in self.buf[dst..dst + d].iter_mut().zip(&k_flat[src..]) {
                 *o = half::f16::from_f32(x);
             }
-            for (o, &x) in self.buf[dst + d..dst + 2 * d].iter_mut().zip(&v_flat[v_src..]) {
+            for (o, &x) in self.buf[dst + d..dst + 2 * d].iter_mut().zip(&v_flat[src..]) {
                 *o = half::f16::from_f32(x);
             }
         }
 
         self.len += 1;
+    }
+
+    fn grow(&mut self) {
+        let new_cap = self.cap * 2;
+        let block = 2 * self.d;
+        let mut new_buf = vec![half::f16::ZERO; self.h_kv * new_cap * block];
+        for h in 0..self.h_kv {
+            let src = h * self.cap * block;
+            let dst = h * new_cap * block;
+            new_buf[dst..dst + self.len * block]
+                .copy_from_slice(&self.buf[src..src + self.len * block]);
+        }
+        self.buf = new_buf;
+        self.cap = new_cap;
     }
 
     /// Write multiple positions of K and V (for prefill).
@@ -1115,9 +1132,10 @@ impl RawInterleavedKvCache {
         }
     }
 
-    /// Get the active portion of the cache as a slice: `(len * H_kv * 2 * D)` elements.
+    /// The full cache buffer; per-head blocks start at `h * head_stride()` and
+    /// hold `len` positions of `[K(d), V(d)]` each.
     pub fn data(&self) -> &[half::f16] {
-        &self.buf[..self.len * self.pos_stride]
+        &self.buf
     }
 
     pub fn reset(&mut self) {

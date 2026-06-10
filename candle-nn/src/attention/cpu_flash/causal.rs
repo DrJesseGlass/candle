@@ -334,6 +334,7 @@ fn causal_decode_f32_lean(
 pub fn causal_decode_f16kv_interleaved(
     q_data: &[f32],
     kv_data: &[half::f16],
+    head_stride: usize,
     h_q: usize,
     h_kv: usize,
     d: usize,
@@ -341,44 +342,51 @@ pub fn causal_decode_f16kv_interleaved(
     scale: f32,
 ) -> Result<Tensor> {
     let rk = h_q / h_kv;
-    let kv_head_stride = 2 * d; // each head has K (d) + V (d)
-    let kv_seq_stride = h_kv * kv_head_stride; // stride between positions
 
     let mut out = vec![0f32; h_q * d];
 
+    // One task per kv head, computing all `rk` of its GQA query heads in a single
+    // pass: the head-major cache makes the stream contiguous, and each K/V row is
+    // read from memory once instead of once per query head.
     FLASH_DECODE_POOL.install(|| {
-        out.par_chunks_mut(d).enumerate().for_each_init(
-            || vec![0f32; d],
-            |acc, (h_i, out_chunk)| {
-                let kv_head = h_i / rk;
-                let kv_head_off = kv_head * kv_head_stride;
-                let q_row = &q_data[h_i * d..(h_i + 1) * d];
+        out.par_chunks_mut(rk * d).enumerate().for_each_init(
+            || (vec![0f32; rk * d], vec![0f32; rk], vec![0f32; rk]),
+            |(acc, m, ssum), (kv_h, out_chunk)| {
+                let head_base = kv_h * head_stride;
 
                 acc.fill(0.0);
-                let mut m = f32::NEG_INFINITY;
-                let mut ssum = 0.0f32;
+                m.fill(f32::NEG_INFINITY);
+                ssum.fill(0.0);
 
                 for kv_pos in 0..kv_len {
                     // K and V share a base pointer (adjacent in memory)
-                    let kv_base = kv_pos * kv_seq_stride + kv_head_off;
+                    let kv_base = head_base + kv_pos * 2 * d;
                     let k_row = &kv_data[kv_base..kv_base + d];
                     let v_row = &kv_data[kv_base + d..kv_base + 2 * d];
 
                     // One prefetch loads both next K and V
                     if kv_pos + 1 < kv_len {
-                        prefetch_read(kv_data[kv_base + kv_seq_stride..].as_ptr());
+                        prefetch_read(kv_data[kv_base + 2 * d..].as_ptr());
                     }
 
-                    let score = dot_f32_f16(q_row, k_row) * scale;
-
-                    online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                        axpy_f16(acc, v_row, w);
-                    });
+                    for r in 0..rk {
+                        let h_i = kv_h * rk + r;
+                        let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                        let score = dot_f32_f16(q_row, k_row) * scale;
+                        let acc_r = &mut acc[r * d..(r + 1) * d];
+                        online_softmax_step(score, &mut m[r], &mut ssum[r], acc_r, |acc, w| {
+                            axpy_f16(acc, v_row, w);
+                        });
+                    }
                 }
 
-                let inv = if ssum > 0.0 { 1.0 / ssum } else { 0.0 };
-                for t in 0..d {
-                    out_chunk[t] = acc[t] * inv;
+                for r in 0..rk {
+                    let inv = if ssum[r] > 0.0 { 1.0 / ssum[r] } else { 0.0 };
+                    let acc_r = &acc[r * d..(r + 1) * d];
+                    let out_r = &mut out_chunk[r * d..(r + 1) * d];
+                    for t in 0..d {
+                        out_r[t] = acc_r[t] * inv;
+                    }
                 }
             },
         );

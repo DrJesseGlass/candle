@@ -259,10 +259,10 @@ fn interleaved_kv_decode() -> Result<()> {
         .reshape((1, h_q, kv_len, d))?;
     let expected = reference_sdpa(&q, &k_exp, &v_exp, scale)?;
 
-    // Build interleaved KV: (kv_len, h_kv, 2*d).
-    let k_seq = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-    let v_seq = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-    let kv = Tensor::cat(&[&k_seq, &v_seq], 2)?.contiguous()?; // (kv_len, h_kv, 2*d)
+    // Build head-major interleaved KV: (h_kv, kv_len, 2*d).
+    let k_seq = k.squeeze(0)?.contiguous()?;
+    let v_seq = v.squeeze(0)?.contiguous()?;
+    let kv = Tensor::cat(&[&k_seq, &v_seq], 2)?.contiguous()?; // (h_kv, kv_len, 2*d)
 
     let kv_data: Vec<half::f16> = kv
         .flatten_all()?
@@ -277,7 +277,16 @@ fn interleaved_kv_decode() -> Result<()> {
         .flatten_all()?
         .to_vec1()?;
 
-    let out = causal_decode_f16kv_interleaved(&q_flat, &kv_data, h_q, h_kv, d, kv_len, scale)?;
+    let out = causal_decode_f16kv_interleaved(
+        &q_flat,
+        &kv_data,
+        kv_len * 2 * d,
+        h_q,
+        h_kv,
+        d,
+        kv_len,
+        scale,
+    )?;
 
     let out = out.unsqueeze(0)?;
     // f16 KV storage rounds K/V to ~1e-3 relative; the reference uses f32 throughout.
