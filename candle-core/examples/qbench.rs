@@ -9,6 +9,7 @@
 use candle_core::quantized::{k_quants, GgmlDType, QTensor};
 use candle_core::{Device, Result, Tensor};
 use half::f16;
+#[cfg(target_arch = "aarch64")]
 use std::time::Instant;
 
 const QK_K: usize = 256;
