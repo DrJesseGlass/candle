@@ -1,4 +1,5 @@
 use crate::models::with_tracing::QMatMul;
+use crate::quantized_nn::{EmbedTokens, QuantizedEmbedding};
 use crate::quantized_var_builder::VarBuilder;
 use candle::quantized::gguf_file;
 use candle::{DType, Device, Module, Result, Storage, Tensor};
@@ -375,11 +376,9 @@ impl QuantizedAttention {
                 None
             },
             raw_cache: if use_flash_attn {
-                Some(RawInterleavedKvCache::new(
-                    num_kv_heads,
-                    head_dim,
-                    MAX_SEQ_LEN,
-                ))
+                // Modest preallocation; the cache doubles itself when a longer
+                // context needs it, and 36-layer models pay this per layer.
+                Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 1024))
             } else {
                 None
             },
@@ -644,7 +643,7 @@ impl QuantizedDecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct QuantizedModelForCausalLM {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: EmbedTokens,
     layers: Vec<QuantizedDecoderLayer>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -654,12 +653,11 @@ pub struct QuantizedModelForCausalLM {
 }
 
 impl QuantizedModelForCausalLM {
-    pub fn from_gguf<P: AsRef<std::path::Path>>(
-        path: P,
-        device: &Device,
-        use_flash_attn: bool,
-    ) -> Result<Self> {
-        use candle::quantized::{GgmlDType, QTensor};
+    pub fn from_gguf<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<Self> {
+        // CPU always takes the flash path (raw f16 KV cache + interleaved decode
+        // kernel); GPU keeps the standard tensor-op attention. Same auto-selection
+        // as quantized_qwen3 — no caller flag.
+        let use_flash_attn = device.is_cpu();
 
         // Open file once to read metadata
         let mut file = std::fs::File::open(path.as_ref())?;
@@ -669,12 +667,16 @@ impl QuantizedModelForCausalLM {
         // Create VarBuilder for tensor loading
         let vb = VarBuilder::from_gguf(path, device)?;
 
-        // Load embedding tensor - dequantize on CPU first to save VRAM
-        // (will be used for both embed_tokens and lm_head - tied embeddings)
-        let cpu = Device::Cpu;
-        let embed_tensor = vb.get_no_shape("token_embd.weight")?.dequantize(&cpu)?;
-        let embed_tensor_gpu = embed_tensor.to_device(device)?; // Move to GPU for embedding layer
-        let embed_tokens = candle_nn::Embedding::new(embed_tensor_gpu, config.hidden_size);
+        // Embedding and lm_head are tied; keep one copy of the quantized bytes.
+        // On CPU, lookups gather + dequantize rows on demand (a dense f32 table
+        // for a 128k vocab costs ~1 GB of RSS).
+        let embed_qtensor = vb.get_no_shape("token_embd.weight")?;
+        let embed_tokens = if device.is_cpu() {
+            EmbedTokens::Quantized(QuantizedEmbedding::from_arc(embed_qtensor.clone())?)
+        } else {
+            let embed_tensor = embed_qtensor.dequantize(device)?;
+            EmbedTokens::Full(candle_nn::Embedding::new(embed_tensor, config.hidden_size))
+        };
 
         // Create rotary embedding if needed
         let needs_rope = (0..config.num_hidden_layers).any(|i| !config.should_skip_rope(i));
@@ -720,12 +722,9 @@ impl QuantizedModelForCausalLM {
             config.rms_norm_eps,
         );
 
-        // Load LM head - move CPU embedding tensor to GPU, then quantize
-        let embed_tensor_for_lm = embed_tensor.to_device(device)?;
-        let embed_qtensor = QTensor::quantize(&embed_tensor_for_lm, GgmlDType::Q8_0)?;
-        let lm_head = QMatMul::from_weights(Arc::new(embed_qtensor))?;
-        drop(embed_tensor); // Free CPU memory
-        drop(embed_tensor_for_lm);
+        // LM head shares the tied embedding's quantized weights directly — no
+        // dequantize/requantize round-trip (which also double-quantized to Q8_0).
+        let lm_head = QMatMul::from_weights(embed_qtensor)?;
 
         Ok(Self {
             embed_tokens,

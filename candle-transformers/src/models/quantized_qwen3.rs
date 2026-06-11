@@ -7,7 +7,8 @@
 //! - [Qwen3 Models](https://huggingface.co/Qwen/Qwen3-0.6B) (architecture based on official implementations)
 //!
 use super::with_tracing::QMatMul;
-use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
+use crate::quantized_nn::{EmbedTokens, QuantizedEmbedding, RmsNorm};
+use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor, D};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
@@ -259,7 +260,9 @@ impl AttentionWeights {
             None
         };
         let raw_cache = if on_cpu {
-            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 4096))
+            // Modest preallocation; the cache doubles itself when a longer
+            // context needs it, and 36-layer models pay this per layer.
+            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 1024))
         } else {
             None
         };
@@ -506,7 +509,7 @@ impl LayerWeights {
 
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
-    embed_tokens: Embedding,
+    embed_tokens: EmbedTokens,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -546,8 +549,15 @@ impl ModelWeights {
             None => DType::F16,
         };
 
-        let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
+        let embed_tokens = if device.is_cpu() {
+            EmbedTokens::Quantized(QuantizedEmbedding::from_arc(embed_tensor.clone())?)
+        } else {
+            EmbedTokens::Full(Embedding::new(
+                embed_tensor.dequantize(device)?,
+                hidden_size,
+            ))
+        };
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
@@ -572,12 +582,12 @@ impl ModelWeights {
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        // Load output projection tensor, falling back to tied embeddings like gemma3
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
+        // Load output projection tensor, falling back to tied embeddings like gemma3;
+        // the tied case shares the quantized bytes already held by embed_tokens.
+        let lm_head = match gg.tensor("output.weight") {
+            Ok(tensor) => QMatMul::from_weights(tensor.into())?,
+            Err(_) => QMatMul::from_weights(embed_tensor.clone())?,
         };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
