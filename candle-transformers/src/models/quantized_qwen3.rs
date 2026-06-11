@@ -633,8 +633,10 @@ impl ModelWeights {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
-        // Skip mask materialization when using CPU flash attention
-        let causal_mask = if l == 1 || self.device.is_cpu() {
+        // Skip mask materialization only when the CPU flash path will actually
+        // run (it requires b == 1); batched CPU falls back to standard attention,
+        // which needs the causal mask.
+        let causal_mask = if l == 1 || (self.device.is_cpu() && b == 1) {
             None
         } else {
             Some(self.causal_mask(b, l, offset, None)?)

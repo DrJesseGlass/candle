@@ -743,8 +743,11 @@ impl QuantizedModelForCausalLM {
         // Embed tokens
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
-        // Skip mask materialization when using CPU flash attention
-        let mask = if seq_len > 1 && !(self.use_flash_attn && self.device.is_cpu()) {
+        // Skip mask materialization only when the CPU flash path will actually
+        // run (it requires b == 1); batched CPU falls back to standard attention,
+        // which needs the causal mask.
+        let flash = self.use_flash_attn && self.device.is_cpu() && batch_size == 1;
+        let mask = if seq_len > 1 && !flash {
             Some(self.create_causal_mask(batch_size, seq_len, offset)?)
         } else {
             None

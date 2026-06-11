@@ -2359,7 +2359,11 @@ pub fn matmul<T: GgmlType>(
     }
 
     let prof = *MATMUL_PROFILE;
-    let t_quant = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_quant = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
 
     // TODO: Pre-allocate this.
@@ -2433,7 +2437,11 @@ fn matmul_blas<T: GgmlType>(
     dst: &mut [f32],
 ) -> Result<()> {
     let prof = *MATMUL_PROFILE;
-    let t_all = if prof { Some(std::time::Instant::now()) } else { None };
+    let t_all = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let k_in_blocks = k / T::BLCK_SIZE;
 
     // Tile rows so the f32 scratch stays ~8 MB regardless of n.

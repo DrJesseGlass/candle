@@ -522,11 +522,7 @@ impl QTensor {
         for t in ts {
             let (r, kt) = t.shape().dims2()?;
             if t.dtype() != dtype {
-                crate::bail!(
-                    "cat_rows dtype mismatch: {:?} vs {:?}",
-                    t.dtype(),
-                    dtype
-                )
+                crate::bail!("cat_rows dtype mismatch: {:?} vs {:?}", t.dtype(), dtype)
             }
             if kt != k {
                 crate::bail!("cat_rows inner dim mismatch: {kt} vs {k}")

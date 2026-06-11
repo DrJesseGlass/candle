@@ -1098,7 +1098,10 @@ impl RawInterleavedKvCache {
             for (o, &x) in self.buf[dst..dst + d].iter_mut().zip(&k_flat[src..]) {
                 *o = half::f16::from_f32(x);
             }
-            for (o, &x) in self.buf[dst + d..dst + 2 * d].iter_mut().zip(&v_flat[src..]) {
+            for (o, &x) in self.buf[dst + d..dst + 2 * d]
+                .iter_mut()
+                .zip(&v_flat[src..])
+            {
                 *o = half::f16::from_f32(x);
             }
         }

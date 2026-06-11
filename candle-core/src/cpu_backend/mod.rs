@@ -1500,8 +1500,11 @@ impl Map2 for MatMul {
                     let rhs_p = &rhs[step * b_skip..];
                     let dst_p = &mut dst[step * c_skip..];
                     unsafe {
-                        let a = std::slice::from_raw_parts(rhs_p.as_ptr() as *const f16, a_skip);
-                        let bm = std::slice::from_raw_parts(lhs_p.as_ptr() as *const f16, b_skip);
+                        // Exact operand sizes — unlike the f32 branch (where the slices
+                        // only carry pointers into the full allocation), these get
+                        // copied, so a_skip/b_skip batch strides would be wrong here.
+                        let a = std::slice::from_raw_parts(rhs_p.as_ptr() as *const f16, n * k);
+                        let bm = std::slice::from_raw_parts(lhs_p.as_ptr() as *const f16, m * k);
                         let c =
                             std::slice::from_raw_parts_mut(dst_p.as_mut_ptr() as *mut f16, c_skip);
                         let a32: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();

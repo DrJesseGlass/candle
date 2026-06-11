@@ -70,7 +70,10 @@ mod kernels {
         let d = y.d * x.d.to_f32();
         let dmin = y.d * x.dmin.to_f32();
 
-        let q8sums = vpaddq_s16(vld1q_s16(y.bsums.as_ptr()), vld1q_s16(y.bsums.as_ptr().add(8)));
+        let q8sums = vpaddq_s16(
+            vld1q_s16(y.bsums.as_ptr()),
+            vld1q_s16(y.bsums.as_ptr().add(8)),
+        );
 
         let mut utmp = [0u32; 4];
         std::ptr::copy_nonoverlapping(x.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
@@ -298,6 +301,7 @@ mod kernels {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn bench_gemv<F: Fn(usize, &[Q4K], &[Q8K]) -> f32 + Sync>(
     name: &str,
     rows: usize,
@@ -357,7 +361,8 @@ fn main() -> Result<()> {
     let wt = Tensor::randn(0f32, 1f32, (rows, k), &dev)?;
     let wq = QTensor::quantize(&wt, GgmlDType::Q4K)?;
     let wbytes = wq.data()?.into_owned();
-    let w: &[Q4K] = unsafe { std::slice::from_raw_parts(wbytes.as_ptr() as *const Q4K, rows * bpr) };
+    let w: &[Q4K] =
+        unsafe { std::slice::from_raw_parts(wbytes.as_ptr() as *const Q4K, rows * bpr) };
 
     let at = Tensor::randn(0f32, 1f32, (1, k), &dev)?;
     let aq = QTensor::quantize(&at, GgmlDType::Q8K)?;
@@ -391,7 +396,10 @@ fn main() -> Result<()> {
                 *e = e.max((o - reference).abs() / reference.abs().max(1.0));
             }
         }
-        println!("max rel err vs in-tree: v0={:.2e} v1={:.2e} v2={:.2e} v3={:.2e}", max_err[0], max_err[1], max_err[2], max_err[3]);
+        println!(
+            "max rel err vs in-tree: v0={:.2e} v1={:.2e} v2={:.2e} v3={:.2e}",
+            max_err[0], max_err[1], max_err[2], max_err[3]
+        );
 
         println!("benchmarks (matrix streamed, decode-GEMV shaped):");
         bench_gemv("in-tree", rows, k, w, y, |n, xs, _| {
