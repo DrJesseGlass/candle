@@ -415,6 +415,103 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
+/// Multi-row Q4K×Q8K dot (R ≤ 4 rows): unpacks each weight superblock once and dots
+/// it against R activation rows. The nibble load/mask/shift work is shared, which is
+/// the dominant non-SDOT cost of the single-row kernel; per-row arithmetic order is
+/// identical to `vec_dot_q4k_q8k`, so results match it bit-for-bit.
+#[inline(always)]
+pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
+    n: usize,
+    xs: &[BlockQ4K],
+    ys: &[&[BlockQ8K]; R],
+    dst: &mut [f32],
+) {
+    debug_assert!(
+        n.is_multiple_of(QK_K),
+        "vec_dot_q4k_q8k_xr: {n} is not divisible by {QK_K}"
+    );
+    let nrows = R;
+    debug_assert!(nrows >= 1 && nrows <= 4 && dst.len() == nrows);
+    let mut utmp = [0u32; 4];
+    let mut scales = [0u8; 16];
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let mut sumf = [0f32; R];
+    unsafe {
+        let m4b = vdupq_n_u8(0xF);
+
+        for (i, x) in xs.iter().enumerate() {
+            // Shared: unpack the weight superblock's 6-bit scales/mins.
+            LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
+            let mins8 = vld1_u32(
+                [
+                    utmp[1] & KMASK1,
+                    ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4),
+                ]
+                .as_ptr(),
+            );
+            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+            utmp[0] &= KMASK1;
+            let mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+            LittleEndian::write_u32_into(&utmp, &mut scales);
+            let xd = x.d.to_f32();
+            let xdmin = x.dmin.to_f32();
+
+            // Per row: the -dmin * Σ(mins · bsums) correction.
+            for (r, sf) in sumf.iter_mut().enumerate().take(nrows) {
+                let y = &ys[r][i];
+                let q8sums = vpaddq_s16(
+                    vld1q_s16(y.bsums.as_ptr()),
+                    vld1q_s16(y.bsums.as_ptr().add(8)),
+                );
+                let prod = vaddq_s32(
+                    vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)),
+                    vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)),
+                );
+                *sf -= y.d * xdmin * vaddvq_s32(prod) as f32;
+            }
+
+            let mut q4 = x.qs.as_ptr();
+            let mut q8p = [core::ptr::null::<i8>(); R];
+            for r in 0..nrows {
+                q8p[r] = ys[r][i].qs.as_ptr();
+            }
+            let mut sumi1 = [0i32; R];
+            let mut sumi2 = [0i32; R];
+
+            for j in 0..QK_K / 64 {
+                let q4bits = vld1q_u8_x2(q4);
+                q4 = q4.add(32);
+                let lo = int8x16x2_t(
+                    vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b)),
+                    vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b)),
+                );
+                let hi = int8x16x2_t(
+                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4)),
+                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4)),
+                );
+
+                for r in 0..nrows {
+                    let q8 = vld1q_s8_x2(q8p[r]);
+                    q8p[r] = q8p[r].add(32);
+                    let p = vaddq_s32(vdotq_s32(lo.0, q8.0), vdotq_s32(lo.1, q8.1));
+                    sumi1[r] += vaddvq_s32(p) * scales[2 * j] as i32;
+                    let q8 = vld1q_s8_x2(q8p[r]);
+                    q8p[r] = q8p[r].add(32);
+                    let p = vaddq_s32(vdotq_s32(hi.0, q8.0), vdotq_s32(hi.1, q8.1));
+                    sumi2[r] += vaddvq_s32(p) * scales[2 * j + 1] as i32;
+                }
+            }
+            for r in 0..nrows {
+                sumf[r] += ys[r][i].d * xd * (sumi1[r] + sumi2[r]) as f32;
+            }
+        }
+    }
+    dst.copy_from_slice(&sumf[..nrows]);
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(

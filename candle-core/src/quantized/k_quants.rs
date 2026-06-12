@@ -52,6 +52,21 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
 
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
+
+    /// Dot one quantized weight column against `dst.len()` activation rows spaced
+    /// `row_stride` blocks apart in `ys`. The default loops `vec_dot`; SIMD backends
+    /// can override it to share the weight unpack across rows (GEMM micro-kernel).
+    fn vec_dot_multi(
+        n: usize,
+        xs: &[Self],
+        ys: &[Self::VecDotType],
+        row_stride: usize,
+        dst: &mut [f32],
+    ) {
+        for (r, d) in dst.iter_mut().enumerate() {
+            *d = Self::vec_dot(n, xs, &ys[r * row_stride..r * row_stride + xs.len()]);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1369,6 +1384,35 @@ impl GgmlType for BlockQ4K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    /// Groups rows through the multi-row NEON kernel so each weight superblock is
+    /// unpacked once per group of four instead of once per row.
+    #[cfg(target_feature = "neon")]
+    fn vec_dot_multi(
+        n: usize,
+        xs: &[Self],
+        ys: &[Self::VecDotType],
+        row_stride: usize,
+        dst: &mut [f32],
+    ) {
+        let nb = xs.len();
+        let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        let mut r = 0;
+        // Pairs beat groups of four on Cortex-X925 (R=4 spills / serializes the
+        // horizontal reductions); revisit per-arch if more profiles disagree.
+        while r + 2 <= dst.len() {
+            super::neon::vec_dot_q4k_q8k_xr::<2>(
+                n,
+                xs,
+                &[row(r), row(r + 1)],
+                &mut dst[r..r + 2],
+            );
+            r += 2;
+        }
+        if r < dst.len() {
+            dst[r] = Self::vec_dot(n, xs, row(r));
+        }
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK_K),
@@ -2282,6 +2326,17 @@ static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| 
         .unwrap_or(128)
 });
 
+// Rows per prefill tile. The Q8K activation tile (m_tile × k/256 × 292 B) should stay
+// cache-resident while each weight column streams once per tile instead of once per row;
+// 64 rows × 12.5 KB (k=11008) ≈ 800 KB, inside a 1-2 MB L2.
+static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_M_TILE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(64)
+});
+
 fn env_threads(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -2393,18 +2448,51 @@ pub fn matmul<T: GgmlType>(
         &*QMATMUL_PREFILL_POOL
     };
     pool.install(|| {
-        for row_idx in 0..m {
-            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-            let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-
-            dst_row
-                .into_par_iter()
+        if m == 1 {
+            let lhs_row = &lhs_b[..k_in_blocks];
+            dst.into_par_iter()
                 .enumerate()
                 .with_min_len(*MATMUL_MIN_LEN)
                 .for_each(|(col_idx, dst)| {
                     let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
                     *dst = T::vec_dot(k, rhs_col, lhs_row);
                 });
+        } else {
+            // Row-tiled GEMM: iterating rows in the outer loop streams the full weight
+            // matrix once per row (m× total). Tiling rows keeps an activation tile
+            // cache-resident while each weight column is streamed once per tile,
+            // cutting weight traffic by ~m_tile×. Each (row, col) cell is written by
+            // exactly one task, so the raw-pointer writes are disjoint.
+            struct DstPtr(*mut f32);
+            unsafe impl Sync for DstPtr {}
+            let dst_ptr = DstPtr(dst.as_mut_ptr());
+            let m_tile = *MATMUL_M_TILE;
+            for row0 in (0..m).step_by(m_tile) {
+                let row1 = (row0 + m_tile).min(m);
+                (0..n)
+                    .into_par_iter()
+                    .with_min_len(*MATMUL_MIN_LEN)
+                    .for_each(|col_idx| {
+                        let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                        let p = &dst_ptr;
+                        let mut out = [0f32; 8];
+                        let mut r = row0;
+                        while r < row1 {
+                            let nr = (row1 - r).min(8);
+                            T::vec_dot_multi(
+                                k,
+                                rhs_col,
+                                &lhs_b[r * k_in_blocks..],
+                                k_in_blocks,
+                                &mut out[..nr],
+                            );
+                            for (i, v) in out[..nr].iter().enumerate() {
+                                unsafe { *p.0.add((r + i) * n + col_idx) = *v };
+                            }
+                            r += nr;
+                        }
+                    });
+            }
         }
     });
 
