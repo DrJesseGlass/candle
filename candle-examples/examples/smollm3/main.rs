@@ -452,6 +452,10 @@ fn run_generation(
     };
     let prompt_dt = start_prompt.elapsed();
 
+    // Isolate decode from prefill in the matmul profile (no-op unless CANDLE_MATMUL_PROFILE=1).
+    print_matmul_profile("prefill");
+    candle::quantized::k_quants::matmul_profile_reset();
+
     // Get EOS token
     let config = model.config();
     let eos_token = get_eos_token(tos.tokenizer(), &config);
@@ -514,6 +518,7 @@ fn run_generation(
         sampled,
         sampled as f64 / generation_dt.as_secs_f64(),
     );
+    print_matmul_profile("decode");
 
     Ok(())
 }
@@ -561,6 +566,27 @@ fn print_model_info(config: &ModelConfig) {
             interval
         );
     }
+}
+
+/// Print the accumulated quantized-matmul counters for one phase (no-op unless
+/// CANDLE_MATMUL_PROFILE=1). Pair with matmul_profile_reset() to isolate phases.
+fn print_matmul_profile(phase: &str) {
+    if std::env::var("CANDLE_MATMUL_PROFILE").is_err() {
+        return;
+    }
+    use candle::quantized::k_quants::{MATMUL_CALLS, MATMUL_DOT_NS, MATMUL_QUANT_NS};
+    use std::sync::atomic::Ordering::Relaxed;
+    let q = MATMUL_QUANT_NS.load(Relaxed) as f64 / 1e6;
+    let d = MATMUL_DOT_NS.load(Relaxed) as f64 / 1e6;
+    let c = MATMUL_CALLS.load(Relaxed).max(1);
+    let tot = (q + d).max(1e-9);
+    println!(
+        "\nmatmul {phase} profile: calls={c}  quant={q:.1}ms ({:.1}%)  dot={d:.1}ms ({:.1}%)  | per-call quant={:.2}us dot={:.2}us",
+        100.0 * q / tot,
+        100.0 * d / tot,
+        q * 1000.0 / c as f64,
+        d * 1000.0 / c as f64,
+    );
 }
 
 fn main() -> Result<()> {

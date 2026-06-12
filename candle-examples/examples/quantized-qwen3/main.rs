@@ -159,6 +159,27 @@ fn format_size(size_in_bytes: usize) -> String {
     }
 }
 
+/// Print the accumulated quantized-matmul counters for one phase (no-op unless
+/// CANDLE_MATMUL_PROFILE=1). Pair with matmul_profile_reset() to isolate phases.
+fn print_matmul_profile(phase: &str) {
+    if std::env::var("CANDLE_MATMUL_PROFILE").is_err() {
+        return;
+    }
+    use candle::quantized::k_quants::{MATMUL_CALLS, MATMUL_DOT_NS, MATMUL_QUANT_NS};
+    use std::sync::atomic::Ordering::Relaxed;
+    let q = MATMUL_QUANT_NS.load(Relaxed) as f64 / 1e6;
+    let d = MATMUL_DOT_NS.load(Relaxed) as f64 / 1e6;
+    let c = MATMUL_CALLS.load(Relaxed).max(1);
+    let tot = (q + d).max(1e-9);
+    println!(
+        "\nmatmul {phase} profile: calls={c}  quant={q:.1}ms ({:.1}%)  dot={d:.1}ms ({:.1}%)  | per-call quant={:.2}us dot={:.2}us",
+        100.0 * q / tot,
+        100.0 * d / tot,
+        q * 1000.0 / c as f64,
+        d * 1000.0 / c as f64,
+    );
+}
+
 fn main() -> anyhow::Result<()> {
     use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;
@@ -273,6 +294,7 @@ fn main() -> anyhow::Result<()> {
     let eos_token = *tos.tokenizer().get_vocab(true).get("<|im_end|>").unwrap();
 
     // Isolate decode from prefill in the matmul profile (no-op unless CANDLE_MATMUL_PROFILE=1).
+    print_matmul_profile("prefill");
     candle::quantized::k_quants::matmul_profile_reset();
     let start_post_prompt = std::time::Instant::now();
 
@@ -318,20 +340,6 @@ fn main() -> anyhow::Result<()> {
         "{sampled:4} tokens generated: {:.2} token/s",
         sampled as f64 / dt.as_secs_f64(),
     );
-    if std::env::var("CANDLE_MATMUL_PROFILE").is_ok() {
-        use candle::quantized::k_quants::{MATMUL_CALLS, MATMUL_DOT_NS, MATMUL_QUANT_NS};
-        use std::sync::atomic::Ordering::Relaxed;
-        let q = MATMUL_QUANT_NS.load(Relaxed) as f64 / 1e6;
-        let d = MATMUL_DOT_NS.load(Relaxed) as f64 / 1e6;
-        let c = MATMUL_CALLS.load(Relaxed).max(1);
-        let tot = q + d;
-        println!(
-            "matmul decode profile: calls={c}  quant={q:.1}ms ({:.1}%)  dot={d:.1}ms ({:.1}%)  | per-call quant={:.2}us dot={:.2}us",
-            100.0 * q / tot,
-            100.0 * d / tot,
-            q * 1000.0 / c as f64,
-            d * 1000.0 / c as f64,
-        );
-    }
+    print_matmul_profile("decode");
     Ok(())
 }
