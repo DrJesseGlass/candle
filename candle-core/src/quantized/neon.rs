@@ -478,8 +478,10 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             for r in 0..nrows {
                 q8p[r] = ys[r][i].qs.as_ptr();
             }
-            let mut sumi1 = [0i32; R];
-            let mut sumi2 = [0i32; R];
+            // Vector accumulators: one horizontal reduction per superblock per row
+            // instead of one per 32 weights (i32 adds are associative, so this is
+            // bit-identical to the scalar-sum form).
+            let mut acc = [vdupq_n_s32(0); R];
 
             for j in 0..QK_K / 64 {
                 let q4bits = vld1q_u8_x2(q4);
@@ -497,15 +499,15 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
                     let q8 = vld1q_s8_x2(q8p[r]);
                     q8p[r] = q8p[r].add(32);
                     let p = vaddq_s32(vdotq_s32(lo.0, q8.0), vdotq_s32(lo.1, q8.1));
-                    sumi1[r] += vaddvq_s32(p) * scales[2 * j] as i32;
+                    acc[r] = vmlaq_n_s32(acc[r], p, scales[2 * j] as i32);
                     let q8 = vld1q_s8_x2(q8p[r]);
                     q8p[r] = q8p[r].add(32);
                     let p = vaddq_s32(vdotq_s32(hi.0, q8.0), vdotq_s32(hi.1, q8.1));
-                    sumi2[r] += vaddvq_s32(p) * scales[2 * j + 1] as i32;
+                    acc[r] = vmlaq_n_s32(acc[r], p, scales[2 * j + 1] as i32);
                 }
             }
             for r in 0..nrows {
-                sumf[r] += ys[r][i].d * xd * (sumi1[r] + sumi2[r]) as f32;
+                sumf[r] += ys[r][i].d * xd * vaddvq_s32(acc[r]) as f32;
             }
         }
     }
