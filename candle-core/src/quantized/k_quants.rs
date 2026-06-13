@@ -2426,12 +2426,20 @@ pub fn matmul<T: GgmlType>(
     // f32, f16, and bf16 support direct copy
     if T::DIRECT_COPY {
         T::VecDotType::direct_copy(lhs, &mut lhs_b);
+    } else if m == 1 {
+        T::VecDotType::from_float(&lhs[..k], &mut lhs_b[..k_in_blocks]);
     } else {
-        for row_idx in 0..m {
-            let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-            let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-            T::VecDotType::from_float(lhs, lhs_b_mut)
-        }
+        // Prefill quantizes m rows; spread them over the prefill pool (the serial
+        // loop showed up as a constant ~2% of prefill wall time).
+        QMATMUL_PREFILL_POOL.install(|| {
+            lhs_b
+                .par_chunks_mut(k_in_blocks)
+                .enumerate()
+                .with_min_len(8)
+                .for_each(|(row_idx, lhs_b_row)| {
+                    T::VecDotType::from_float(&lhs[row_idx * k..(row_idx + 1) * k], lhs_b_row)
+                });
+        });
     }
 
     let t_dot = if let Some(t) = t_quant {
