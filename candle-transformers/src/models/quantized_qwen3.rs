@@ -11,9 +11,10 @@ use crate::quantized_nn::{EmbedTokens, QuantizedEmbedding, RmsNorm};
 use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor, D};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
-use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle_nn::attention::cpu_flash::causal::{
+    causal_decode_f16kv_interleaved, causal_prefill_f16kv_headmajor,
+};
+use candle_nn::kv_cache::{ConcatKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -213,7 +214,6 @@ struct AttentionWeights {
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<ConcatKvCache>,
-    interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
 }
@@ -254,11 +254,6 @@ impl AttentionWeights {
         } else {
             Some(ConcatKvCache::new(2))
         };
-        let interleaved_cache = if on_cpu {
-            Some(InterleavedKvCache::new(head_dim))
-        } else {
-            None
-        };
         let raw_cache = if on_cpu {
             // Modest preallocation; the cache doubles itself when a longer
             // context needs it, and 36-layer models pay this per layer.
@@ -282,7 +277,6 @@ impl AttentionWeights {
             hidden_size,
             rotary_emb,
             kv_cache,
-            interleaved_cache,
             raw_cache,
             span_attn,
         })
@@ -369,47 +363,48 @@ impl AttentionWeights {
                 let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             } else {
-                // Prefill: interleaved cache + flash_attn; also populate raw cache for decode.
-                let ic = self.interleaved_cache.as_mut().unwrap();
-                let kv = ic.append(&k, &v)?;
+                // Prefill: write the f16 raw cache, then run causal flash directly
+                // over it — the same cache decode reads, so there is no separate
+                // f32 KV copy and no per-layer cat of the full cache.
+                let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let (kg, kl) = k_cont.storage_and_layout();
+                let k_d: &[f32] = match &*kg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
+                let (vg, vl) = v_cont.storage_and_layout();
+                let v_d: &[f32] = match &*vg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
+                let rc = self.raw_cache.as_mut().unwrap();
+                rc.write_kv_batch(k_d, v_d, l);
+                let kv_len = rc.len();
 
-                // Populate raw cache for subsequent decode steps
-                {
-                    let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                    let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                    let (kg, kl) = k_cont.storage_and_layout();
-                    let k_d: &[f32] = match &*kg {
-                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
-                    };
-                    let (vg, vl) = v_cont.storage_and_layout();
-                    let v_d: &[f32] = match &*vg {
-                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
-                    };
-                    self.raw_cache.as_mut().unwrap().write_kv_batch(k_d, v_d, l);
-                }
-
-                let kv_k = kv.narrow(2, 0, self.head_dim)?.unsqueeze(0)?;
-                let kv_v = kv.narrow(2, self.head_dim, self.head_dim)?.unsqueeze(0)?;
-
-                let q = q.transpose(1, 2)?.contiguous()?;
-                let k = kv_k.contiguous()?;
-                let v = kv_v.contiguous()?;
+                let q_t = q.transpose(1, 2)?.contiguous()?; // (b, l, h_q, d)
+                let (qg, ql) = q_t.storage_and_layout();
+                let q_d: &[f32] = match &*qg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[ql.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
 
                 let ctx = {
                     let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
-                    flash_attn::<f32>(
-                        &q,
-                        &k,
-                        &v,
+                    causal_prefill_f16kv_headmajor(
+                        &q_d[..l * self.num_heads * self.head_dim],
+                        rc.data(),
+                        rc.head_stride(),
+                        l,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        kv_len,
                         scale,
-                        AttnMask::causal_with_offset(offset),
-                        None,
-                        None,
+                        offset,
                     )?
                 };
-                let ctx = ctx.transpose(1, 2)?;
+                let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
         } else {
@@ -439,9 +434,6 @@ impl AttentionWeights {
 
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
-            c.reset();
-        }
-        if let Some(c) = &mut self.interleaved_cache {
             c.reset();
         }
         if let Some(c) = &mut self.raw_cache {

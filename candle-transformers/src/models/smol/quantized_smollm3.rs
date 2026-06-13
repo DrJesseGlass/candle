@@ -3,9 +3,10 @@ use crate::quantized_nn::{EmbedTokens, QuantizedEmbedding};
 use crate::quantized_var_builder::VarBuilder;
 use candle::quantized::gguf_file;
 use candle::{DType, Device, Module, Result, Storage, Tensor};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
-use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{rope_i_inplace, InterleavedKvCache, KvCache, RawInterleavedKvCache};
+use candle_nn::attention::cpu_flash::causal::{
+    causal_decode_f16kv_interleaved, causal_prefill_f16kv_headmajor,
+};
+use candle_nn::kv_cache::{rope_i_inplace, KvCache, RawInterleavedKvCache};
 use candle_nn::Activation;
 use std::io::Write;
 use std::sync::Arc;
@@ -296,7 +297,6 @@ struct QuantizedAttention {
     skip_rope: bool,
     use_flash_attn: bool,
     kv_cache: Option<KvCache>,
-    interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     /// Pre-allocated buffers for in-place RoPE during fused decode
     q_rope_buf: Vec<f32>,
@@ -369,11 +369,6 @@ impl QuantizedAttention {
                 None
             } else {
                 Some(KvCache::new(2, 512))
-            },
-            interleaved_cache: if use_flash_attn {
-                Some(InterleavedKvCache::new(head_dim))
-            } else {
-                None
             },
             raw_cache: if use_flash_attn {
                 // Modest preallocation; the cache doubles itself when a longer
@@ -497,46 +492,46 @@ impl QuantizedAttention {
         };
 
         if self.use_flash_attn && x.device().is_cpu() && b == 1 {
-            // Prefill (B=1 only): use InterleavedKvCache + flash_attn
-            let kv = self.interleaved_cache.as_mut().unwrap().append(&k, &v)?;
-            // Also populate raw cache for subsequent decode steps
-            {
-                let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                let (kg, kl) = k_cont.storage_and_layout();
-                let k_data: &[f32] = match &*kg {
-                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
-                    _ => candle::bail!("Expected CPU"),
-                };
-                let (vg, vl) = v_cont.storage_and_layout();
-                let v_data: &[f32] = match &*vg {
-                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
-                    _ => candle::bail!("Expected CPU"),
-                };
-                self.raw_cache
-                    .as_mut()
-                    .unwrap()
-                    .write_kv_batch(k_data, v_data, seq_len);
-            }
+            // Prefill (B=1 only): write the f16 raw cache, then run causal flash
+            // directly over it — the same cache decode reads, so there is no
+            // separate f32 KV copy and no per-layer cat of the full cache.
+            let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+            let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+            let (kg, kl) = k_cont.storage_and_layout();
+            let k_data: &[f32] = match &*kg {
+                Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
+                _ => candle::bail!("Expected CPU"),
+            };
+            let (vg, vl) = v_cont.storage_and_layout();
+            let v_data: &[f32] = match &*vg {
+                Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
+                _ => candle::bail!("Expected CPU"),
+            };
+            let rc = self.raw_cache.as_mut().unwrap();
+            rc.write_kv_batch(k_data, v_data, seq_len);
+            let kv_len = rc.len();
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
-            let kv_k = kv.narrow(2, 0, self.head_dim)?.unsqueeze(0)?;
-            let kv_v = kv.narrow(2, self.head_dim, self.head_dim)?.unsqueeze(0)?;
+            let q_t = q.transpose(1, 2)?.contiguous()?; // (b, l, h_q, d)
+            let (qg, ql) = q_t.storage_and_layout();
+            let q_d: &[f32] = match &*qg {
+                Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[ql.start_offset()..],
+                _ => candle::bail!("Expected CPU"),
+            };
 
-            let q = q.transpose(1, 2)?.contiguous()?;
-            let k = kv_k.contiguous()?;
-            let v = kv_v.contiguous()?;
-
-            let ctx = flash_attn::<f32>(
-                &q,
-                &k,
-                &v,
+            let ctx = causal_prefill_f16kv_headmajor(
+                &q_d[..seq_len * self.num_heads * self.head_dim],
+                rc.data(),
+                rc.head_stride(),
+                seq_len,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                kv_len,
                 scale,
-                AttnMask::causal_with_offset(offset),
-                None,
-                None,
+                offset,
             )?;
-            let ctx = ctx.transpose(1, 2)?;
+            let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
             ctx.reshape((b, seq_len, self.hidden_size))?
                 .apply(&self.o_proj)
         } else {
@@ -571,9 +566,6 @@ impl QuantizedAttention {
 
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
-            c.reset();
-        }
-        if let Some(c) = &mut self.interleaved_cache {
             c.reset();
         }
         if let Some(c) = &mut self.raw_cache {

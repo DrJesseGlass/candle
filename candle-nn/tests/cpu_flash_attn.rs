@@ -169,6 +169,104 @@ fn causal_decode_gqa() -> Result<()> {
     assert_close(&out, &expected, 1e-5, "causal_decode_gqa")
 }
 
+// Causal prefill with GQA, long enough to cross the kernel's KV-block (128) and
+// query-block (32) boundaries.
+#[test]
+fn causal_prefill_gqa() -> Result<()> {
+    let (h_q, h_kv, d, s) = (8, 2, 16, 200);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+
+    let q = Tensor::randn(0f32, 1f32, (1, h_q, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h_kv, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h_kv, s, d), dev)?;
+
+    let reps = h_q / h_kv;
+    let k_exp = k
+        .reshape((1, h_kv, 1, s, d))?
+        .broadcast_as((1, h_kv, reps, s, d))?
+        .reshape((1, h_q, s, d))?;
+    let v_exp = v
+        .reshape((1, h_kv, 1, s, d))?
+        .broadcast_as((1, h_kv, reps, s, d))?
+        .reshape((1, h_q, s, d))?;
+
+    let expected = reference_causal_sdpa(&q, &k_exp, &v_exp, scale)?;
+
+    let out = flash_attn::<f32>(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+        AttnMask::causal(),
+        None,
+        None,
+    )?;
+
+    assert_close(&out, &expected, 1e-5, "causal_prefill_gqa")
+}
+
+// f16 head-major prefill kernel vs f32 reference (tolerance dominated by f16 KV
+// storage + f16 QK dots, same budget as the decode counterpart).
+#[test]
+fn f16kv_headmajor_prefill() -> Result<()> {
+    use candle_nn::attention::cpu_flash::causal::causal_prefill_f16kv_headmajor;
+    use half::f16;
+
+    let (h_q, h_kv, d, s) = (8, 2, 16, 200);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+
+    let q = Tensor::randn(0f32, 1f32, (1, h_q, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h_kv, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h_kv, s, d), dev)?;
+
+    // Reference on the f16-rounded K/V so we measure kernel error, not storage error.
+    let k_h = k.to_dtype(candle::DType::F16)?.to_dtype(candle::DType::F32)?;
+    let v_h = v.to_dtype(candle::DType::F16)?.to_dtype(candle::DType::F32)?;
+    let reps = h_q / h_kv;
+    let k_exp = k_h
+        .reshape((1, h_kv, 1, s, d))?
+        .broadcast_as((1, h_kv, reps, s, d))?
+        .reshape((1, h_q, s, d))?;
+    let v_exp = v_h
+        .reshape((1, h_kv, 1, s, d))?
+        .broadcast_as((1, h_kv, reps, s, d))?
+        .reshape((1, h_q, s, d))?;
+    let expected = reference_causal_sdpa(&q, &k_exp, &v_exp, scale)?;
+
+    // Pack K/V into the head-major interleaved f16 layout: [head][pos][K(d), V(d)].
+    let k_v: Vec<f32> = k.flatten_all()?.to_vec1()?; // (h_kv, s, d)
+    let v_v: Vec<f32> = v.flatten_all()?.to_vec1()?;
+    let head_stride = s * 2 * d;
+    let mut kv = vec![f16::ZERO; h_kv * head_stride];
+    for h in 0..h_kv {
+        for pos in 0..s {
+            for t in 0..d {
+                kv[h * head_stride + pos * 2 * d + t] =
+                    f16::from_f32(k_v[h * s * d + pos * d + t]);
+                kv[h * head_stride + pos * 2 * d + d + t] =
+                    f16::from_f32(v_v[h * s * d + pos * d + t]);
+            }
+        }
+    }
+
+    // Q as (s, h_q, d)
+    let q_seq: Vec<f32> = q
+        .squeeze(0)?
+        .transpose(0, 1)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1()?;
+
+    let out = causal_prefill_f16kv_headmajor(
+        &q_seq, &kv, head_stride, s, h_q, h_kv, d, s, scale, 0,
+    )?
+    .unsqueeze(0)?; // (1, h_q, s, d) to match reference
+
+    assert_close(&out, &expected, 2e-2, "f16kv_headmajor_prefill")
+}
+
 // Standard (no mask)
 
 #[test]
