@@ -680,9 +680,11 @@ mod tests {
                         maxdiff = maxdiff.max((dst_base[idx] - dst_pack[idx]).abs());
                     }
                     let phase = if m == 1 { "decode " } else { "prefill" };
+                    // GFLOP/s for the matmul: 2*m*k*n MACs.
+                    let gflop = 2.0 * (m as f64) * (k as f64) * (n as f64) / 1e9;
                     println!(
-                        "[{phase}] m={m:<4} MR={:<1} base={:.3}ms packed={:.3}ms speedup={:.2}x maxdiff={maxdiff:.1e}",
-                        $main, t_base * 1e3, t_pack * 1e3, t_base / t_pack
+                        "[{phase}] m={m:<4} MR={:<1} base={:.3}ms ({:.1} GFLOP/s) packed={:.3}ms ({:.1} GFLOP/s) speedup={:.2}x maxdiff={maxdiff:.1e}",
+                        $main, t_base * 1e3, gflop / t_base, t_pack * 1e3, gflop / t_pack, t_base / t_pack
                     );
                 }};
             }

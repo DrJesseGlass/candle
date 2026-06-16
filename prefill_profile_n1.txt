@@ -1,0 +1,7 @@
+candle N1 prefill matmul-vs-rest profile (Qwen3-0.6B Q4_K_M, pp=512, baseline path)
+cores=2: pp=42.8 t/s  matmul_dot=72.2%  quant=1.0%  rest=26.8%   (564 matmul calls)
+cores=4: pp=77.4 t/s  matmul_dot=66.1%  quant=1.0%  rest=32.9%
+cores=8: pp=126.1 t/s matmul_dot=58.0%  quant=1.2%  rest=40.8%
+KEY: "rest" (attention/norm/rope/softmax/copies) GROWS with cores (27->33->41%) = doesn't scale.
+Matmul aggregate @8c (~2356ms/rep) EXCEEDS llama's entire prefill (~1566ms/rep) despite IDENTICAL kernel
+ => candle matmul has a dispatch/efficiency problem, not a kernel problem.

@@ -87,15 +87,46 @@ fn main() -> Result<()> {
     let mut pp_rates = Vec::new();
     let mut tg_rates = Vec::new();
 
+    // Optional matmul-vs-rest profiling of the prefill (CANDLE_MATMUL_PROFILE=1).
+    use candle::quantized::k_quants::{
+        matmul_profile_reset, MATMUL_CALLS, MATMUL_DOT_NS, MATMUL_QUANT_NS,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let profile = std::env::var("CANDLE_MATMUL_PROFILE").is_ok();
+    let mut pp_wall_ns: u128 = 0;
+    let mut pp_dot_ns: u64 = 0;
+    let mut pp_quant_ns: u64 = 0;
+    let mut pp_calls: u64 = 0;
+    let mut pp_flash_ns: u64 = 0;
+    let mut pp_norm_ns: u64 = 0;
+    let mut pp_rope_ns: u64 = 0;
+    let mut pp_copy_ns: u64 = 0;
+
     let total = args.warmup + args.reps;
     for rep in 0..total {
         model.clear_kv_cache();
 
         // Prefill: one forward over the whole synthetic prompt.
         let input = Tensor::new(prompt.as_slice(), &device)?.unsqueeze(0)?;
+        if profile {
+            matmul_profile_reset();
+            candle_transformers::models::quantized_qwen3::model_profile_reset();
+        }
         let t = Instant::now();
         let logits = model.forward(&input, 0)?.squeeze(0)?;
-        let pp_dt = t.elapsed().as_secs_f64();
+        let pp_elapsed = t.elapsed();
+        let pp_dt = pp_elapsed.as_secs_f64();
+        if profile && rep >= args.warmup {
+            use candle_transformers::models::quantized_qwen3 as m;
+            pp_wall_ns += pp_elapsed.as_nanos();
+            pp_dot_ns += MATMUL_DOT_NS.load(Relaxed);
+            pp_quant_ns += MATMUL_QUANT_NS.load(Relaxed);
+            pp_calls += MATMUL_CALLS.load(Relaxed);
+            pp_flash_ns += m::FLASH_NS.load(Relaxed);
+            pp_norm_ns += m::NORM_NS.load(Relaxed);
+            pp_rope_ns += m::ROPE_NS.load(Relaxed);
+            pp_copy_ns += m::COPY_NS.load(Relaxed);
+        }
         let mut next = argmax(&logits.to_vec1::<f32>()?);
 
         // Decode: tg greedy single-token forwards.
@@ -139,6 +170,32 @@ fn main() -> Result<()> {
         println!("\ncandle  pp{}  tg{}  reps={}", args.pp, args.tg, args.reps);
         println!("  prefill (pp): {pp_med:.2} t/s  [{pp_min:.2}..{pp_max:.2}]");
         println!("  decode  (tg): {tg_med:.2} t/s  [{tg_min:.2}..{tg_max:.2}]");
+    }
+    if profile && pp_wall_ns > 0 {
+        // MATMUL_DOT_NS/QUANT_NS sum the wall time of each matmul's dot / activation-
+        // quantization phase. The remainder of prefill wall time is everything else
+        // (attention, norms, rope, softmax, copies, framework overhead).
+        let wall = pp_wall_ns as f64;
+        let dot = pp_dot_ns as f64;
+        let quant = pp_quant_ns as f64;
+        let rest = (wall - dot - quant).max(0.0);
+        let flash = pp_flash_ns as f64;
+        let norm = pp_norm_ns as f64;
+        let rope = pp_rope_ns as f64;
+        let copy = pp_copy_ns as f64;
+        let glue = (rest - flash - norm - rope - copy).max(0.0);
+        let pct = |x: f64| 100.0 * x / wall;
+        eprintln!(
+            "\n[prefill profile over {} reps]  wall={:.1}ms  calls={}\n  \
+matmul_dot={:.1}ms ({:.1}%)  matmul_quant={:.1}ms ({:.1}%)\n  \
+REST={:.1}ms ({:.1}%) = flash_attn {:.1}ms ({:.1}%) + norm {:.1}ms ({:.1}%) + \
+rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
+            args.reps, wall / 1e6, pp_calls,
+            dot / 1e6, pct(dot), quant / 1e6, pct(quant),
+            rest / 1e6, pct(rest),
+            flash / 1e6, pct(flash), norm / 1e6, pct(norm),
+            rope / 1e6, pct(rope), copy / 1e6, pct(copy), glue / 1e6, pct(glue),
+        );
     }
     Ok(())
 }

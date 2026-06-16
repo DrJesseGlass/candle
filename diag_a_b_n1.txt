@@ -1,0 +1,21 @@
+=== (a) candle matmul GFLOP/s (8 cores, 2048x2048) ===
+prefill m=512: candle base 233 GFLOP/s, packed 238 GFLOP/s
+decode  m=1:   candle base 56 GFLOP/s, packed 150 GFLOP/s (2.68x, packed decode win)
+N1 int8 sdot peak ~1280 GFLOP/s => candle prefill matmul at ~18% of peak.
+llama estimated matmul ~676 GFLOP/s (~53% peak): candle matmul_dot aggregate @8c (2378ms/rep)
+ EXCEEDS llama's ENTIRE prefill (1566ms/rep) with the IDENTICAL inner kernel.
+ => candle matmul ~2.5x less efficient than llama. Gap is GEMM blocking/scheduling AROUND
+    the kernel (tiling, cache, thread granularity), NOT the inner sdot loop.
+
+=== (b) prefill REST breakdown (per 4 reps) ===
+cores=2: matmul 72% | flash 17.4% | norm 0.8% | rope 0.7% | copy 0.7% | GLUE 7.4% (3580ms)
+cores=4: matmul 66% | flash 16.3% | norm 0.9% | rope 0.7% | copy 1.2% | GLUE 13.5% (3562ms)
+cores=8: matmul 59% | flash 14.4% | norm 1.0% | rope 0.8% | copy 2.0% | GLUE 22.0% (3577ms)
+KEY: flash_attn scales fine (3.6x/4cores). norm/rope/copy negligible.
+GLUE (~890ms/prefill) is CONSTANT across cores => serial framework overhead
+ (residual adds, reshape/transpose, allocations, dtype conversions, per-Tensor-op machinery).
+ It's the non-scaling bottleneck: 22% of prefill at 8 cores.
+
+=== Conclusion ===
+The 2x N1 gap = (1) matmul dispatch ~2.5x less efficient than llama (SAME kernel) +
+(2) ~22% serial framework "glue". Both FRAMEWORK-level, neither is the inner kernel.

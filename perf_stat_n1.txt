@@ -1,0 +1,12 @@
+=== perf stat root-cause: candle vs llama, FULL MODEL, 1 thread, pp512 (Graviton2/N1) ===
+candle: pp=22.16 t/s | IPC=2.35 | instructions=526.1B | L1-miss=6.35% | (matmul 75%, flash 18%, glue 4%)
+llama : pp=43.99 t/s | IPC=2.46 | instructions=291.5B | L1-miss=0.74%
+=> llama 1.99x faster. candle executes 1.81x MORE instructions for the same work.
+   IPC ~identical (both ~2.4, pipelines full) => NOT compute-stalled.
+   candle L1 miss rate 8.5x higher (6.35 vs 0.74%) but IPC stays high => mostly hidden.
+ROOT CAUSE: INSTRUCTION COUNT, not memory BW and not IPC stalls. candle's q4_K matmul
+ emits ~1.8x the instructions per MAC vs ggml's C (same algorithm) — Rust/LLVM NEON codegen
+ + per-call/indexing overhead (bounds checks, vec_dot_multi ladder, array-of-accumulator
+ indexing), NOT the inner sdot. Lever: cut instructions in the hot kernel (get_unchecked,
+ simplify hot loop, ensure clean vectorization / hand-tuned asm), + improve locality.
+Single-thread isolated matmul: candle 29.6 GFLOP/s @ IPC 2.41, L1-miss 3.77%.

@@ -19,6 +19,39 @@ use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
+// --- coarse prefill "rest" profiling (set CANDLE_MATMUL_PROFILE=1) ---------
+// Non-matmul forward-pass buckets, to see what dominates (and scales) outside the
+// quantized matmuls. Whatever's left of prefill wall after matmul + these is "glue"
+// (residuals, reshapes, allocations).
+pub static FLASH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static NORM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ROPE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MODEL_PROFILE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_MATMUL_PROFILE").is_ok());
+
+/// Time `f`, adding the elapsed ns to `c` when profiling is on.
+#[inline]
+fn timed<T>(c: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if *MODEL_PROFILE {
+        let t = std::time::Instant::now();
+        let r = f();
+        c.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        r
+    } else {
+        f()
+    }
+}
+
+/// Reset the model profiling buckets (call before a measured prefill).
+pub fn model_profile_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    FLASH_NS.store(0, Relaxed);
+    NORM_NS.store(0, Relaxed);
+    ROPE_NS.store(0, Relaxed);
+    COPY_NS.store(0, Relaxed);
+}
+
 pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
@@ -303,13 +336,13 @@ impl AttentionWeights {
         // Per-head Q/K norms (must stay as tensor ops)
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q_flat = timed(&NORM_NS, || self.q_norm.forward(&q_flat))?;
+        let k_flat = timed(&NORM_NS, || self.k_norm.forward(&k_flat))?;
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
         // RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        let (q, k) = timed(&ROPE_NS, || self.rotary_emb.apply(&q, &k, offset))?;
 
         // TODO: b > 1 needs varlen CPU flash with interleaved cache support.
         if x.device().is_cpu() && b == 1 {
@@ -366,8 +399,8 @@ impl AttentionWeights {
                 // Prefill: write the f16 raw cache, then run causal flash directly
                 // over it — the same cache decode reads, so there is no separate
                 // f32 KV copy and no per-layer cat of the full cache.
-                let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let k_cont = timed(&COPY_NS, || k.squeeze(0)?.transpose(0, 1)?.contiguous())?;
+                let v_cont = timed(&COPY_NS, || v.squeeze(0)?.transpose(0, 1)?.contiguous())?;
                 let (kg, kl) = k_cont.storage_and_layout();
                 let k_d: &[f32] = match &*kg {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
@@ -382,14 +415,14 @@ impl AttentionWeights {
                 rc.write_kv_batch(k_d, v_d, l);
                 let kv_len = rc.len();
 
-                let q_t = q.transpose(1, 2)?.contiguous()?; // (b, l, h_q, d)
+                let q_t = timed(&COPY_NS, || q.transpose(1, 2)?.contiguous())?; // (b, l, h_q, d)
                 let (qg, ql) = q_t.storage_and_layout();
                 let q_d: &[f32] = match &*qg {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[ql.start_offset()..],
                     _ => candle::bail!("Expected CPU"),
                 };
 
-                let ctx = {
+                let ctx = timed(&FLASH_NS, || {
                     let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
                     causal_prefill_f16kv_headmajor(
                         &q_d[..l * self.num_heads * self.head_dim],
@@ -402,8 +435,8 @@ impl AttentionWeights {
                         kv_len,
                         scale,
                         offset,
-                    )?
-                };
+                    )
+                })?;
                 let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
@@ -486,10 +519,10 @@ impl LayerWeights {
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let h = self.ln1.forward(x)?;
+        let h = timed(&NORM_NS, || self.ln1.forward(x))?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
-        let h2 = self.ln2.forward(&x)?;
+        let h2 = timed(&NORM_NS, || self.ln2.forward(&x))?;
         let h2 = h2.apply(&self.mlp)?;
         x + h2
     }
