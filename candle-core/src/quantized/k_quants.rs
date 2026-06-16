@@ -1412,7 +1412,9 @@ impl GgmlType for BlockQ4K {
         dst: &mut [f32],
     ) {
         let nb = xs.len();
-        let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        // ys holds dst.len() rows of `nb` blocks at `row_stride`; every (r, slice)
+        // here is in-bounds by construction, so skip the per-row bounds check.
+        let row = |r: usize| unsafe { ys.get_unchecked(r * row_stride..r * row_stride + nb) };
         let maxr = *Q4K_XR_R;
         let len = dst.len();
         let mut r = 0;
@@ -2709,13 +2711,9 @@ pub fn matmul<T: GgmlType>(
                         let mut r = row0;
                         while r < row1 {
                             let nr = (row1 - r).min(8);
-                            T::vec_dot_multi(
-                                k,
-                                rhs_col,
-                                &lhs_b[r * k_in_blocks..],
-                                k_in_blocks,
-                                &mut out[..nr],
-                            );
+                            // r*k_in_blocks is in-bounds (r < m); skip the check.
+                            let lhs_rows = unsafe { lhs_b.get_unchecked(r * k_in_blocks..) };
+                            T::vec_dot_multi(k, rhs_col, lhs_rows, k_in_blocks, &mut out[..nr]);
                             for (i, v) in out[..nr].iter().enumerate() {
                                 unsafe { *p.0.add((r + i) * n + col_idx) = *v };
                             }

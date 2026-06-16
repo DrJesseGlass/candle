@@ -1,0 +1,13 @@
+=== Attack #1: bounds-check audit (get_unchecked in _xr + vec_dot_multi + matmul hot loop) ===
+Full model 1-thread: baseline 526.1B instr / 22.16 t/s  ->  optimized 531.0B instr / 21.66 t/s
+Isolated matmul 1-thread: baseline 29.6 GFLOP/s -> optimized 28.2 GFLOP/s
+=> NO CHANGE (within noise). Bounds checks were ALREADY elided by LLVM. Rust safety is NOT the overhead.
+All 7 bit-exact tests still pass.
+
+=== Instruction efficiency ===
+candle matmul ~0.42 instr/MAC (2.38 IPC, 2.46GHz, 28 GFLOP/s) = ~6.7x the ideal (1 sdot=16 MAC=0.0625 instr/MAC).
+llama ~2x more efficient => ~0.21 instr/MAC. Same Q4_K unpack ops, llama's C compiles to ~half the instructions.
+CONCLUSION: the 1.8x instruction overhead is in NEON CODEGEN of the hot kernel (Rust/LLVM vs ggml C/GCC),
+ NOT bounds checks, NOT blocking, NOT the inner sdot. Lever to match on N1 = hand-written asm inner GEMM
+ loop (big, specialized, uncertain). Alternative higher-leverage: Graviton3 + i8mm/SMMLA — SMMLA does
+ many MACs/instruction, sidestepping the instr-count problem; uses the already-ported BlockQ4Kx8L laneq layout.

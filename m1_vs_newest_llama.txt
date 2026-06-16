@@ -1,0 +1,10 @@
+=== Apple M1 (4 P-cores), Qwen3-0.6B Q4_K_M, CPU-to-CPU, newest llama.cpp (HEAD c1304d7) ===
+newest llama.cpp (-ngl 0, Accelerate BLAS, 4t): pp512=531 t/s  tg128=119 t/s
+candle (--features accelerate / AMX sgemm):     pp512=427 t/s  tg128=51 t/s
+=> newest llama BEATS candle on M1: prefill 1.24x, DECODE 2.34x.
+The old "candle beat llama on M1" was vs an OLDER llama.cpp; llama.cpp has since gotten much faster.
+Pattern is consistent with N1: llama ~1.2-2.3x faster from kernel/framework efficiency.
+candle stays close on M1 PREFILL only via Accelerate AMX (vendor BLAS); decode (no BLAS) shows full 2.3x gap.
+On Lambda/N1: NO vendor BLAS (no Accelerate, no AMX, no i8mm) => candle ~2x behind on BOTH phases,
+ no shortcut. Closing it = match llama's kernel/framework instr-efficiency (hand-asm/codegen) + decode path.
++25% repack is the bankable partial Lambda win.
