@@ -514,6 +514,128 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
     dst.copy_from_slice(&sumf[..nrows]);
 }
 
+/// 2-D register-blocked Q4_K × Q8_K microkernel: `NR` weight columns × `MR`
+/// activation rows in one pass. Each weight superblock's nibble unpack is shared
+/// across the `MR` rows (as in `_xr`), and each activation's Q8 load is shared
+/// across the `NR` weight columns — so *both* operands are reused from registers,
+/// cutting weight-decode by `MR×` and activation traffic by `NR×` (the structure
+/// llama.cpp's GEMM uses). Per-(col,row) arithmetic order is identical to
+/// `vec_dot_q4k_q8k`, so results are bit-for-bit identical. `dst` is `NR×MR`
+/// row-major: `dst[w * MR + a]` = column `w` · row `a`.
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
+    n: usize,
+    xs: &[&[BlockQ4K]; NR],
+    ys: &[&[BlockQ8K]; MR],
+    dst: &mut [f32],
+) {
+    debug_assert!(
+        n.is_multiple_of(QK_K),
+        "vec_dot_q4k_q8k_mn: {n} is not divisible by {QK_K}"
+    );
+    debug_assert!(NR >= 1 && MR >= 1 && dst.len() == NR * MR);
+    let nb = n / QK_K;
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    for d in dst.iter_mut() {
+        *d = 0.0;
+    }
+    unsafe {
+        let m4b = vdupq_n_u8(0xF);
+        for i in 0..nb {
+            // --- per weight column: unpack 6-bit scales/mins, base pointers ---
+            let mut scales_w = [[0u8; 16]; NR];
+            let mut mins_w = [vdupq_n_s16(0); NR];
+            let mut xd = [0f32; NR];
+            let mut xdmin = [0f32; NR];
+            let mut q4p = [core::ptr::null::<u8>(); NR];
+            for w in 0..NR {
+                let x = &xs[w][i];
+                let mut utmp = [0u32; 4];
+                LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
+                let mins8 = vld1_u32(
+                    [
+                        utmp[1] & KMASK1,
+                        ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4),
+                    ]
+                    .as_ptr(),
+                );
+                utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+                utmp[0] &= KMASK1;
+                mins_w[w] = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+                LittleEndian::write_u32_into(&utmp, &mut scales_w[w]);
+                xd[w] = x.d.to_f32();
+                xdmin[w] = x.dmin.to_f32();
+                q4p[w] = x.qs.as_ptr();
+            }
+
+            // --- per activation row: base pointer; the -dmin·Σ(mins·bsums) term ---
+            let mut q8p = [core::ptr::null::<i8>(); MR];
+            for a in 0..MR {
+                let y = &ys[a][i];
+                q8p[a] = y.qs.as_ptr();
+                let q8sums = vpaddq_s16(
+                    vld1q_s16(y.bsums.as_ptr()),
+                    vld1q_s16(y.bsums.as_ptr().add(8)),
+                );
+                let yd = y.d;
+                for w in 0..NR {
+                    let prod = vaddq_s32(
+                        vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins_w[w])),
+                        vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins_w[w])),
+                    );
+                    dst[w * MR + a] -= yd * xdmin[w] * vaddvq_s32(prod) as f32;
+                }
+            }
+
+            // --- main: NR×MR int32 accumulators, both operands reused in-register ---
+            let mut acc = [[vdupq_n_s32(0); MR]; NR];
+            for j in 0..QK_K / 64 {
+                // Unpack this 64-weight block's nibbles for every weight column once.
+                let mut lo0 = [vdupq_n_s8(0); NR];
+                let mut lo1 = [vdupq_n_s8(0); NR];
+                let mut hi0 = [vdupq_n_s8(0); NR];
+                let mut hi1 = [vdupq_n_s8(0); NR];
+                for w in 0..NR {
+                    let q4bits = vld1q_u8_x2(q4p[w]);
+                    q4p[w] = q4p[w].add(32);
+                    lo0[w] = vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b));
+                    lo1[w] = vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b));
+                    hi0[w] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4));
+                    hi1[w] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4));
+                }
+                // Low-nibble sub-block (scale index 2j): load each row's Q8 once,
+                // reuse across all NR weight columns.
+                for a in 0..MR {
+                    let q8 = vld1q_s8_x2(q8p[a]);
+                    q8p[a] = q8p[a].add(32);
+                    for w in 0..NR {
+                        let p = vaddq_s32(vdotq_s32(lo0[w], q8.0), vdotq_s32(lo1[w], q8.1));
+                        acc[w][a] = vmlaq_n_s32(acc[w][a], p, scales_w[w][2 * j] as i32);
+                    }
+                }
+                // High-nibble sub-block (scale index 2j+1).
+                for a in 0..MR {
+                    let q8 = vld1q_s8_x2(q8p[a]);
+                    q8p[a] = q8p[a].add(32);
+                    for w in 0..NR {
+                        let p = vaddq_s32(vdotq_s32(hi0[w], q8.0), vdotq_s32(hi1[w], q8.1));
+                        acc[w][a] = vmlaq_n_s32(acc[w][a], p, scales_w[w][2 * j + 1] as i32);
+                    }
+                }
+            }
+            for w in 0..NR {
+                for a in 0..MR {
+                    dst[w * MR + a] += ys[a][i].d * xd[w] * vaddvq_s32(acc[w][a]) as f32;
+                }
+            }
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
@@ -732,4 +854,61 @@ unsafe fn multiply_accum_with_scale(
     let p1 = vdotq_s32(q2bytes.0, q8bytes.0);
     let p2 = vdotq_s32(q2bytes.1, q8bytes.1);
     vaddvq_s32(p1) * aux[is + index] as i32 + vaddvq_s32(p2) * aux[is + 1 + index] as i32
+}
+
+#[cfg(test)]
+mod fused_gemm_tests {
+    use super::*;
+    use crate::quantized::k_quants::GgmlType;
+
+    // Simple deterministic LCG -> f32 in [-1, 1); avoids a rand dependency.
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = (*state >> 33) as f32 / (1u64 << 31) as f32;
+        2.0 * u - 1.0
+    }
+
+    #[test]
+    fn q4k_mn_matches_scalar_bit_exact() {
+        const NR: usize = 4;
+        const MR: usize = 4;
+        let nb = 3usize;
+        let k = nb * QK_K;
+        let mut st = 0x1234_5678_9abc_def0u64;
+
+        let mut wq: Vec<Vec<BlockQ4K>> = Vec::new();
+        for _ in 0..NR {
+            let row: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let mut q = vec![BlockQ4K::zeros(); nb];
+            BlockQ4K::from_float(&row, &mut q);
+            wq.push(q);
+        }
+        let mut aq: Vec<Vec<BlockQ8K>> = Vec::new();
+        for _ in 0..MR {
+            let row: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let mut q = vec![BlockQ8K::zeros(); nb];
+            BlockQ8K::from_float(&row, &mut q);
+            aq.push(q);
+        }
+
+        let xs: [&[BlockQ4K]; NR] = [&wq[0], &wq[1], &wq[2], &wq[3]];
+        let ys: [&[BlockQ8K]; MR] = [&aq[0], &aq[1], &aq[2], &aq[3]];
+        let mut got = vec![0f32; NR * MR];
+        vec_dot_q4k_q8k_mn::<NR, MR>(k, &xs, &ys, &mut got);
+
+        for w in 0..NR {
+            for a in 0..MR {
+                let want = vec_dot_q4k_q8k(k, &wq[w], &aq[a]);
+                assert_eq!(
+                    got[w * MR + a].to_bits(),
+                    want.to_bits(),
+                    "mismatch at col {w}, row {a}: got {} want {}",
+                    got[w * MR + a],
+                    want
+                );
+            }
+        }
+    }
 }
