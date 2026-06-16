@@ -2443,6 +2443,12 @@ static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|
         .unwrap_or(false)
 });
 
+// Serial GEMV fast-path for single-thread decode (default on; set
+// CANDLE_DECODE_SERIAL=0 to force the rayon path, for A/B benchmarking).
+static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_DECODE_SERIAL").map(|s| s != "0").unwrap_or(true)
+});
+
 // Tile dims (weight columns NR × activation rows MR) for the int8-tile prefill.
 // `vec_dot_tile` dispatches a fused micro-kernel for supported shapes and falls
 // back to scalar otherwise — so NR=MR=1 routes the SAME matmul_tile structure
@@ -2679,6 +2685,24 @@ pub fn matmul<T: GgmlType>(
     } else {
         &*QMATMUL_PREFILL_POOL
     };
+    // Decode (m=1) on a single-thread pool — the common Lambda 1-vCPU tier — runs
+    // the GEMV serially. Going through `pool.install` + `into_par_iter` there is
+    // pure rayon split/join overhead per matmul call (and decode issues ~200
+    // matmuls/token), with no parallelism to gain. (A/B-gated for benchmarking;
+    // `CANDLE_DECODE_SERIAL=0` forces the old parallel path.)
+    if m == 1 && pool.current_num_threads() <= 1 && *DECODE_SERIAL {
+        let lhs_row = &lhs_b[..k_in_blocks];
+        for (col_idx, d) in dst.iter_mut().enumerate() {
+            let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+            *d = T::vec_dot(k, rhs_col, lhs_row);
+        }
+        if let Some(t) = t_dot {
+            use std::sync::atomic::Ordering::Relaxed;
+            MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            MATMUL_CALLS.fetch_add(1, Relaxed);
+        }
+        return Ok(());
+    }
     pool.install(|| {
         if m == 1 {
             let lhs_row = &lhs_b[..k_in_blocks];

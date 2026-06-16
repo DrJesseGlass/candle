@@ -101,6 +101,13 @@ fn main() -> Result<()> {
     let mut pp_norm_ns: u64 = 0;
     let mut pp_rope_ns: u64 = 0;
     let mut pp_copy_ns: u64 = 0;
+    let mut tg_wall_ns: u128 = 0;
+    let mut tg_dot_ns: u64 = 0;
+    let mut tg_quant_ns: u64 = 0;
+    let mut tg_flash_ns: u64 = 0;
+    let mut tg_norm_ns: u64 = 0;
+    let mut tg_rope_ns: u64 = 0;
+    let mut tg_copy_ns: u64 = 0;
 
     let total = args.warmup + args.reps;
     for rep in 0..total {
@@ -130,13 +137,28 @@ fn main() -> Result<()> {
         let mut next = argmax(&logits.to_vec1::<f32>()?);
 
         // Decode: tg greedy single-token forwards.
+        if profile {
+            matmul_profile_reset();
+            candle_transformers::models::quantized_qwen3::model_profile_reset();
+        }
         let t = Instant::now();
         for i in 0..args.tg {
             let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, args.pp + i)?.squeeze(0)?;
             next = argmax(&logits.to_vec1::<f32>()?);
         }
-        let tg_dt = t.elapsed().as_secs_f64();
+        let tg_elapsed = t.elapsed();
+        let tg_dt = tg_elapsed.as_secs_f64();
+        if profile && rep >= args.warmup {
+            use candle_transformers::models::quantized_qwen3 as m;
+            tg_wall_ns += tg_elapsed.as_nanos();
+            tg_dot_ns += MATMUL_DOT_NS.load(Relaxed);
+            tg_quant_ns += MATMUL_QUANT_NS.load(Relaxed);
+            tg_flash_ns += m::FLASH_NS.load(Relaxed);
+            tg_norm_ns += m::NORM_NS.load(Relaxed);
+            tg_rope_ns += m::ROPE_NS.load(Relaxed);
+            tg_copy_ns += m::COPY_NS.load(Relaxed);
+        }
 
         let pp_rate = args.pp as f64 / pp_dt;
         let tg_rate = args.tg as f64 / tg_dt;
@@ -191,6 +213,29 @@ matmul_dot={:.1}ms ({:.1}%)  matmul_quant={:.1}ms ({:.1}%)\n  \
 REST={:.1}ms ({:.1}%) = flash_attn {:.1}ms ({:.1}%) + norm {:.1}ms ({:.1}%) + \
 rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
             args.reps, wall / 1e6, pp_calls,
+            dot / 1e6, pct(dot), quant / 1e6, pct(quant),
+            rest / 1e6, pct(rest),
+            flash / 1e6, pct(flash), norm / 1e6, pct(norm),
+            rope / 1e6, pct(rope), copy / 1e6, pct(copy), glue / 1e6, pct(glue),
+        );
+    }
+    if profile && tg_wall_ns > 0 {
+        let wall = tg_wall_ns as f64;
+        let dot = tg_dot_ns as f64;
+        let quant = tg_quant_ns as f64;
+        let flash = tg_flash_ns as f64;
+        let norm = tg_norm_ns as f64;
+        let rope = tg_rope_ns as f64;
+        let copy = tg_copy_ns as f64;
+        let rest = (wall - dot - quant).max(0.0);
+        let glue = (rest - flash - norm - rope - copy).max(0.0);
+        let pct = |x: f64| 100.0 * x / wall;
+        eprintln!(
+            "\n[decode profile over {} reps × {} tok]  wall={:.1}ms\n  \
+matmul_dot={:.1}ms ({:.1}%)  matmul_quant={:.1}ms ({:.1}%)\n  \
+REST={:.1}ms ({:.1}%) = flash {:.1}ms ({:.1}%) + norm {:.1}ms ({:.1}%) + \
+rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
+            args.reps, args.tg, wall / 1e6,
             dot / 1e6, pct(dot), quant / 1e6, pct(quant),
             rest / 1e6, pct(rest),
             flash / 1e6, pct(flash), norm / 1e6, pct(norm),

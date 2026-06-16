@@ -379,7 +379,7 @@ impl AttentionWeights {
                 // Run interleaved decode kernel
                 let kv_len = rc.len();
                 let q_len = self.num_heads * self.head_dim;
-                let ctx = {
+                let ctx = timed(&FLASH_NS, || {
                     let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
                     causal_decode_f16kv_interleaved(
                         &q_data[..q_len],
@@ -390,8 +390,8 @@ impl AttentionWeights {
                         self.head_dim,
                         kv_len,
                         scale,
-                    )?
-                };
+                    )
+                })?;
 
                 let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
