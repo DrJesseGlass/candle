@@ -33,6 +33,7 @@ mod cuda {
 
 #[cfg(target_feature = "neon")]
 pub mod neon;
+pub mod repack;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
 pub mod utils;

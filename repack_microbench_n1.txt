@@ -1,0 +1,5 @@
+candle-native Q4_Kx8 repack microbench on Graviton2/N1 (k=2048 n=2048, vs candle baseline matmul)
+cores=2: decode MR1 1.23x | prefill MR2 1.10x | prefill MR4 0.87x
+cores=4: decode MR1 1.70x | prefill MR2 1.07x | prefill MR4 0.86x
+cores=8: decode MR1 2.96x | prefill MR2 1.01x | prefill MR4 0.82x
+All bit-exact (maxdiff=0). MR=4 spills (8ch x 4row = 32 acc). Decode baseline pool was untuned (decode win likely overstated at 8c).

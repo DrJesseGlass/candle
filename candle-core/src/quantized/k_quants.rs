@@ -1399,7 +1399,10 @@ impl GgmlType for BlockQ4K {
     }
 
     /// Groups rows through the multi-row NEON kernel so each weight superblock is
-    /// unpacked once per group of four instead of once per row.
+    /// unpacked once per group instead of once per row. Group width is capped by
+    /// `CANDLE_Q4K_XR_R` (2..=8); a descending 8→4→2→1 ladder settles the remainder.
+    /// One weight column => 4 nibble vectors shared across the group, so R=8 fits
+    /// N1's register file (unlike the 2-D tile). Bit-identical to `vec_dot`.
     #[cfg(target_feature = "neon")]
     fn vec_dot_multi(
         n: usize,
@@ -1410,34 +1413,71 @@ impl GgmlType for BlockQ4K {
     ) {
         let nb = xs.len();
         let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        let maxr = *Q4K_XR_R;
+        let len = dst.len();
         let mut r = 0;
-        // Pairs beat groups of four on Cortex-X925 (R=4 spills / serializes the
-        // horizontal reductions); revisit per-arch if more profiles disagree.
-        while r + 2 <= dst.len() {
-            super::neon::vec_dot_q4k_q8k_xr::<2>(
-                n,
-                xs,
-                &[row(r), row(r + 1)],
-                &mut dst[r..r + 2],
-            );
-            r += 2;
-        }
-        if r < dst.len() {
-            dst[r] = Self::vec_dot(n, xs, row(r));
+        while r < len {
+            let rem = len - r;
+            if maxr >= 8 && rem >= 8 {
+                super::neon::vec_dot_q4k_q8k_xr::<8>(
+                    n,
+                    xs,
+                    &[
+                        row(r), row(r + 1), row(r + 2), row(r + 3),
+                        row(r + 4), row(r + 5), row(r + 6), row(r + 7),
+                    ],
+                    &mut dst[r..r + 8],
+                );
+                r += 8;
+            } else if maxr >= 4 && rem >= 4 {
+                super::neon::vec_dot_q4k_q8k_xr::<4>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1), row(r + 2), row(r + 3)],
+                    &mut dst[r..r + 4],
+                );
+                r += 4;
+            } else if maxr >= 2 && rem >= 2 {
+                super::neon::vec_dot_q4k_q8k_xr::<2>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1)],
+                    &mut dst[r..r + 2],
+                );
+                r += 2;
+            } else {
+                dst[r] = Self::vec_dot(n, xs, row(r));
+                r += 1;
+            }
         }
     }
 
     #[cfg(target_feature = "neon")]
     fn vec_dot_tile(n: usize, cols: &[&[Self]], rows: &[&[Self::VecDotType]], dst: &mut [f32]) {
-        // Fast path: a full 4×4 tile through the 2-D register-blocked micro-kernel
-        // (reuses weight unpack across the 4 rows AND each Q8 load across the 4 cols).
-        if cols.len() == 4 && rows.len() == 4 {
-            let xs: &[&[BlockQ4K]; 4] = cols.try_into().unwrap();
-            let ys: &[&[BlockQ8K]; 4] = rows.try_into().unwrap();
-            super::neon::vec_dot_q4k_q8k_mn::<4, 4>(n, xs, ys, dst);
-            return;
+        // Dispatch the 2-D register-blocked micro-kernel for the (NR, MR) shapes we
+        // instantiate (tile sweep). `mn::<NR, MR>` reuses the weight unpack across MR
+        // rows AND each Q8 load across NR cols. Partial/edge tiles fall to scalar.
+        macro_rules! k {
+            ($nr:literal, $mr:literal) => {{
+                let xs: &[&[BlockQ4K]; $nr] = cols.try_into().unwrap();
+                let ys: &[&[BlockQ8K]; $mr] = rows.try_into().unwrap();
+                super::neon::vec_dot_q4k_q8k_mn::<$nr, $mr>(n, xs, ys, dst);
+                return;
+            }};
         }
-        // Edge tiles (partial column/row group at the matrix boundary): scalar.
+        #[cfg(target_feature = "neon")]
+        match (cols.len(), rows.len()) {
+            (4, 4) => k!(4, 4),
+            (4, 2) => k!(4, 2),
+            (2, 4) => k!(2, 4),
+            (2, 2) => k!(2, 2),
+            (8, 2) => k!(8, 2),
+            (2, 8) => k!(2, 8),
+            (4, 1) => k!(4, 1),
+            (1, 4) => k!(1, 4),
+            _ => {}
+        }
+        // Edge tiles (partial group at the matrix boundary) and 1×1: scalar.
         let nrows = rows.len();
         for (c, col) in cols.iter().enumerate() {
             for (r, rrow) in rows.iter().enumerate() {
@@ -2370,6 +2410,19 @@ static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         .unwrap_or(64)
 });
 
+// Max row-group width for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`)
+// inside `vec_dot_multi`. R=2 was the Cortex-X925 default; N1 has 32 regs and one
+// weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
+// and amortize the unpack further. `vec_dot_multi` uses a descending 8→4→2→1
+// ladder capped here. Clamped to 2..=8; default 4 (the validated N1 win).
+static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_Q4K_XR_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (2..=8).contains(&v))
+        .unwrap_or(4)
+});
+
 // Opt-in: route prefill (m>1) through the 2-D register-blocked int8 micro-kernel
 // (`matmul_tile` + `T::vec_dot_tile`) instead of the 1-D row-tiled path. Default
 // off; set `CANDLE_MATMUL_INT8_TILE=1` to A/B.
@@ -2377,6 +2430,26 @@ static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
     std::env::var("CANDLE_MATMUL_INT8_TILE")
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+});
+
+// Tile dims (weight columns NR × activation rows MR) for the int8-tile prefill.
+// `vec_dot_tile` dispatches a fused micro-kernel for supported shapes and falls
+// back to scalar otherwise — so NR=MR=1 routes the SAME matmul_tile structure
+// through plain `vec_dot` (a clean isolation: if 1×1 also regresses, the loss is
+// structural, not in the kernel). Clamped to 1..=8.
+static INT8_NR: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_INT8_NR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (1..=8).contains(&v))
+        .unwrap_or(4)
+});
+static INT8_MR: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_INT8_MR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (1..=8).contains(&v))
+        .unwrap_or(4)
 });
 
 fn env_threads(name: &str, default: usize) -> usize {
@@ -2442,27 +2515,30 @@ fn matmul_tile<T: GgmlType>(
     dst: &mut [f32],
     k_in_blocks: usize,
 ) {
-    const NR: usize = 4;
-    const MR: usize = 4;
+    // Tile dims are runtime-selectable (env) for the shape sweep; buffers sized to
+    // the 8×8 max. NR weight columns × MR activation rows per micro-kernel call.
+    const MAXB: usize = 8;
+    let nr_blk = (*INT8_NR).min(MAXB);
+    let mr_blk = (*INT8_MR).min(MAXB);
     let m_tile = *MATMUL_M_TILE;
     struct DstPtr(*mut f32);
     unsafe impl Sync for DstPtr {}
     let dst_ptr = DstPtr(dst.as_mut_ptr());
-    let col_groups = n.div_ceil(NR);
+    let col_groups = n.div_ceil(nr_blk);
     QMATMUL_PREFILL_POOL.install(|| {
         // Tile the activation rows: a m_tile-row Q8 block stays L2-resident while
         // every weight column streams past it once per tile, so the activation
         // re-reads across column groups hit L2 rather than DRAM. Parallelize the
-        // weight columns within each tile; the 4×4 micro-kernel adds register reuse.
+        // weight columns within each tile; the micro-kernel adds register reuse.
         for m0 in (0..m).step_by(m_tile) {
             let m1 = (m0 + m_tile).min(m);
             (0..col_groups)
                 .into_par_iter()
                 .with_min_len(*MATMUL_MIN_LEN)
                 .for_each(|cg| {
-                    let c0 = cg * NR;
-                    let nc = (c0 + NR).min(n) - c0;
-                    let mut colbuf: [&[T]; NR] = [&[]; NR];
+                    let c0 = cg * nr_blk;
+                    let nc = (c0 + nr_blk).min(n) - c0;
+                    let mut colbuf: [&[T]; MAXB] = [&[]; MAXB];
                     for cc in 0..nc {
                         colbuf[cc] = &rhs_t[(c0 + cc) * k_in_blocks..(c0 + cc + 1) * k_in_blocks];
                     }
@@ -2470,14 +2546,14 @@ fn matmul_tile<T: GgmlType>(
                     let p = &dst_ptr;
                     let mut r = m0;
                     while r < m1 {
-                        let nr = (m1 - r).min(MR);
-                        let mut rowbuf: [&[T::VecDotType]; MR] = [&[]; MR];
+                        let nr = (m1 - r).min(mr_blk);
+                        let mut rowbuf: [&[T::VecDotType]; MAXB] = [&[]; MAXB];
                         for rr in 0..nr {
                             rowbuf[rr] =
                                 &lhs_b[(r + rr) * k_in_blocks..(r + rr + 1) * k_in_blocks];
                         }
                         let rows = &rowbuf[..nr];
-                        let mut tile = [0f32; NR * MR];
+                        let mut tile = [0f32; MAXB * MAXB];
                         T::vec_dot_tile(k, cols, rows, &mut tile[..nc * nr]);
                         for cc in 0..nc {
                             for rr in 0..nr {
@@ -2948,6 +3024,51 @@ mod tile_matmul_tests {
                     want.to_bits(),
                     "mismatch row {rr} col {cc}: got {} want {}",
                     got[rr * n + cc],
+                    want
+                );
+            }
+        }
+    }
+
+    // vec_dot_multi (the per-column-parallel row-grouping path) must be bit-exact
+    // vs per-row vec_dot for every group count up to 8 (exercises the 8→4→2→1
+    // ladder regardless of the env cap, since the ladder always runs).
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn vec_dot_multi_q4k_bit_exact_all_counts() {
+        let nb = 2usize;
+        let k = nb * QK_K;
+        let kib = k / QK_K;
+        let mut s = 0x0bad_c0de_1337_4242u64;
+        let mut nxt = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            2.0 * ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+
+        let wf: Vec<f32> = (0..k).map(|_| nxt()).collect();
+        let mut col = vec![BlockQ4K::zeros(); kib];
+        BlockQ4K::from_float(&wf, &mut col);
+
+        for rows in 1..=8usize {
+            let mut af = vec![0f32; rows * k];
+            for v in af.iter_mut() {
+                *v = nxt();
+            }
+            let mut ab = vec![BlockQ8K::zeros(); rows * kib];
+            for rr in 0..rows {
+                BlockQ8K::from_float(&af[rr * k..(rr + 1) * k], &mut ab[rr * kib..(rr + 1) * kib]);
+            }
+            let mut got = vec![0f32; rows];
+            BlockQ4K::vec_dot_multi(k, &col, &ab, kib, &mut got);
+            for rr in 0..rows {
+                let want = BlockQ4K::vec_dot(k, &col, &ab[rr * kib..(rr + 1) * kib]);
+                assert_eq!(
+                    got[rr].to_bits(),
+                    want.to_bits(),
+                    "rows={rows} row {rr}: got {} want {}",
+                    got[rr],
                     want
                 );
             }
