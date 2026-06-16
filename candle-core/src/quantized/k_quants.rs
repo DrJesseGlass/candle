@@ -1385,7 +1385,11 @@ impl GgmlType for BlockQ4K {
     }
 
     /// Groups rows through the multi-row NEON kernel so each weight superblock is
-    /// unpacked once per group of four instead of once per row.
+    /// unpacked once per group instead of once per row. The group width R is an
+    /// arch tuning knob (`CANDLE_Q4K_XR_R`, 2..=4): R=2 was tuned on Cortex-X925
+    /// (R=4 spilled / serialized its horizontal reductions there), but Neoverse N1
+    /// (Graviton2) has 32 NEON regs and different issue behavior, so wider groups
+    /// can win — benchmark per-arch. Default 2 preserves prior behavior.
     #[cfg(target_feature = "neon")]
     fn vec_dot_multi(
         n: usize,
@@ -1396,10 +1400,36 @@ impl GgmlType for BlockQ4K {
     ) {
         let nb = xs.len();
         let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        let len = dst.len();
         let mut r = 0;
-        // Pairs beat groups of four on Cortex-X925 (R=4 spills / serializes the
-        // horizontal reductions); revisit per-arch if more profiles disagree.
-        while r + 2 <= dst.len() {
+        // Wide groups first (selectable R), then settle the remainder in pairs and
+        // a final single. Each arm instantiates a distinct const-generic kernel.
+        match *Q4K_XR_R {
+            4 => {
+                while r + 4 <= len {
+                    super::neon::vec_dot_q4k_q8k_xr::<4>(
+                        n,
+                        xs,
+                        &[row(r), row(r + 1), row(r + 2), row(r + 3)],
+                        &mut dst[r..r + 4],
+                    );
+                    r += 4;
+                }
+            }
+            3 => {
+                while r + 3 <= len {
+                    super::neon::vec_dot_q4k_q8k_xr::<3>(
+                        n,
+                        xs,
+                        &[row(r), row(r + 1), row(r + 2)],
+                        &mut dst[r..r + 3],
+                    );
+                    r += 3;
+                }
+            }
+            _ => {}
+        }
+        while r + 2 <= len {
             super::neon::vec_dot_q4k_q8k_xr::<2>(
                 n,
                 xs,
@@ -1408,7 +1438,7 @@ impl GgmlType for BlockQ4K {
             );
             r += 2;
         }
-        if r < dst.len() {
+        if r < len {
             dst[r] = Self::vec_dot(n, xs, row(r));
         }
     }
@@ -2335,6 +2365,17 @@ static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         .and_then(|s| s.parse().ok())
         .filter(|&v| v > 0)
         .unwrap_or(64)
+});
+
+// Row-grouping width R for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`),
+// used by `BlockQ4K::vec_dot_multi`. R=2 was tuned on Cortex-X925; Neoverse N1
+// (Graviton2) may prefer wider groups. Benchmark knob, clamped to 2..=4.
+static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_Q4K_XR_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (2..=4).contains(&v))
+        .unwrap_or(2)
 });
 
 fn env_threads(name: &str, default: usize) -> usize {
