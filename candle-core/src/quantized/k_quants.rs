@@ -2432,6 +2432,15 @@ static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
         .unwrap_or(false)
 });
 
+// Opt-in: route Q4_K matmuls through the interleaved packed SDOT kernels
+// (`repack::matmul_q4k_packed`). Weights are repacked once and cached. Default
+// off; set `CANDLE_MATMUL_PACKED_Q4K=1`.
+static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_PACKED_Q4K")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
 // Tile dims (weight columns NR × activation rows MR) for the int8-tile prefill.
 // `vec_dot_tile` dispatches a fused micro-kernel for supported shapes and falls
 // back to scalar otherwise — so NR=MR=1 routes the SAME matmul_tile structure
@@ -2593,6 +2602,26 @@ pub fn matmul<T: GgmlType>(
     #[cfg(feature = "accelerate")]
     if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 {
         return matmul_blas((m, k, n), lhs, rhs_t, dst);
+    }
+
+    // Interleaved packed Q4_K path (repack-on-first-use + SDOT GEMM/GEMV). T is
+    // BlockQ4K exactly when DTYPE matches, so the cast is sound; gated on shape
+    // divisibility and the env flag.
+    #[cfg(target_feature = "neon")]
+    if *MATMUL_PACKED_Q4K
+        && T::DTYPE == GgmlDType::Q4K
+        && super::repack::packed_q4k_applicable(k, n)
+    {
+        let rhs_q4k = unsafe {
+            std::slice::from_raw_parts(rhs_t.as_ptr() as *const BlockQ4K, rhs_t.len())
+        };
+        let pool = if m == 1 {
+            &*QMATMUL_DECODE_POOL
+        } else {
+            &*QMATMUL_PREFILL_POOL
+        };
+        super::repack::matmul_q4k_packed((m, k, n), lhs, rhs_q4k, dst, pool);
+        return Ok(());
     }
 
     let prof = *MATMUL_PROFILE;

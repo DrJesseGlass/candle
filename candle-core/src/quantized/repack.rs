@@ -11,9 +11,12 @@
 //! helpers shared by the repack, its tests, and the kernels to come. The GEMM/GEMV
 //! kernels that consume `BlockQ4Kx8` land in later steps.
 
-use super::k_quants::{BlockQ4K, QK_K};
+use super::k_quants::{BlockQ4K, BlockQ8K, GgmlType, QK_K};
 use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Output channels interleaved per packed block.
 pub(crate) const Q4KX8_ROWS: usize = 8;
@@ -107,6 +110,107 @@ pub(crate) fn repack_q4k_x8(rows: &[&[BlockQ4K]; Q4KX8_ROWS]) -> Vec<BlockQ4Kx8>
         out.push(blk);
     }
     out
+}
+
+/// Process-global cache of repacked Q4_K weights, keyed by the source block
+/// slice's base pointer. Model weights live for the whole run, so this repacks
+/// each weight matrix once on first use. Benchmark-grade: keyed on pointer, so it
+/// assumes weights aren't freed and reallocated at the same address (true for a
+/// loaded model). Cleared via `clear_packed_cache` if needed.
+static PACKED_CACHE: LazyLock<Mutex<HashMap<usize, Arc<Vec<BlockQ4Kx8>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Drop all cached repacked weights (e.g. between unrelated models in a process).
+pub fn clear_packed_cache() {
+    PACKED_CACHE.lock().unwrap().clear();
+}
+
+fn packed_cache_get(rhs: &[BlockQ4K], n: usize, nb: usize) -> Arc<Vec<BlockQ4Kx8>> {
+    let key = rhs.as_ptr() as usize;
+    {
+        if let Some(p) = PACKED_CACHE.lock().unwrap().get(&key) {
+            return p.clone();
+        }
+    }
+    let mut map = PACKED_CACHE.lock().unwrap();
+    if let Some(p) = map.get(&key) {
+        return p.clone();
+    }
+    let mut packed = Vec::with_capacity((n / 8) * nb);
+    for g in 0..n / 8 {
+        let grp: [&[BlockQ4K]; Q4KX8_ROWS] =
+            std::array::from_fn(|r| &rhs[(g * 8 + r) * nb..(g * 8 + r + 1) * nb]);
+        packed.extend(repack_q4k_x8(&grp));
+    }
+    let arc = Arc::new(packed);
+    map.insert(key, arc.clone());
+    arc
+}
+
+/// Whether a `(k, n)` Q4_K matmul can use the packed path: k a multiple of the
+/// super-block (256) and n a multiple of the 8-channel pack width.
+pub(crate) fn packed_q4k_applicable(k: usize, n: usize) -> bool {
+    k % QK_K == 0 && n % Q4KX8_ROWS == 0
+}
+
+/// `dst(m,n) = lhs(m,k) × rhs_q4k(n,k)^T` via the interleaved packed SDOT kernels.
+/// Activations are quantized to Q8K here (as the baseline does). Weights are
+/// repacked once and cached. Parallelized over 8-channel groups on `pool`. Decode
+/// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot —
+/// MR=4 spills) with a 1-row remainder. Bit-identical to baseline `matmul`.
+#[cfg(target_feature = "neon")]
+pub(crate) fn matmul_q4k_packed(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_q4k: &[BlockQ4K],
+    dst: &mut [f32],
+    pool: &rayon::ThreadPool,
+) {
+    use super::neon::gemm_q4kx8_q8k;
+    let nb = k / QK_K;
+    let packed = packed_cache_get(rhs_q4k, n, nb);
+
+    let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
+    pool.install(|| {
+        lhs_q
+            .par_chunks_mut(nb)
+            .enumerate()
+            .with_min_len(4)
+            .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
+    });
+
+    struct DstPtr(*mut f32);
+    unsafe impl Sync for DstPtr {}
+    let dptr = DstPtr(dst.as_mut_ptr());
+    let groups = n / Q4KX8_ROWS;
+    pool.install(|| {
+        (0..groups).into_par_iter().for_each(|g| {
+            let w = &packed[g * nb..(g + 1) * nb];
+            let p = &dptr;
+            let mut r = 0;
+            while r + 2 <= m {
+                let rows: [&[BlockQ8K]; 2] =
+                    std::array::from_fn(|a| &lhs_q[(r + a) * nb..(r + a + 1) * nb]);
+                let mut tile = [0f32; Q4KX8_ROWS * 2];
+                gemm_q4kx8_q8k::<2>(w, &rows, &mut tile);
+                for c in 0..Q4KX8_ROWS {
+                    for a in 0..2 {
+                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
+                    }
+                }
+                r += 2;
+            }
+            while r < m {
+                let rows: [&[BlockQ8K]; 1] = [&lhs_q[r * nb..(r + 1) * nb]];
+                let mut tile = [0f32; Q4KX8_ROWS];
+                gemm_q4kx8_q8k::<1>(w, &rows, &mut tile);
+                for c in 0..Q4KX8_ROWS {
+                    unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
+                }
+                r += 1;
+            }
+        });
+    });
 }
 
 #[cfg(test)]
@@ -245,6 +349,45 @@ mod tests {
         check!(1);
         check!(2);
         check!(4);
+    }
+
+    // The packed driver must match baseline matmul end-to-end (full dst, multiple
+    // 8-channel groups), for prefill and decode.
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn matmul_q4k_packed_matches_baseline() {
+        use crate::quantized::k_quants::matmul;
+
+        let k = 512usize; // 2 super-blocks
+        let n = 24usize; // 3 groups of 8
+        let nb = k / QK_K;
+        let mut st = 0x2222_4444_6666_8888u64;
+
+        let mut rhs_t = vec![BlockQ4K::zeros(); n * nb];
+        for r in 0..n {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            BlockQ4K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
+        }
+        let rhs_q4k: &[BlockQ4K] = &rhs_t;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+
+        for &m in &[1usize, 5usize, 16usize] {
+            let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
+            let mut dst_base = vec![0f32; m * n];
+            let mut dst_pack = vec![0f32; m * n];
+            matmul::<BlockQ4K>((m, k, n), &lhs, &rhs_t, &mut dst_base).unwrap();
+            clear_packed_cache();
+            matmul_q4k_packed((m, k, n), &lhs, rhs_q4k, &mut dst_pack, &pool);
+            for i in 0..m * n {
+                assert_eq!(
+                    dst_base[i].to_bits(),
+                    dst_pack[i].to_bits(),
+                    "m={m} idx {i}: base {} packed {}",
+                    dst_base[i],
+                    dst_pack[i]
+                );
+            }
+        }
     }
 
     // Standalone microbench: baseline per-column matmul vs the packed 8-channel

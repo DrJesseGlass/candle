@@ -1,0 +1,13 @@
+full-model packed Q4K A/B (pp=512 tg=64 reps=4)
+  llama.cpp ref:  pp 2c=87.5 4c=174.0 8c=327.0   tg 2c=35.1 4c=62.8 8c=72.7
+config    cores pp_t/s     tg_t/s    
+baseline  2     42.44      16.76     
+packed    2     47.36      17.77     
+
+baseline  4     77.76      28.31     
+packed    4     89.88      29.00     
+
+baseline  8     126.86     40.27     
+packed    8     156.72     38.92     
+
+PACKED_AB_DONE
