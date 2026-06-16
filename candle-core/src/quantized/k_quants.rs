@@ -67,6 +67,20 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
             *d = Self::vec_dot(n, xs, &ys[r * row_stride..r * row_stride + xs.len()]);
         }
     }
+
+    /// Compute a `cols.len()` × `rows.len()` output tile: weight column `c` dotted
+    /// against activation row `r`, written to `dst[c * rows.len() + r]`. The default
+    /// loops `vec_dot`; SIMD backends override it with a 2-D register-blocked kernel
+    /// that reuses BOTH operands (weight unpack across rows, activation load across
+    /// columns) — the GEMM micro-kernel. Must stay numerically identical to `vec_dot`.
+    fn vec_dot_tile(n: usize, cols: &[&[Self]], rows: &[&[Self::VecDotType]], dst: &mut [f32]) {
+        let nrows = rows.len();
+        for (c, col) in cols.iter().enumerate() {
+            for (r, row) in rows.iter().enumerate() {
+                dst[c * nrows + r] = Self::vec_dot(n, col, row);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1413,6 +1427,25 @@ impl GgmlType for BlockQ4K {
         }
     }
 
+    #[cfg(target_feature = "neon")]
+    fn vec_dot_tile(n: usize, cols: &[&[Self]], rows: &[&[Self::VecDotType]], dst: &mut [f32]) {
+        // Fast path: a full 4×4 tile through the 2-D register-blocked micro-kernel
+        // (reuses weight unpack across the 4 rows AND each Q8 load across the 4 cols).
+        if cols.len() == 4 && rows.len() == 4 {
+            let xs: &[&[BlockQ4K]; 4] = cols.try_into().unwrap();
+            let ys: &[&[BlockQ8K]; 4] = rows.try_into().unwrap();
+            super::neon::vec_dot_q4k_q8k_mn::<4, 4>(n, xs, ys, dst);
+            return;
+        }
+        // Edge tiles (partial column/row group at the matrix boundary): scalar.
+        let nrows = rows.len();
+        for (c, col) in cols.iter().enumerate() {
+            for (r, rrow) in rows.iter().enumerate() {
+                dst[c * nrows + r] = Self::vec_dot(n, col, rrow);
+            }
+        }
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK_K),
@@ -2337,6 +2370,15 @@ static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         .unwrap_or(64)
 });
 
+// Opt-in: route prefill (m>1) through the 2-D register-blocked int8 micro-kernel
+// (`matmul_tile` + `T::vec_dot_tile`) instead of the 1-D row-tiled path. Default
+// off; set `CANDLE_MATMUL_INT8_TILE=1` to A/B.
+static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_INT8_TILE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
 fn env_threads(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -2386,6 +2428,70 @@ pub fn matmul_profile_reset() {
     MATMUL_QUANT_NS.store(0, Relaxed);
     MATMUL_DOT_NS.store(0, Relaxed);
     MATMUL_CALLS.store(0, Relaxed);
+}
+
+/// 2-D register-blocked prefill GEMM: `dst(m,n) = lhs(m,k) x rhs_t(n,k)^T`, with
+/// pre-quantized activations `lhs_b` (m rows). Parallelizes over groups of NR=4
+/// weight columns; each task walks the m rows in MR=4 groups, emitting a 4×4 tile
+/// via `T::vec_dot_tile` (fused micro-kernel for Q4_K, scalar elsewhere/at edges).
+/// Every (row,col) cell is written by exactly one task, so the raw writes are disjoint.
+fn matmul_tile<T: GgmlType>(
+    (m, k, n): (usize, usize, usize),
+    lhs_b: &[T::VecDotType],
+    rhs_t: &[T],
+    dst: &mut [f32],
+    k_in_blocks: usize,
+) {
+    const NR: usize = 4;
+    const MR: usize = 4;
+    let m_tile = *MATMUL_M_TILE;
+    struct DstPtr(*mut f32);
+    unsafe impl Sync for DstPtr {}
+    let dst_ptr = DstPtr(dst.as_mut_ptr());
+    let col_groups = n.div_ceil(NR);
+    QMATMUL_PREFILL_POOL.install(|| {
+        // Tile the activation rows: a m_tile-row Q8 block stays L2-resident while
+        // every weight column streams past it once per tile, so the activation
+        // re-reads across column groups hit L2 rather than DRAM. Parallelize the
+        // weight columns within each tile; the 4×4 micro-kernel adds register reuse.
+        for m0 in (0..m).step_by(m_tile) {
+            let m1 = (m0 + m_tile).min(m);
+            (0..col_groups)
+                .into_par_iter()
+                .with_min_len(*MATMUL_MIN_LEN)
+                .for_each(|cg| {
+                    let c0 = cg * NR;
+                    let nc = (c0 + NR).min(n) - c0;
+                    let mut colbuf: [&[T]; NR] = [&[]; NR];
+                    for cc in 0..nc {
+                        colbuf[cc] = &rhs_t[(c0 + cc) * k_in_blocks..(c0 + cc + 1) * k_in_blocks];
+                    }
+                    let cols = &colbuf[..nc];
+                    let p = &dst_ptr;
+                    let mut r = m0;
+                    while r < m1 {
+                        let nr = (m1 - r).min(MR);
+                        let mut rowbuf: [&[T::VecDotType]; MR] = [&[]; MR];
+                        for rr in 0..nr {
+                            rowbuf[rr] =
+                                &lhs_b[(r + rr) * k_in_blocks..(r + rr + 1) * k_in_blocks];
+                        }
+                        let rows = &rowbuf[..nr];
+                        let mut tile = [0f32; NR * MR];
+                        T::vec_dot_tile(k, cols, rows, &mut tile[..nc * nr]);
+                        for cc in 0..nc {
+                            for rr in 0..nr {
+                                // tile is col-major within the block: tile[cc*nr + rr].
+                                unsafe {
+                                    *p.0.add((r + rr) * n + (c0 + cc)) = tile[cc * nr + rr]
+                                };
+                        }
+                    }
+                    r += nr;
+                }
+            });
+        }
+    });
 }
 
 pub fn matmul<T: GgmlType>(
@@ -2449,6 +2555,17 @@ pub fn matmul<T: GgmlType>(
     } else {
         None
     };
+
+    // Opt-in 2-D tiled prefill (NR=4 × MR=4) via the fused int8 micro-kernel.
+    if *MATMUL_INT8_TILE && m > 1 {
+        matmul_tile::<T>((m, k, n), &lhs_b, rhs_t, dst, k_in_blocks);
+        if let Some(t) = t_dot {
+            use std::sync::atomic::Ordering::Relaxed;
+            MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            MATMUL_CALLS.fetch_add(1, Relaxed);
+        }
+        return Ok(());
+    }
 
     let pool = if m == 1 {
         &*QMATMUL_DECODE_POOL
@@ -2776,3 +2893,64 @@ verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
     BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
 );
+
+#[cfg(test)]
+mod tile_matmul_tests {
+    use super::*;
+
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        2.0 * ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    // matmul_tile must be bit-exact vs per-cell vec_dot, including partial edge
+    // tiles (m and n not multiples of 4).
+    #[test]
+    fn matmul_tile_q4k_bit_exact_with_edges() {
+        let (m, n) = (7usize, 9usize);
+        let nb = 2usize;
+        let k = nb * QK_K;
+        let kib = k / QK_K; // BLCK_SIZE == QK_K for Q4K
+        let mut s = 0xfeed_face_dead_beefu64;
+
+        let mut lhs_f = vec![0f32; m * k];
+        for v in lhs_f.iter_mut() {
+            *v = lcg(&mut s);
+        }
+        let mut lhs_b = vec![BlockQ8K::zeros(); m * kib];
+        for r in 0..m {
+            BlockQ8K::from_float(&lhs_f[r * k..(r + 1) * k], &mut lhs_b[r * kib..(r + 1) * kib]);
+        }
+
+        let mut rhs_f = vec![0f32; n * k];
+        for v in rhs_f.iter_mut() {
+            *v = lcg(&mut s);
+        }
+        let mut rhs_t = vec![BlockQ4K::zeros(); n * kib];
+        for c in 0..n {
+            BlockQ4K::from_float(&rhs_f[c * k..(c + 1) * k], &mut rhs_t[c * kib..(c + 1) * kib]);
+        }
+
+        let mut got = vec![0f32; m * n];
+        matmul_tile::<BlockQ4K>((m, k, n), &lhs_b, &rhs_t, &mut got, kib);
+
+        for rr in 0..m {
+            for cc in 0..n {
+                let want = BlockQ4K::vec_dot(
+                    k,
+                    &rhs_t[cc * kib..(cc + 1) * kib],
+                    &lhs_b[rr * kib..(rr + 1) * kib],
+                );
+                assert_eq!(
+                    got[rr * n + cc].to_bits(),
+                    want.to_bits(),
+                    "mismatch row {rr} col {cc}: got {} want {}",
+                    got[rr * n + cc],
+                    want
+                );
+            }
+        }
+    }
+}

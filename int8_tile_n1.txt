@@ -1,0 +1,9 @@
+candle baseline vs int8-tile 4x4 (pp=512 tg=64 reps=3) [llama pp: 2c=87.5 4c=174.0 8c=327.0]
+config    cores pp_t/s    tg_t/s   
+base      2     40.83     17.21    
+int8tile  2     43.05     16.83    
+base      4     75.70     28.41    
+int8tile  4     60.78     29.39    
+base      8     123.46    40.38    
+int8tile  8     71.78     40.47    
+INT8_DONE
