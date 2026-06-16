@@ -1,0 +1,15 @@
+prefill tile A/B (pp=512 tg=64 reps=4)  llama pp ref: 2c=87.5 4c=174.0 8c=327.0
+config       cores pp_t/s     tg_t/s    
+baseline     2     42.16      17.04     
+packed-nc8   2     46.17      17.40     
+packed-nc4   2     48.37      17.43     
+
+baseline     4     77.46      28.19     
+packed-nc8   4     88.36      29.00     
+packed-nc4   4     91.99      29.18     
+
+baseline     8     126.51     41.40     
+packed-nc8   8     154.23     37.54     
+packed-nc4   8     157.72     37.41     
+
+NC_AB_DONE

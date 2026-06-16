@@ -650,41 +650,40 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
     }
 }
 
-/// SDOT GEMM over candle's interleaved `BlockQ4Kx8`: all 8 output channels of the
-/// packed weights × `MR` activation rows. Output `dst[c * MR + a]` = channel `c` ·
-/// row `a`, numerically identical to `vec_dot_q4k_q8k` per pair.
+/// SDOT GEMM over candle's interleaved `BlockQ4Kx8`: `NC` output channels starting
+/// at `c_off` (NC + c_off ≤ 8) × `MR` activation rows. Output `dst[c * MR + a]` =
+/// channel `c_off+c` · row `a`, numerically identical to `vec_dot_q4k_q8k` per pair.
 ///
-/// The repacking payoff is in the loop order: scales/mins are read pre-unpacked
-/// (no 6-bit twiddle), the 8 channels' chunk weights are one contiguous run, and
-/// each q8 activation load is reused across all 8 channels (vs reloaded per
-/// channel in a per-column kernel). Nibbles are taken a half at a time (lo then
-/// hi) to keep only 8 channels × 2 vectors of weights live alongside the 8×MR
-/// accumulators.
+/// The repacking payoff is the loop order: scales/mins read pre-unpacked (no 6-bit
+/// twiddle), each chunk's channel weights contiguous, and each q8 activation load
+/// reused across all NC channels. Nibbles taken a half at a time (lo then hi) to
+/// keep `NC × 2` weight vectors live alongside the `NC × MR` accumulators — so the
+/// NC/MR product sets register pressure (8×4 spills on N1; 4×4 and 8×2 fit).
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
-pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
+pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
     packed: &[BlockQ4Kx8],
+    c_off: usize,
     rows: &[&[BlockQ8K]; MR],
     dst: &mut [f32],
 ) {
-    const NC: usize = 8; // channels per packed block
-    debug_assert!(dst.len() == NC * MR);
+    const PACK_ROWS: usize = 8; // channels stored per packed block (chunk stride)
+    debug_assert!(dst.len() == NC * MR && c_off + NC <= PACK_ROWS);
     let nb = packed.len();
     // Running accumulator per (channel, row), updated as `-= mins` then `+= main`
     // per super-block — the SAME two-op float sequence as `vec_dot`/`_xr`, so the
-    // result is bit-identical (computing a combined per-block term instead would
-    // round differently). Written to `dst` once at the end.
+    // result is bit-identical. Written to `dst` once at the end.
     let mut sumf = [[0f32; MR]; NC];
     unsafe {
         let m4b = vdupq_n_u8(0xF);
         for i in 0..nb {
             let blk = &packed[i];
-            // d / dmin per channel; y.d per row.
+            // d / dmin for the NC channels at c_off; y.d per row.
             let mut cd = [0f32; NC];
             let mut cdmin = [0f32; NC];
             for c in 0..NC {
-                cd[c] = blk.d[c].to_f32();
-                cdmin[c] = blk.dmin[c].to_f32();
+                cd[c] = blk.d[c_off + c].to_f32();
+                cdmin[c] = blk.dmin[c_off + c].to_f32();
             }
 
             // mins correction: per (c, a)  -= y.d * dmin[c] * Σ_s min[c][s]·q8sums[a][s],
@@ -695,8 +694,7 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
                 q8sums[a] = vpaddq_s16(vld1q_s16(b), vld1q_s16(b.add(8)));
             }
             for c in 0..NC {
-                let mb = blk.mins.as_ptr().add(c * 8);
-                // widen 8 min bytes -> s16x8
+                let mb = blk.mins.as_ptr().add((c_off + c) * 8);
                 let mins = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mb)));
                 for a in 0..MR {
                     let prod = vaddq_s32(
@@ -709,16 +707,16 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
 
             let mut acc = [[vdupq_n_s32(0); MR]; NC];
             for j in 0..QK_K / 64 {
-                let wbase = j * (NC * 32); // chunk j, row-interleaved 8×32 bytes
+                // chunk j is always a row-interleaved 8×32-byte run; channel c_off+c
+                // lives at qs[j*256 + (c_off+c)*32].
+                let wbase = j * (PACK_ROWS * 32);
                 let sc_lo = 2 * j;
                 let sc_hi = 2 * j + 1;
 
-                // --- low-nibble sub-block (scale index 2j) ---
                 let mut lo0 = [vdupq_n_s8(0); NC];
                 let mut lo1 = [vdupq_n_s8(0); NC];
                 for c in 0..NC {
-                    // Each channel's chunk is 32 bytes = 2× u8x16 at qs[wbase + c*32].
-                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + c * 32));
+                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + (c_off + c) * 32));
                     lo0[c] = vreinterpretq_s8_u8(vandq_u8(q4b.0, m4b));
                     lo1[c] = vreinterpretq_s8_u8(vandq_u8(q4b.1, m4b));
                 }
@@ -726,15 +724,15 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
                     let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_lo * 32));
                     for c in 0..NC {
                         let p = vaddq_s32(vdotq_s32(lo0[c], q8.0), vdotq_s32(lo1[c], q8.1));
-                        acc[c][a] = vmlaq_n_s32(acc[c][a], p, blk.scales[c * 8 + sc_lo] as i32);
+                        acc[c][a] =
+                            vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_lo] as i32);
                     }
                 }
 
-                // --- high-nibble sub-block (scale index 2j+1) ---
                 let mut hi0 = [vdupq_n_s8(0); NC];
                 let mut hi1 = [vdupq_n_s8(0); NC];
                 for c in 0..NC {
-                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + c * 32));
+                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + (c_off + c) * 32));
                     hi0[c] = vreinterpretq_s8_u8(vshrq_n_u8(q4b.0, 4));
                     hi1[c] = vreinterpretq_s8_u8(vshrq_n_u8(q4b.1, 4));
                 }
@@ -742,7 +740,8 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
                     let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_hi * 32));
                     for c in 0..NC {
                         let p = vaddq_s32(vdotq_s32(hi0[c], q8.0), vdotq_s32(hi1[c], q8.1));
-                        acc[c][a] = vmlaq_n_s32(acc[c][a], p, blk.scales[c * 8 + sc_hi] as i32);
+                        acc[c][a] =
+                            vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_hi] as i32);
                     }
                 }
             }
@@ -758,6 +757,16 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
             }
         }
     }
+}
+
+/// Convenience wrapper: all 8 channels of the packed block × `MR` rows.
+#[inline(always)]
+pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
+    packed: &[BlockQ4Kx8],
+    rows: &[&[BlockQ8K]; MR],
+    dst: &mut [f32],
+) {
+    gemm_q4kx_q8k::<8, MR>(packed, 0, rows, dst)
 }
 
 #[inline(always)]

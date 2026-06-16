@@ -112,6 +112,106 @@ pub(crate) fn repack_q4k_x8(rows: &[&[BlockQ4K]; Q4KX8_ROWS]) -> Vec<BlockQ4Kx8>
     out
 }
 
+// ===========================================================================
+// Laneq layout (N1 parity path): 8 columns interleaved 8 bytes at a time, with
+// the 6-bit scales/mins repacked into a 96-byte block aligned for a vector load.
+// This is the byte layout llama.cpp's arm `ggml_gemm_q4_K_8x8_q8_K` consumes via
+// `vdotq_laneq_s32` — chosen because that lane-broadcast kernel reaches llama's
+// N1 speed (our earlier separate-channel BlockQ4Kx8 can't feed laneq). Ported
+// from llama's `make_block_q4_Kx8` (blck_size_interleave = 8); the matching laneq
+// GEMM lands next. Distinct from BlockQ4Kx8 (kept for the shipped +25% path).
+// ===========================================================================
+
+/// 8 Q4_K columns interleaved for the `vdotq_laneq` GEMM. Field layout matches
+/// llama's `block_q4_Kx8` byte-for-byte so the kernel can mirror its proven one.
+#[repr(C)]
+#[derive(Clone)]
+pub struct BlockQ4Kx8L {
+    pub(crate) d: [f16; 8],
+    pub(crate) dmin: [f16; 8],
+    pub(crate) scales: [u8; 96], // 6-bit scales+mins, repacked (8 cols)
+    pub(crate) qs: [u8; 1024],   // 4-bit quants, 8-byte round-robin interleave
+}
+
+impl BlockQ4Kx8L {
+    fn zeroed() -> Self {
+        Self {
+            d: [f16::ZERO; 8],
+            dmin: [f16::ZERO; 8],
+            scales: [0; 96],
+            qs: [0; 1024],
+        }
+    }
+}
+
+/// Port of llama's `make_block_q4_Kx8` for one super-block of 8 columns
+/// (`blck_size_interleave = 8`). Pure data rearrangement; deterministic.
+fn make_q4kx8_laneq(cols: &[&[BlockQ4K]; 8], i: usize) -> BlockQ4Kx8L {
+    let mut out = BlockQ4Kx8L::zeroed();
+    for c in 0..8 {
+        out.d[c] = cols[c][i].d;
+        out.dmin[c] = cols[c][i].dmin;
+    }
+    // qs: take 8 bytes at a time, round-robin across the 8 columns.
+    // end = QK_K * 4 / 8 = 128; src col = t%8, src off = (t/8)*8, dst = t*8.
+    let end = QK_K * 4 / 8;
+    for t in 0..end {
+        let src_id = t % 8;
+        let src_off = (t / 8) * 8;
+        let dst_off = t * 8;
+        out.qs[dst_off..dst_off + 8]
+            .copy_from_slice(&cols[src_id][i].qs[src_off..src_off + 8]);
+    }
+    // scales: repack the 6-bit packed scales/mins of all 8 columns into 96 bytes.
+    let mut s = [0u8; 8];
+    let mut m = [0u8; 8];
+    for ii in 0..4 {
+        for j in 0..8 {
+            s[j] = cols[j][i].scales[ii] & 63;
+            m[j] = cols[j][i].scales[ii + 4] & 63;
+        }
+        let b = ii * 12;
+        out.scales[b] = (s[0] & 63) + ((s[4] & 48) << 2);
+        out.scales[b + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+        out.scales[b + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+        out.scales[b + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+        out.scales[b + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+        out.scales[b + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+        out.scales[b + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+        out.scales[b + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+        out.scales[b + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+        out.scales[b + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+        out.scales[b + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+        out.scales[b + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+    }
+    for ii in 0..4 {
+        for j in 0..8 {
+            s[j] = ((cols[j][i].scales[ii] & 192) >> 2) | (cols[j][i].scales[ii + 8] & 15);
+            m[j] = ((cols[j][i].scales[ii + 4] & 192) >> 2) | ((cols[j][i].scales[ii + 8] & 240) >> 4);
+        }
+        let b = ii * 12 + 48;
+        out.scales[b] = (s[0] & 63) + ((s[4] & 48) << 2);
+        out.scales[b + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+        out.scales[b + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+        out.scales[b + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+        out.scales[b + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+        out.scales[b + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+        out.scales[b + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+        out.scales[b + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+        out.scales[b + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+        out.scales[b + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+        out.scales[b + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+        out.scales[b + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+    }
+    out
+}
+
+/// Repack 8 weight columns (each `nb` Q4_K super-blocks) into `nb` laneq blocks.
+pub(crate) fn repack_q4kx8_laneq(cols: &[&[BlockQ4K]; 8]) -> Vec<BlockQ4Kx8L> {
+    let nb = cols[0].len();
+    (0..nb).map(|i| make_q4kx8_laneq(cols, i)).collect()
+}
+
 /// Process-global cache of repacked Q4_K weights, keyed by the source block
 /// slice's base pointer. Model weights live for the whole run, so this repacks
 /// each weight matrix once on first use. Benchmark-grade: keyed on pointer, so it
@@ -158,6 +258,16 @@ pub(crate) fn packed_q4k_applicable(k: usize, n: usize) -> bool {
 /// repacked once and cached. Parallelized over 8-channel groups on `pool`. Decode
 /// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot —
 /// MR=4 spills) with a 1-row remainder. Bit-identical to baseline `matmul`.
+/// Prefill tile strategy for the packed GEMM. `nc4mr4` (DEFAULT): two 4-channel ×
+/// 4-row calls per group (16 acc each, most activation reuse without spilling —
+/// measured best on N1). `nc8mr2`: one 8-channel × 2-row call (16 acc). Override
+/// with `CANDLE_PACKED_PREFILL=nc8mr2`.
+static PACKED_PREFILL_NC4: LazyLock<bool> = LazyLock::new(|| {
+    !std::env::var("CANDLE_PACKED_PREFILL")
+        .map(|s| s.eq_ignore_ascii_case("nc8mr2"))
+        .unwrap_or(false)
+});
+
 #[cfg(target_feature = "neon")]
 pub(crate) fn matmul_q4k_packed(
     (m, k, n): (usize, usize, usize),
@@ -166,7 +276,7 @@ pub(crate) fn matmul_q4k_packed(
     dst: &mut [f32],
     pool: &rayon::ThreadPool,
 ) {
-    use super::neon::gemm_q4kx8_q8k;
+    use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
     let nb = k / QK_K;
     let packed = packed_cache_get(rhs_q4k, n, nb);
 
@@ -183,14 +293,33 @@ pub(crate) fn matmul_q4k_packed(
     unsafe impl Sync for DstPtr {}
     let dptr = DstPtr(dst.as_mut_ptr());
     let groups = n / Q4KX8_ROWS;
+    let use_nc4 = *PACKED_PREFILL_NC4;
     pool.install(|| {
         (0..groups).into_par_iter().for_each(|g| {
             let w = &packed[g * nb..(g + 1) * nb];
             let p = &dptr;
+            let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
             let mut r = 0;
+            if use_nc4 {
+                // nc4mr4: 4 rows × {channels 0..4, 4..8} per call.
+                while r + 4 <= m {
+                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                    for half in 0..2 {
+                        let c0 = half * 4;
+                        let mut tile = [0f32; 4 * 4];
+                        gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut tile);
+                        for c in 0..4 {
+                            for a in 0..4 {
+                                unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = tile[c * 4 + a] };
+                            }
+                        }
+                    }
+                    r += 4;
+                }
+            }
+            // nc8mr2 main (default), or the 2/3-row remainder of the nc4 path.
             while r + 2 <= m {
-                let rows: [&[BlockQ8K]; 2] =
-                    std::array::from_fn(|a| &lhs_q[(r + a) * nb..(r + a + 1) * nb]);
+                let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
                 let mut tile = [0f32; Q4KX8_ROWS * 2];
                 gemm_q4kx8_q8k::<2>(w, &rows, &mut tile);
                 for c in 0..Q4KX8_ROWS {
@@ -201,7 +330,7 @@ pub(crate) fn matmul_q4k_packed(
                 r += 2;
             }
             while r < m {
-                let rows: [&[BlockQ8K]; 1] = [&lhs_q[r * nb..(r + 1) * nb]];
+                let rows: [&[BlockQ8K]; 1] = [row(r)];
                 let mut tile = [0f32; Q4KX8_ROWS];
                 gemm_q4kx8_q8k::<1>(w, &rows, &mut tile);
                 for c in 0..Q4KX8_ROWS {
@@ -349,6 +478,60 @@ mod tests {
         check!(1);
         check!(2);
         check!(4);
+
+        // NC=4 halves (c_off 0 and 4), MR=4 — the nc4mr4 prefill path.
+        use crate::quantized::neon::gemm_q4kx_q8k;
+        for c_off in [0usize, 4usize] {
+            let ys: [&[BlockQ8K]; 4] = std::array::from_fn(|a| aq[a].as_slice());
+            let mut got = vec![0f32; 4 * 4];
+            gemm_q4kx_q8k::<4, 4>(&packed, c_off, &ys, &mut got);
+            for c in 0..4 {
+                for a in 0..4 {
+                    let want = BlockQ4K::vec_dot(k, &wq[c_off + c], &aq[a]);
+                    assert_eq!(
+                        got[c * 4 + a].to_bits(),
+                        want.to_bits(),
+                        "NC4 c_off={c_off} channel {c} row {a}: got {} want {}",
+                        got[c * 4 + a], want
+                    );
+                }
+            }
+        }
+    }
+
+    // Laneq repack sanity: qs must be a permutation of the 8 columns' qs bytes
+    // (every source byte present once), and d/dmin copied exactly. Full numeric
+    // correctness comes with the laneq GEMM (compared to vec_dot) in the next step.
+    #[test]
+    fn repack_q4kx8_laneq_qs_is_permutation() {
+        let nb = 2usize;
+        let k = nb * QK_K;
+        let mut st = 0x7777_3333_1111_9999u64;
+        let mut wq: Vec<Vec<BlockQ4K>> = Vec::new();
+        for _ in 0..8 {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let mut q = vec![BlockQ4K::zeros(); nb];
+            BlockQ4K::from_float(&f, &mut q);
+            wq.push(q);
+        }
+        let cols: [&[BlockQ4K]; 8] = std::array::from_fn(|c| wq[c].as_slice());
+        let packed = repack_q4kx8_laneq(&cols);
+        assert_eq!(packed.len(), nb);
+        for i in 0..nb {
+            // Multiset of qs bytes equal across source columns and packed block.
+            let mut src: Vec<u8> = Vec::new();
+            for c in 0..8 {
+                src.extend_from_slice(&wq[c][i].qs);
+            }
+            let mut got: Vec<u8> = packed[i].qs.to_vec();
+            src.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(src, got, "qs not a permutation at block {i}");
+            for c in 0..8 {
+                assert_eq!(packed[i].d[c].to_bits(), wq[c][i].d.to_bits(), "d c{c} i{i}");
+                assert_eq!(packed[i].dmin[c].to_bits(), wq[c][i].dmin.to_bits(), "dmin c{c} i{i}");
+            }
+        }
     }
 
     // The packed driver must match baseline matmul end-to-end (full dst, multiple
