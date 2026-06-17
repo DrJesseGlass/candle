@@ -108,6 +108,7 @@ fn main() -> Result<()> {
     let mut tg_norm_ns: u64 = 0;
     let mut tg_rope_ns: u64 = 0;
     let mut tg_copy_ns: u64 = 0;
+    let mut tg_fwd_ns: u64 = 0;
 
     let total = args.warmup + args.reps;
     for rep in 0..total {
@@ -140,6 +141,7 @@ fn main() -> Result<()> {
         if profile {
             matmul_profile_reset();
             candle_transformers::models::quantized_qwen3::model_profile_reset();
+            candle::quantized::QMATMUL_FWD_NS.store(0, Relaxed);
         }
         let t = Instant::now();
         for i in 0..args.tg {
@@ -158,6 +160,7 @@ fn main() -> Result<()> {
             tg_norm_ns += m::NORM_NS.load(Relaxed);
             tg_rope_ns += m::ROPE_NS.load(Relaxed);
             tg_copy_ns += m::COPY_NS.load(Relaxed);
+            tg_fwd_ns += candle::quantized::QMATMUL_FWD_NS.load(Relaxed);
         }
 
         let pp_rate = args.pp as f64 / pp_dt;
@@ -229,14 +232,22 @@ rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
         let copy = tg_copy_ns as f64;
         let rest = (wall - dot - quant).max(0.0);
         let glue = (rest - flash - norm - rope - copy).max(0.0);
+        // qmatmul_fwd = full QMatMul::forward (dispatch + dot + quant). dispatch =
+        // the per-op Tensor machinery (apply_op1/cpu_fwd allocs/from_storage) =
+        // fwd - dot - quant. It lives inside "matmul_dot+quant" timing-wise but is
+        // NOT the kernel — this isolates it.
+        let fwd = tg_fwd_ns as f64;
+        let dispatch = (fwd - dot - quant).max(0.0);
         let pct = |x: f64| 100.0 * x / wall;
         eprintln!(
             "\n[decode profile over {} reps × {} tok]  wall={:.1}ms\n  \
 matmul_dot={:.1}ms ({:.1}%)  matmul_quant={:.1}ms ({:.1}%)\n  \
+qmatmul_fwd_total={:.1}ms ({:.1}%)  => DISPATCH overhead={:.1}ms ({:.1}%)\n  \
 REST={:.1}ms ({:.1}%) = flash {:.1}ms ({:.1}%) + norm {:.1}ms ({:.1}%) + \
 rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
             args.reps, args.tg, wall / 1e6,
             dot / 1e6, pct(dot), quant / 1e6, pct(quant),
+            fwd / 1e6, pct(fwd), dispatch / 1e6, pct(dispatch),
             rest / 1e6, pct(rest),
             flash / 1e6, pct(flash), norm / 1e6, pct(norm),
             rope / 1e6, pct(rope), copy / 1e6, pct(copy), glue / 1e6, pct(glue),

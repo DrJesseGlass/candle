@@ -2449,6 +2449,13 @@ static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_DECODE_SERIAL").map(|s| s != "0").unwrap_or(true)
 });
 
+// Software prefetch of the next weight column in the serial decode GEMV. Default
+// OFF (HW prefetcher may already cover the sequential stream); CANDLE_GEMV_PREFETCH=1
+// to A/B.
+static GEMV_PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_GEMV_PREFETCH").map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false)
+});
+
 // Tile dims (weight columns NR × activation rows MR) for the int8-tile prefill.
 // `vec_dot_tile` dispatches a fused micro-kernel for supported shapes and falls
 // back to scalar otherwise — so NR=MR=1 routes the SAME matmul_tile structure
@@ -2692,9 +2699,30 @@ pub fn matmul<T: GgmlType>(
     // `CANDLE_DECODE_SERIAL=0` forces the old parallel path.)
     if m == 1 && pool.current_num_threads() <= 1 && *DECODE_SERIAL {
         let lhs_row = &lhs_b[..k_in_blocks];
-        for (col_idx, d) in dst.iter_mut().enumerate() {
-            let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
-            *d = T::vec_dot(k, rhs_col, lhs_row);
+        let prefetch = *GEMV_PREFETCH;
+        let col_bytes = k_in_blocks * std::mem::size_of::<T>();
+        let base = rhs_t.as_ptr() as *const u8;
+        let n = dst.len();
+        for col_idx in 0..n {
+            // Prefetch the NEXT weight column into L1 while we dot the current one
+            // (~260 cycles of compute lead hides the ~100-cycle miss latency). The HW
+            // prefetcher should stream the contiguous columns, but an explicit hint
+            // can lift the memory-stall-bound IPC; A/B with CANDLE_GEMV_PREFETCH.
+            if prefetch && col_idx + 1 < n {
+                let mut p = unsafe { base.add((col_idx + 1) * col_bytes) };
+                let end = unsafe { p.add(col_bytes) };
+                while p < end {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p, options(nostack, preserves_flags));
+                    }
+                    p = unsafe { p.add(64) };
+                }
+            }
+            let rhs_col = unsafe {
+                rhs_t.get_unchecked(col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks)
+            };
+            unsafe { *dst.get_unchecked_mut(col_idx) = T::vec_dot(k, rhs_col, lhs_row) };
         }
         if let Some(t) = t_dot {
             use std::sync::atomic::Ordering::Relaxed;

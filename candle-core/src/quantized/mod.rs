@@ -922,10 +922,29 @@ impl crate::CustomOp1 for QTensor {
     }
 }
 
+/// Total wall-ns inside `QMatMul::forward` for QTensor matmuls (dispatch + kernel),
+/// when `CANDLE_MATMUL_PROFILE` is set. Subtract MATMUL_DOT_NS+MATMUL_QUANT_NS to get
+/// the per-op Tensor-dispatch overhead (apply_op1 / cpu_fwd allocs / from_storage).
+pub static QMATMUL_FWD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QMATMUL_FWD_PROFILE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_MATMUL_PROFILE").is_ok());
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
+            Self::QTensor(t) => {
+                if *QMATMUL_FWD_PROFILE {
+                    let s = std::time::Instant::now();
+                    let r = xs.apply_op1_no_bwd(t.as_ref());
+                    QMATMUL_FWD_NS.fetch_add(
+                        s.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    r
+                } else {
+                    xs.apply_op1_no_bwd(t.as_ref())
+                }
+            }
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
