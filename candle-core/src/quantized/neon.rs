@@ -41,6 +41,44 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
 }
 
+// Accumulating SDOT: `acc += dot4(a, b)` lane-wise, using SDOT's native accumulate
+// so chains of sub-block dots reuse one register (vs `vdupq_n_s32(0)` + separate
+// `vaddq` per call, which emits a redundant `movi` and an add — the candle-vs-ggml
+// instruction-count gap). Integer accumulation is associative, so chaining is
+// bit-identical to summing separate `vdotq_s32` results.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn vdotq_s32_acc(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_s32_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    vaddq_s32(acc, vdotq_s32(a, b))
+}
+
+// Toggle the accumulate-chain SDOT path (default on; CANDLE_SDOT_CHAIN=0 reverts to
+// the zero-init + vaddq form) for A/B benchmarking.
+static SDOT_CHAIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_SDOT_CHAIN").map(|s| s != "0").unwrap_or(true));
+
+// Vector-accumulation in the single-row Q4_K kernel: accumulate `p*scale` into an
+// int32x4 vector (vmlaq_n) + ONE `vaddvq` per superblock, vs a cross-lane `vaddvq`
+// per sub-block-half. MEASURED slightly SLOWER on the decode GEMV (it's memory-bound,
+// so the per-sub-block reduction latency is hidden, while vmlaq_n adds a scalar→vec
+// dup + a serial accumulator dependency). DEFAULT OFF (chain-only wins); set
+// CANDLE_VEC_ACC=1 to A/B. (Opposite holds for _xr/prefill, which already uses this.)
+static VEC_ACC: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_VEC_ACC").map(|s| s != "0").unwrap_or(false));
+
 #[inline(always)]
 pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert!(
@@ -384,31 +422,31 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
             let mut q4 = x.qs.as_ptr();
             let mut q8 = y.qs.as_ptr();
 
+            let mzero = vdupq_n_s32(0); // chain seed (reused; hoisted out of the loop)
+
+            // Chained sdots (ggml-style): both sub-block-half dots accumulate into one
+            // register via SDOT's native accumulate; per-sub-block scalar reduction.
+            // Bit-identical (integer associative). Measured +9.7% cumulative decode on
+            // N1 vs the zero-init + vaddq form; vector-accumulation was slightly slower
+            // on this memory-bound single-row kernel so it's intentionally not used.
             let mut sumi1 = 0i32;
             let mut sumi2 = 0i32;
-
             for j in 0..QK_K / 64 {
                 let q4bits = vld1q_u8_x2(q4);
                 q4 = q4.add(32);
                 let q8bytes = vld1q_s8_x2(q8);
                 q8 = q8.add(32);
-                let q4bytes = int8x16x2_t(
-                    vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b)),
-                    vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b)),
-                );
-                let p0 = vdotq_s32(q4bytes.0, q8bytes.0);
-                let p1 = vdotq_s32(q4bytes.1, q8bytes.1);
-                sumi1 += vaddvq_s32(vaddq_s32(p0, p1)) * scales[2 * j] as i32;
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b));
+                let p_lo = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0, q8bytes.0), lo1, q8bytes.1);
+                sumi1 += vaddvq_s32(p_lo) * scales[2 * j] as i32;
 
                 let q8bytes = vld1q_s8_x2(q8);
                 q8 = q8.add(32);
-                let q4bytes = int8x16x2_t(
-                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4)),
-                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4)),
-                );
-                let p2 = vdotq_s32(q4bytes.0, q8bytes.0);
-                let p3 = vdotq_s32(q4bytes.1, q8bytes.1);
-                sumi2 += vaddvq_s32(vaddq_s32(p2, p3)) * scales[2 * j + 1] as i32;
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4));
+                let p_hi = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0, q8bytes.0), hi1, q8bytes.1);
+                sumi2 += vaddvq_s32(p_hi) * scales[2 * j + 1] as i32;
             }
             sumf += d * (sumi1 + sumi2) as f32;
         }
@@ -442,6 +480,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
     const KMASK1: u32 = 0x3f3f3f3f;
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
+    let chain = *SDOT_CHAIN; // read once per call
 
     let mut sumf = [0f32; R];
     unsafe {
@@ -489,33 +528,61 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             // instead of one per 32 weights (i32 adds are associative, so this is
             // bit-identical to the scalar-sum form).
             let mut acc = [vdupq_n_s32(0); R];
+            let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
 
-            for j in 0..QK_K / 64 {
-                let q4bits = vld1q_u8_x2(q4);
-                q4 = q4.add(32);
-                let lo = int8x16x2_t(
-                    vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b)),
-                    vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b)),
-                );
-                let hi = int8x16x2_t(
-                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4)),
-                    vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4)),
-                );
-
-                // Scales are loop-invariant across r; hoist them out of the row loop.
-                let sc_lo = *scales.get_unchecked(2 * j) as i32;
-                let sc_hi = *scales.get_unchecked(2 * j + 1) as i32;
-                for r in 0..nrows {
-                    let pr = q8p.get_unchecked_mut(r);
-                    let q8 = vld1q_s8_x2(*pr);
-                    *pr = pr.add(32);
-                    let p = vaddq_s32(vdotq_s32(lo.0, q8.0), vdotq_s32(lo.1, q8.1));
-                    let a = acc.get_unchecked_mut(r);
-                    *a = vmlaq_n_s32(*a, p, sc_lo);
-                    let q8 = vld1q_s8_x2(*pr);
-                    *pr = pr.add(32);
-                    let p = vaddq_s32(vdotq_s32(hi.0, q8.0), vdotq_s32(hi.1, q8.1));
-                    *a = vmlaq_n_s32(*a, p, sc_hi);
+            // Two variants selected once by `chain`: the chained sdot path uses
+            // SDOT's accumulate (2 sdot/sub-block-half, no zero-init or vaddq); the
+            // else path is the original. Branching the whole loop (not per-iter)
+            // keeps the hot path clean. Bit-identical (integer associative).
+            if chain {
+                for j in 0..QK_K / 64 {
+                    let q4bits = vld1q_u8_x2(q4);
+                    q4 = q4.add(32);
+                    let lo0 = vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b));
+                    let lo1 = vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b));
+                    let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4));
+                    let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4));
+                    let sc_lo = *scales.get_unchecked(2 * j) as i32;
+                    let sc_hi = *scales.get_unchecked(2 * j + 1) as i32;
+                    for r in 0..nrows {
+                        let pr = q8p.get_unchecked_mut(r);
+                        let q8 = vld1q_s8_x2(*pr);
+                        *pr = pr.add(32);
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0, q8.0), lo1, q8.1);
+                        let a = acc.get_unchecked_mut(r);
+                        *a = vmlaq_n_s32(*a, p, sc_lo);
+                        let q8 = vld1q_s8_x2(*pr);
+                        *pr = pr.add(32);
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0, q8.0), hi1, q8.1);
+                        *a = vmlaq_n_s32(*a, p, sc_hi);
+                    }
+                }
+            } else {
+                for j in 0..QK_K / 64 {
+                    let q4bits = vld1q_u8_x2(q4);
+                    q4 = q4.add(32);
+                    let lo = int8x16x2_t(
+                        vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b)),
+                        vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b)),
+                    );
+                    let hi = int8x16x2_t(
+                        vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4)),
+                        vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4)),
+                    );
+                    let sc_lo = *scales.get_unchecked(2 * j) as i32;
+                    let sc_hi = *scales.get_unchecked(2 * j + 1) as i32;
+                    for r in 0..nrows {
+                        let pr = q8p.get_unchecked_mut(r);
+                        let q8 = vld1q_s8_x2(*pr);
+                        *pr = pr.add(32);
+                        let p = vaddq_s32(vdotq_s32(lo.0, q8.0), vdotq_s32(lo.1, q8.1));
+                        let a = acc.get_unchecked_mut(r);
+                        *a = vmlaq_n_s32(*a, p, sc_lo);
+                        let q8 = vld1q_s8_x2(*pr);
+                        *pr = pr.add(32);
+                        let p = vaddq_s32(vdotq_s32(hi.0, q8.0), vdotq_s32(hi.1, q8.1));
+                        *a = vmlaq_n_s32(*a, p, sc_hi);
+                    }
                 }
             }
             for r in 0..nrows {
@@ -607,6 +674,7 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
 
             // --- main: NR×MR int32 accumulators, both operands reused in-register ---
             let mut acc = [[vdupq_n_s32(0); MR]; NR];
+            let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
             for j in 0..QK_K / 64 {
                 // Register-pressure note: 16 int32 accumulators (NR×MR) already use
                 // half the NEON file. Materializing lo+hi nibbles for all NR columns
@@ -627,7 +695,7 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
                     let q8 = vld1q_s8_x2(q8p[a]);
                     q8p[a] = q8p[a].add(32);
                     for w in 0..NR {
-                        let p = vaddq_s32(vdotq_s32(lo0[w], q8.0), vdotq_s32(lo1[w], q8.1));
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0[w], q8.0), lo1[w], q8.1);
                         acc[w][a] = vmlaq_n_s32(acc[w][a], p, scales_w[w][2 * j] as i32);
                     }
                 }
@@ -645,7 +713,7 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
                     let q8 = vld1q_s8_x2(q8p[a]);
                     q8p[a] = q8p[a].add(32);
                     for w in 0..NR {
-                        let p = vaddq_s32(vdotq_s32(hi0[w], q8.0), vdotq_s32(hi1[w], q8.1));
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0[w], q8.0), hi1[w], q8.1);
                         acc[w][a] = vmlaq_n_s32(acc[w][a], p, scales_w[w][2 * j + 1] as i32);
                     }
                 }
@@ -715,6 +783,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
             }
 
             let mut acc = [[vdupq_n_s32(0); MR]; NC];
+            let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
             for j in 0..QK_K / 64 {
                 // chunk j is always a row-interleaved 8×32-byte run; channel c_off+c
                 // lives at qs[j*256 + (c_off+c)*32].
@@ -732,7 +801,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                 for a in 0..MR {
                     let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_lo * 32));
                     for c in 0..NC {
-                        let p = vaddq_s32(vdotq_s32(lo0[c], q8.0), vdotq_s32(lo1[c], q8.1));
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0[c], q8.0), lo1[c], q8.1);
                         acc[c][a] =
                             vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_lo] as i32);
                     }
@@ -748,7 +817,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                 for a in 0..MR {
                     let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_hi * 32));
                     for c in 0..NC {
-                        let p = vaddq_s32(vdotq_s32(hi0[c], q8.0), vdotq_s32(hi1[c], q8.1));
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0[c], q8.0), hi1[c], q8.1);
                         acc[c][a] =
                             vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_hi] as i32);
                     }

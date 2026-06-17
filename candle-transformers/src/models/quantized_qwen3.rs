@@ -37,6 +37,38 @@ static MODEL_PROFILE: std::sync::LazyLock<bool> =
 static FUSED_ROPE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("CANDLE_ROPE_FUSED").map(|s| s != "0").unwrap_or(true));
 
+// Fused SiLU(gate)*up in one CPU/f32 pass, vs `gate.apply(silu)` + `(gate*up)`
+// (two ops + an intermediate tensor). Default on; CANDLE_SILU_MUL_FUSED=0 forces
+// the original path. Bit-exact with the scalar silu path (Lambda has no Accelerate
+// vForce silu, so it matches there exactly).
+static FUSED_SILU_MUL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_SILU_MUL_FUSED").map(|s| s != "0").unwrap_or(true)
+});
+
+/// `out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]` in one pass on raw f32 slices.
+fn fused_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    use candle::Storage;
+    let shape = gate.shape().clone();
+    let g = gate.contiguous()?;
+    let u = up.contiguous()?;
+    let (gs, gl) = g.storage_and_layout();
+    let (us, ul) = u.storage_and_layout();
+    let (gd, ud): (&[f32], &[f32]) = match (&*gs, &*us) {
+        (Storage::Cpu(gc), Storage::Cpu(uc)) => (
+            &gc.as_slice::<f32>()?[gl.start_offset()..],
+            &uc.as_slice::<f32>()?[ul.start_offset()..],
+        ),
+        _ => candle::bail!("fused_silu_mul: expected CPU storage"),
+    };
+    let n = shape.elem_count();
+    let mut out = vec![0f32; n];
+    for i in 0..n {
+        let x = gd[i];
+        out[i] = (x / (1.0 + (-x).exp())) * ud[i];
+    }
+    Tensor::from_vec(out, shape, gate.device())
+}
+
 /// Time `f`, adding the elapsed ns to `c` when profiling is on.
 #[inline]
 fn timed<T>(c: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -166,8 +198,16 @@ impl Module for MlpWeights {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (gate, up) = self.gate_up.forward(x)?;
-        let gate = gate.apply(&self.act_fn)?;
-        let gated = (gate * up)?;
+        let gated = if *FUSED_SILU_MUL
+            && matches!(self.act_fn, Activation::Silu)
+            && gate.device().is_cpu()
+            && gate.dtype() == DType::F32
+        {
+            fused_silu_mul(&gate, &up)?
+        } else {
+            let gate = gate.apply(&self.act_fn)?;
+            (gate * up)?
+        };
         self.down_proj.forward(&gated)
     }
 }
@@ -614,6 +654,13 @@ impl ModelWeights {
                 _ => DType::F16,
             },
             None => DType::F16,
+        };
+        // Experiment override: CANDLE_FORCE_DTYPE=f16|f32 forces the activation
+        // dtype regardless of the GGUF's general.dtype, to A/B f16 vs f32 activations.
+        let dtype = match std::env::var("CANDLE_FORCE_DTYPE").ok().as_deref() {
+            Some("f16") => DType::F16,
+            Some("f32") => DType::F32,
+            _ => dtype,
         };
 
         let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
