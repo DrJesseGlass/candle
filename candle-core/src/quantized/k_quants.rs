@@ -2474,12 +2474,14 @@ static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
 });
 
 // Opt-in: route Q4_K matmuls through the interleaved packed SDOT kernels
-// (`repack::matmul_q4k_packed`). Weights are repacked once and cached. Default
-// off; set `CANDLE_MATMUL_PACKED_Q4K=1`.
+// (`repack::matmul_q4k_packed`). Weights are repacked once and cached. DEFAULT ON
+// (N1-validated): interleaved packing wins prefill at every core count (+15-25%,
+// scales best of all — 193 t/s @8vCPU vs rayon 167) and decode ≤4 vCPU (+7-16%),
+// ~neutral decode @8 vCPU. Bit-exact. Set CANDLE_MATMUL_PACKED_Q4K=0 to disable.
 static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_MATMUL_PACKED_Q4K")
-        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|s| s != "0")
+        .unwrap_or(true)
 });
 
 // Serial GEMV fast-path for single-thread decode (default on; set
