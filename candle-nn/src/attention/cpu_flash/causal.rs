@@ -8,7 +8,11 @@ use rayon::prelude::*;
 
 use super::online_softmax::online_softmax_step;
 use super::standard::{FLASH_ATTN_POOL, FLASH_DECODE_POOL};
-use super::{axpy_f16, dot_f32, dot_f32_f16};
+use super::{axpy_f16, dot_f32};
+#[cfg(not(feature = "f16-attn-dot"))]
+use super::dot_f32_f16;
+#[cfg(feature = "f16-attn-dot")]
+use super::dot_f16_f16;
 
 /// Prefetch a cache line for read.
 #[inline(always)]
@@ -358,6 +362,18 @@ pub fn causal_decode_f16kv_interleaved(
         m.fill(f32::NEG_INFINITY);
         ssum.fill(0.0);
 
+        // `f16-attn-dot`: narrow this kv-head's `rk` query rows to f16 ONCE here
+        // (amortized over all `kv_len` positions), so the inner score is a pure
+        // f16·f16 dot. Default build skips this entirely.
+        #[cfg(feature = "f16-attn-dot")]
+        let q_f16: Vec<half::f16> = {
+            let base = kv_h * rk * d;
+            q_data[base..base + rk * d]
+                .iter()
+                .map(|&x| half::f16::from_f32(x))
+                .collect()
+        };
+
         for kv_pos in 0..kv_len {
             // K and V share a base pointer (adjacent in memory)
             let kv_base = head_base + kv_pos * 2 * d;
@@ -371,8 +387,16 @@ pub fn causal_decode_f16kv_interleaved(
 
             for r in 0..rk {
                 let h_i = kv_h * rk + r;
-                let q_row = &q_data[h_i * d..(h_i + 1) * d];
-                let score = dot_f32_f16(q_row, k_row) * scale;
+                #[cfg(not(feature = "f16-attn-dot"))]
+                let score = {
+                    let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                    dot_f32_f16(q_row, k_row) * scale
+                };
+                #[cfg(feature = "f16-attn-dot")]
+                let score = {
+                    let _ = h_i;
+                    dot_f16_f16(&q_f16[r * d..(r + 1) * d], k_row) * scale
+                };
                 let acc_r = &mut acc[r * d..(r + 1) * d];
                 online_softmax_step(score, &mut m[r], &mut ssum[r], acc_r, |acc, w| {
                     axpy_f16(acc, v_row, w);

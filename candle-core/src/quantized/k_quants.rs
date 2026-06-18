@@ -50,6 +50,28 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
     /// n is the number of elements to be considered.
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
 
+    /// Two dot products sharing one LHS (`ys`) load: `(dot(xs0,ys), dot(xs1,ys))`.
+    /// From upstream PR #3627. Default calls `vec_dot` twice (so our per-dot SDOT
+    /// chain still applies); a NEON override can keep `ys` register-resident.
+    fn vec_dot_2(n: usize, xs0: &[Self], xs1: &[Self], ys: &[Self::VecDotType]) -> (f32, f32) {
+        (Self::vec_dot(n, xs0, ys), Self::vec_dot(n, xs1, ys))
+    }
+
+    /// Four dot products sharing one LHS (`ys`) load. From upstream PR #3627.
+    /// Default fans out to `vec_dot_2`; a NEON override loads `ys` once per 4 cols.
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        let (d0, d1) = Self::vec_dot_2(n, xs0, xs1, ys);
+        let (d2, d3) = Self::vec_dot_2(n, xs2, xs3, ys);
+        (d0, d1, d2, d3)
+    }
+
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
 
@@ -1398,6 +1420,23 @@ impl GgmlType for BlockQ4K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    /// 4 weight columns × 1 activation row, sharing the activation (Q8K) load
+    /// (PR #3627's `vec_dot_4`). NEON kernel mirrors `vec_dot`'s SDOT chain per
+    /// column, so each result is bit-identical to `vec_dot`. Used by the BarrierPool
+    /// matmul path; the default (4× `vec_dot`) covers non-NEON targets.
+    #[cfg(target_feature = "neon")]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        let r = super::neon::vec_dot_q4k_q8k_4col(n, [xs0, xs1, xs2, xs3], ys);
+        (r[0], r[1], r[2], r[3])
+    }
+
     /// Groups rows through the multi-row NEON kernel so each weight superblock is
     /// unpacked once per group instead of once per row. Group width is capped by
     /// `CANDLE_Q4K_XR_R` (2..=8); a descending 8→4→2→1 ladder settles the remainder.
@@ -2449,6 +2488,17 @@ static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_DECODE_SERIAL").map(|s| s != "0").unwrap_or(true)
 });
 
+// Upstream PR #3627 matmul threading: persistent BarrierPool REPLACES rayon as the
+// sole matmul pool (busy-spins, so it can't coexist with rayon). Decode (m==1, multi)
+// → vec_dot_4 column-quads; 1-vCPU → serial GEMV; prefill → row-tile + `_xr` via pool.
+// DEFAULT OFF: WINS on Apple Silicon (M1 decode +14-20% @2/4 threads) but LOSES on
+// Graviton2/Neoverse-N1 = our Lambda target (N1 decode −3%/−9% @2/4, prefill −14% @4;
+// the spin-barrier + static split lose to rayon's work-stealing on N1). Bit-exact
+// either way. Set CANDLE_MATMUL_BARRIER=1 to opt in (e.g. on M-series).
+static MATMUL_BARRIER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_BARRIER").map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false)
+});
+
 // Software prefetch of the next weight column in the serial decode GEMV. Default
 // OFF (HW prefetcher may already cover the sequential stream); CANDLE_GEMV_PREFETCH=1
 // to A/B.
@@ -2647,6 +2697,8 @@ pub fn matmul<T: GgmlType>(
     };
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
 
+    let barrier = *MATMUL_BARRIER;
+
     // TODO: Pre-allocate this.
     let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_blocks];
     // f32, f16, and bf16 support direct copy
@@ -2654,9 +2706,32 @@ pub fn matmul<T: GgmlType>(
         T::VecDotType::direct_copy(lhs, &mut lhs_b);
     } else if m == 1 {
         T::VecDotType::from_float(&lhs[..k], &mut lhs_b[..k_in_blocks]);
+    } else if barrier {
+        // BarrierPool owns the worker threads (busy-spin), so quantize the m rows
+        // through THAT pool (not a second rayon pool, which would contend). Each
+        // thread owns a disjoint row range; raw-pointer writes are disjoint.
+        let pool = crate::utils::barrier_pool();
+        let n_total = pool.n_workers() + 1;
+        let rows_per_thread = m.div_ceil(n_total);
+        struct LhsPtr<U>(*mut U);
+        unsafe impl<U> Sync for LhsPtr<U> {}
+        let lhs_ptr = LhsPtr(lhs_b.as_mut_ptr());
+        pool.execute(|tid| {
+            let r0 = tid * rows_per_thread;
+            if r0 >= m {
+                return;
+            }
+            let r1 = m.min((tid + 1) * rows_per_thread);
+            let p = &lhs_ptr;
+            for row in r0..r1 {
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(p.0.add(row * k_in_blocks), k_in_blocks)
+                };
+                T::VecDotType::from_float(&lhs[row * k..(row + 1) * k], dst);
+            }
+        });
     } else {
-        // Prefill quantizes m rows; spread them over the prefill pool (the serial
-        // loop showed up as a constant ~2% of prefill wall time).
+        // Legacy rayon path: spread the m-row quantization over the prefill pool.
         QMATMUL_PREFILL_POOL.install(|| {
             lhs_b
                 .par_chunks_mut(k_in_blocks)
@@ -2675,6 +2750,114 @@ pub fn matmul<T: GgmlType>(
     } else {
         None
     };
+
+    // Upstream PR #3627 threading (default; CANDLE_MATMUL_BARRIER=0 → legacy rayon):
+    // the persistent BarrierPool is the SOLE matmul pool. Three regimes:
+    //  - decode (m==1) @1 vCPU (0 workers): serial GEMV, single kernel/col (best);
+    //  - decode (m==1) multi-thread: vec_dot_4 column-quads across the pool
+    //    (one activation load per 4 cols; +9%/+28% @2/4 threads vs rayon);
+    //  - prefill (m>1): row-tile + `_xr` multi-row dot, columns split across the pool
+    //    (keeps our weight-reuse-across-rows axis, just on the BarrierPool not rayon).
+    if barrier {
+        let pool = crate::utils::barrier_pool();
+        let n_workers = pool.n_workers();
+        let n_total = n_workers + 1;
+
+        if m == 1 && n_workers == 0 {
+            // 1-vCPU decode: our serial GEMV (vec_dot_4's 4-wide stack arrays
+            // register-allocate worse than the single kernel at 1 thread).
+            let lhs_row = &lhs_b[..k_in_blocks];
+            for col_idx in 0..n {
+                let rhs_col = unsafe {
+                    rhs_t.get_unchecked(col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks)
+                };
+                unsafe { *dst.get_unchecked_mut(col_idx) = T::vec_dot(k, rhs_col, lhs_row) };
+            }
+        } else if m == 1 {
+            // Multi-thread decode: vec_dot_4 over column-quads.
+            let n_quad = n & !3;
+            let quads_total = n_quad / 4;
+            let quads_per_thread = quads_total.div_ceil(n_total);
+            let lhs_row = &lhs_b[..k_in_blocks];
+            let (main, tail) = dst.split_at_mut(n_quad);
+            let main_ptr = main.as_mut_ptr() as usize;
+            pool.execute(|tid| {
+                let start = tid * quads_per_thread;
+                if start >= quads_total {
+                    return;
+                }
+                let end = quads_total.min((tid + 1) * quads_per_thread);
+                let main_ptr = main_ptr as *mut f32;
+                for quad_idx in start..end {
+                    let col = quad_idx * 4;
+                    let (d0, d1, d2, d3) = T::vec_dot_4(
+                        k,
+                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                        &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
+                        &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks],
+                        &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks],
+                        lhs_row,
+                    );
+                    unsafe {
+                        let base = main_ptr.add(quad_idx * 4);
+                        *base = d0;
+                        *base.add(1) = d1;
+                        *base.add(2) = d2;
+                        *base.add(3) = d3;
+                    }
+                }
+            });
+            for (off, dcol) in tail.iter_mut().enumerate() {
+                let col = n_quad + off;
+                *dcol = T::vec_dot(
+                    k,
+                    &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                    lhs_row,
+                );
+            }
+        } else {
+            // Prefill: row-tile keeps an activation tile cache-resident; within each
+            // tile, columns are split across the pool and each weight column is dotted
+            // against a group of up to 8 rows via `_xr` (weight unpack shared/group).
+            struct DstPtr(*mut f32);
+            unsafe impl Sync for DstPtr {}
+            let dst_ptr = DstPtr(dst.as_mut_ptr());
+            let lhs_b: &[T::VecDotType] = &lhs_b;
+            let m_tile = *MATMUL_M_TILE;
+            let cols_per_thread = n.div_ceil(n_total);
+            for row0 in (0..m).step_by(m_tile) {
+                let row1 = (row0 + m_tile).min(m);
+                pool.execute(|tid| {
+                    let c0 = tid * cols_per_thread;
+                    if c0 >= n {
+                        return;
+                    }
+                    let c1 = n.min((tid + 1) * cols_per_thread);
+                    let p = &dst_ptr;
+                    for col_idx in c0..c1 {
+                        let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                        let mut out = [0f32; 8];
+                        let mut r = row0;
+                        while r < row1 {
+                            let nr = (row1 - r).min(8);
+                            let lhs_rows = unsafe { lhs_b.get_unchecked(r * k_in_blocks..) };
+                            T::vec_dot_multi(k, rhs_col, lhs_rows, k_in_blocks, &mut out[..nr]);
+                            for (i, v) in out[..nr].iter().enumerate() {
+                                unsafe { *p.0.add((r + i) * n + col_idx) = *v };
+                            }
+                            r += nr;
+                        }
+                    }
+                });
+            }
+        }
+        if let Some(t) = t_dot {
+            use std::sync::atomic::Ordering::Relaxed;
+            MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            MATMUL_CALLS.fetch_add(1, Relaxed);
+        }
+        return Ok(());
+    }
 
     // Opt-in 2-D tiled prefill (NR=4 × MR=4) via the fused int8 micro-kernel.
     if *MATMUL_INT8_TILE && m > 1 {

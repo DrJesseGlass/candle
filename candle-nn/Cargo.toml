@@ -32,6 +32,10 @@ criterion = { workspace = true }
 
 [features]
 default = []
+# Approximate q·k score with a native-fp16 (f16-accumulating) dot in the decode
+# flash kernel — llama.cpp-style, ~1e-3 rel error, NOT bit-exact. Off by default
+# keeps the f32-accumulating dot.
+f16-attn-dot = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
 cuda = ["candle/cuda"]
 cudnn = ["candle/cudnn"]

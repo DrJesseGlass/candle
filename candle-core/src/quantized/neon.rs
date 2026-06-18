@@ -454,6 +454,102 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
+/// Four-column Q4K×Q8K dot sharing ONE activation (Q8K) load across 4 weight
+/// columns — the LHS-load-once amortization from upstream PR #3627, the mirror of
+/// `_xr` (which shares the *weight* unpack across rows). `xs0..xs3` are 4 weight
+/// columns, `ys` the single activation row; returns `[dot(xs0,ys)..dot(xs3,ys)]`.
+/// Each activation q8 sub-block is loaded once and reused across the 4 weights;
+/// every weight keeps its own nibble unpack, scales and scalar reduction in the
+/// SAME order as `vec_dot_q4k_q8k`, so each result is bit-for-bit identical to it.
+#[inline(always)]
+pub(crate) fn vec_dot_q4k_q8k_4col(n: usize, xs: [&[BlockQ4K]; 4], ys: &[BlockQ8K]) -> [f32; 4] {
+    debug_assert!(
+        n.is_multiple_of(QK_K),
+        "vec_dot_q4k_q8k_4col: {n} is not divisible by {QK_K}"
+    );
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+    let nb = n / QK_K;
+    let mut sumf = [0f32; 4];
+    unsafe {
+        let m4b = vdupq_n_u8(0xF);
+        let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
+
+        for i in 0..nb {
+            let y = ys.get_unchecked(i);
+            let yd = y.d;
+            // Shared activation: q8 block sums for the per-weight `-dmin·Σ(mins·bsums)`.
+            let q8sums = vpaddq_s16(
+                vld1q_s16(y.bsums.as_ptr()),
+                vld1q_s16(y.bsums.as_ptr().add(8)),
+            );
+
+            // Per weight: unpack its 6-bit scales/mins, apply the mins correction
+            // (shared `q8sums`, distinct `mins`), stash its scales + q4 pointer.
+            let mut scales = [[0u8; 16]; 4];
+            let mut q4p = [core::ptr::null::<u8>(); 4];
+            let mut xd = [0f32; 4];
+            for w in 0..4 {
+                let x = xs.get_unchecked(w).get_unchecked(i);
+                let mut utmp = [0u32; 4];
+                LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
+                let mins8 = vld1_u32(
+                    [
+                        utmp[1] & KMASK1,
+                        ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4),
+                    ]
+                    .as_ptr(),
+                );
+                utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+                utmp[0] &= KMASK1;
+                let mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+                let prod = vaddq_s32(
+                    vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)),
+                    vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)),
+                );
+                *sumf.get_unchecked_mut(w) -= yd * x.dmin.to_f32() * vaddvq_s32(prod) as f32;
+                LittleEndian::write_u32_into(&utmp, scales.get_unchecked_mut(w));
+                *q4p.get_unchecked_mut(w) = x.qs.as_ptr();
+                *xd.get_unchecked_mut(w) = yd * x.d.to_f32();
+            }
+
+            // Main dot: per sub-block, load the activation halves ONCE and run the 4
+            // weights through them. Scalar per-(weight,sub-block) reduction = the exact
+            // order of `vec_dot_q4k_q8k`, so per-column results match it bit-for-bit.
+            let mut sumi1 = [0i32; 4];
+            let mut sumi2 = [0i32; 4];
+            let mut q8 = y.qs.as_ptr();
+            for j in 0..QK_K / 64 {
+                let q8lo = vld1q_s8_x2(q8);
+                q8 = q8.add(32);
+                let q8hi = vld1q_s8_x2(q8);
+                q8 = q8.add(32);
+                for w in 0..4 {
+                    let pr = q4p.get_unchecked_mut(w);
+                    let q4bits = vld1q_u8_x2(*pr);
+                    *pr = pr.add(32);
+                    let lo0 = vreinterpretq_s8_u8(vandq_u8(q4bits.0, m4b));
+                    let lo1 = vreinterpretq_s8_u8(vandq_u8(q4bits.1, m4b));
+                    let p_lo = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0, q8lo.0), lo1, q8lo.1);
+                    *sumi1.get_unchecked_mut(w) +=
+                        vaddvq_s32(p_lo) * *scales.get_unchecked(w).get_unchecked(2 * j) as i32;
+                    let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.0, 4));
+                    let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4));
+                    let p_hi = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0, q8hi.0), hi1, q8hi.1);
+                    *sumi2.get_unchecked_mut(w) +=
+                        vaddvq_s32(p_hi) * *scales.get_unchecked(w).get_unchecked(2 * j + 1) as i32;
+                }
+            }
+            for w in 0..4 {
+                *sumf.get_unchecked_mut(w) +=
+                    *xd.get_unchecked(w) * (sumi1[w] + sumi2[w]) as f32;
+            }
+        }
+    }
+    sumf
+}
+
 /// Multi-row Q4K×Q8K dot (R ≤ 4 rows): unpacks each weight superblock once and dots
 /// it against R activation rows. The nibble load/mask/shift work is shared, which is
 /// the dominant non-SDOT cost of the single-row kernel; per-row arithmetic order is

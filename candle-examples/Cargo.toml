@@ -65,6 +65,8 @@ hf-hub = { workspace = true, features = ["tokio"] }
 
 [features]
 default = []
+# f16-accumulating q·k dot in the decode flash kernel (see candle-nn/f16-attn-dot).
+f16-attn-dot = ["candle-nn/f16-attn-dot"]
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",
