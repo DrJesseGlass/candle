@@ -80,6 +80,15 @@ fn main() -> Result<()> {
     let mut file = std::fs::File::open(&args.model)?;
     let content =
         gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
+    // Self-report the KV prealloc (read by the model at construction). The cache grows
+    // on demand, so this is the per-layer initial reservation; size it to the task's
+    // max context to cut idle RAM (~0.11 MB/position for Qwen3-0.6B).
+    let kv_prealloc = std::env::var("CANDLE_KV_PREALLOC")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024);
+    eprintln!("CANDLE_KV_PREALLOC = {kv_prealloc} positions (~{:.0} MB KV)", kv_prealloc as f64 * 0.112);
     let mut model = Qwen3::from_gguf(content, &mut file, &device)?;
 
     let prompt: Vec<u32> = vec![args.token_id; args.pp];

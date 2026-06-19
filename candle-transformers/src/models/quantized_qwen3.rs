@@ -448,9 +448,17 @@ impl AttentionWeights {
             Some(ConcatKvCache::new(2))
         };
         let raw_cache = if on_cpu {
-            // Modest preallocation; the cache doubles itself when a longer
-            // context needs it, and 36-layer models pay this per layer.
-            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 1024))
+            // Per-layer KV prealloc (f16). The cache GROWS on demand, so this is just
+            // the initial reservation; for serverless, size it to the task's expected
+            // max context via CANDLE_KV_PREALLOC to cut idle RAM (each position costs
+            // num_layers * h_kv * d * 2 * 2 bytes; e.g. Qwen3-0.6B ≈ 0.11 MB/position,
+            // so 1024 ≈ 117 MB, 256 ≈ 29 MB). Default 1024 (unchanged).
+            let prealloc = std::env::var("CANDLE_KV_PREALLOC")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1024);
+            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, prealloc))
         } else {
             None
         };
