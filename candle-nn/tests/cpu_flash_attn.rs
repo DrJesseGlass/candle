@@ -131,6 +131,44 @@ fn causal_prefill_with_offset() -> Result<()> {
     assert_close(&out, &expected, 1e-5, "causal_prefill_with_offset")
 }
 
+// Causal prefill with logit soft-capping (exercises the non-lean causal path).
+
+#[test]
+fn causal_prefill_softcap() -> Result<()> {
+    let (h, d, s) = (4, 16, 8);
+    let scale = 1.0 / (d as f32).sqrt();
+    let softcap = 30.0f32;
+    let dev = &Device::Cpu;
+
+    let q = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+
+    // Reference: causal SDPA with Gemma-style logit soft-capping
+    // (softcap * tanh(score / softcap)) applied before the causal mask.
+    let mask: Vec<f32> = (0..s)
+        .flat_map(|i| (0..s).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
+        .collect();
+    let mask = Tensor::from_vec(mask, (1, 1, s, s), dev)?;
+    let att = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?;
+    let att = ((att / softcap as f64)?.tanh()? * softcap as f64)?;
+    let att = att.broadcast_add(&mask)?;
+    let att = candle_nn::ops::softmax_last_dim(&att)?;
+    let expected = att.matmul(&v.clone())?;
+
+    let out = flash_attn::<f32>(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+        AttnMask::causal(),
+        None,
+        Some(softcap),
+    )?;
+
+    assert_close(&out, &expected, 1e-4, "causal_prefill_softcap")
+}
+
 // GQA (fewer KV heads)
 
 #[test]
