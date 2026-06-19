@@ -260,8 +260,12 @@ fn f16kv_headmajor_prefill() -> Result<()> {
     let v = Tensor::randn(0f32, 1f32, (1, h_kv, s, d), dev)?;
 
     // Reference on the f16-rounded K/V so we measure kernel error, not storage error.
-    let k_h = k.to_dtype(candle::DType::F16)?.to_dtype(candle::DType::F32)?;
-    let v_h = v.to_dtype(candle::DType::F16)?.to_dtype(candle::DType::F32)?;
+    let k_h = k
+        .to_dtype(candle::DType::F16)?
+        .to_dtype(candle::DType::F32)?;
+    let v_h = v
+        .to_dtype(candle::DType::F16)?
+        .to_dtype(candle::DType::F32)?;
     let reps = h_q / h_kv;
     let k_exp = k_h
         .reshape((1, h_kv, 1, s, d))?
@@ -281,8 +285,7 @@ fn f16kv_headmajor_prefill() -> Result<()> {
     for h in 0..h_kv {
         for pos in 0..s {
             for t in 0..d {
-                kv[h * head_stride + pos * 2 * d + t] =
-                    f16::from_f32(k_v[h * s * d + pos * d + t]);
+                kv[h * head_stride + pos * 2 * d + t] = f16::from_f32(k_v[h * s * d + pos * d + t]);
                 kv[h * head_stride + pos * 2 * d + d + t] =
                     f16::from_f32(v_v[h * s * d + pos * d + t]);
             }
@@ -297,10 +300,9 @@ fn f16kv_headmajor_prefill() -> Result<()> {
         .flatten_all()?
         .to_vec1()?;
 
-    let out = causal_prefill_f16kv_headmajor(
-        &q_seq, &kv, head_stride, s, h_q, h_kv, d, s, scale, 0,
-    )?
-    .unsqueeze(0)?; // (1, h_q, s, d) to match reference
+    let out =
+        causal_prefill_f16kv_headmajor(&q_seq, &kv, head_stride, s, h_q, h_kv, d, s, scale, 0)?
+            .unsqueeze(0)?; // (1, h_q, s, d) to match reference
 
     assert_close(&out, &expected, 2e-2, "f16kv_headmajor_prefill")
 }
