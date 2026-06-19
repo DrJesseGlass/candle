@@ -221,6 +221,22 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// A zero-width contraction (k == 0) sums over no terms, so every output is zero. The
+// prefill path (m > 1) used to panic here via `par_chunks_mut(0)`; check both the
+// single-row and batched cases produce a zero-filled (m, n) result instead.
+#[test]
+fn quantized_matmul_zero_k() -> Result<()> {
+    for m in [1, 3] {
+        let (k, n) = (0, 4);
+        let lhs = vec![0f32; m * k];
+        let rhs_t = vec![k_quants::BlockQ4_0::zeros(); 0];
+        let mut dst = vec![42f32; m * n];
+        k_quants::matmul((m, k, n), &lhs, &rhs_t, &mut dst)?;
+        assert_eq!(dst, vec![0f32; m * n]);
+    }
+    Ok(())
+}
+
 fn qmm_batch(dev: &Device) -> Result<()> {
     let (lhs, rhs, _mm) = get_random_tensors(2, 256, 6, dev)?;
     let rhs = quantized::QTensor::quantize(&rhs, GgmlDType::Q2K)?;
