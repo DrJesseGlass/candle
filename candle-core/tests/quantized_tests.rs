@@ -1402,34 +1402,33 @@ fn quantized_matmul_q8k() -> Result<()> {
     Ok(())
 }
 
-fn from_data_dequant_matches_canonical_when_caller_passes_cow_owned(device: &Device) -> Result<()> {
-    let cpu = Device::Cpu;
-    let n = 1024usize;
-    let src_data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin()).collect();
-    let src = Tensor::from_vec(src_data, (n,), &cpu)?;
-    let qt_canonical = quantized::QTensor::quantize(&src, GgmlDType::Q4_0)?;
-    let canonical_dequant = qt_canonical.dequantize(&cpu)?.to_vec1::<f32>()?;
-
-    let bytes_owned: Vec<u8> = qt_canonical.data()?.to_vec();
-    let storage = quantized::QStorage::from_data(Cow::Owned(bytes_owned), device, GgmlDType::Q4_0)?;
-    let qt_via_from_data = quantized::QTensor::new(storage, (n,))?;
-    let observed_dequant = qt_via_from_data.dequantize(device)?.to_vec1::<f32>()?;
-
-    let max_diff = canonical_dequant
-        .iter()
-        .zip(observed_dequant.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
-    assert!(
-        max_diff < 1e-5,
-        "QStorage::from_data dequant mismatch on {device:?} (max |Δ| = {max_diff})"
-    );
+/// Round-tripping owned bytes through `QStorage::from_data` must reproduce the
+/// original values. Regression test for a use-after-free where `as_t_slice`
+/// consumed an owned Cow and returned a dangling slice - gathered rows then
+/// dequantized to zeros (or worse, stale heap contents).
+#[test]
+fn qstorage_from_owned_data_roundtrip() -> Result<()> {
+    let cpu = &Device::Cpu;
+    let (rows, k) = (8usize, 512usize);
+    let t = Tensor::randn(0f32, 1f32, (rows, k), cpu)?;
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::Q8_0] {
+        let qt = quantized::QTensor::quantize(&t, dtype)?;
+        let reference = qt.dequantize(cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        // Gather a row range as owned bytes, as a quantized embedding lookup does.
+        let row_bytes = k / dtype.block_size() * dtype.type_size();
+        let data = qt.data()?;
+        for r in 0..rows {
+            let owned = data[r * row_bytes..(r + 1) * row_bytes].to_vec();
+            let storage =
+                quantized::QStorage::from_data(std::borrow::Cow::Owned(owned), cpu, dtype)?;
+            let row = quantized::QTensor::new(storage, (1, k))?
+                .dequantize(cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for (i, (a, b)) in row.iter().zip(&reference[r * k..(r + 1) * k]).enumerate() {
+                assert_eq!(a, b, "mismatch dtype {dtype:?} row {r} idx {i}");
+            }
+        }
+    }
     Ok(())
 }
-
-test_device!(
-    from_data_dequant_matches_canonical_when_caller_passes_cow_owned,
-    from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cpu,
-    from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
-    from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
-);
