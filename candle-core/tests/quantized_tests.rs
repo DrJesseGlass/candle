@@ -228,7 +228,7 @@ fn quantized_matmul_zero_k() -> Result<()> {
     for m in [1, 3] {
         let (k, n) = (0, 4);
         let lhs = vec![0f32; m * k];
-        let rhs_t = vec![k_quants::BlockQ4_0::zeros(); 0];
+        let rhs_t: Vec<k_quants::BlockQ4_0> = Vec::new();
         let mut dst = vec![42f32; m * n];
         k_quants::matmul((m, k, n), &lhs, &rhs_t, &mut dst)?;
         assert_eq!(dst, vec![0f32; m * n]);
