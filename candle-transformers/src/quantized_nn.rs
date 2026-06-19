@@ -35,6 +35,83 @@ impl Module for Embedding {
     }
 }
 
+/// Token embedding that is either a dense f32 table (GPU) or a row-gather over
+/// the quantized weight (CPU; see [`QuantizedEmbedding`]).
+#[derive(Debug, Clone)]
+pub enum EmbedTokens {
+    Full(candle_nn::Embedding),
+    Quantized(QuantizedEmbedding),
+}
+
+impl Module for EmbedTokens {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Full(e) => e.forward(ids),
+            Self::Quantized(e) => e.forward(ids),
+        }
+    }
+}
+
+/// Embedding lookup that keeps the weight quantized, dequantizing only the rows
+/// each forward needs. A 128k-vocab f32 embedding table costs ~1 GB of RSS while
+/// decode reads a single row per token; this keeps the quantized bytes (often
+/// shared with a tied lm_head) as the only copy. CPU only.
+#[derive(Debug, Clone)]
+pub struct QuantizedEmbedding {
+    weight: std::sync::Arc<QTensor>,
+    row_bytes: usize,
+    hidden: usize,
+    span: tracing::Span,
+}
+
+impl QuantizedEmbedding {
+    pub fn from_arc(weight: std::sync::Arc<QTensor>) -> Result<Self> {
+        let (vocab, hidden) = weight.shape().dims2()?;
+        let dtype = weight.dtype();
+        if hidden % dtype.block_size() != 0 {
+            candle::bail!("embedding dim {hidden} not divisible by block size")
+        }
+        let row_bytes = hidden / dtype.block_size() * dtype.type_size();
+        debug_assert_eq!(weight.storage_size_in_bytes(), vocab * row_bytes);
+        let span = tracing::span!(tracing::Level::TRACE, "q-embedding");
+        Ok(Self {
+            weight,
+            row_bytes,
+            hidden,
+            span,
+        })
+    }
+
+    pub fn from_qtensor(weight: QTensor) -> Result<Self> {
+        Self::from_arc(std::sync::Arc::new(weight))
+    }
+}
+
+impl Module for QuantizedEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let dims = ids.dims().to_vec();
+        let ids = ids.flatten_all()?.to_vec1::<u32>()?;
+        // Gather the quantized rows, dequantize them as one small QTensor.
+        let data = self.weight.data()?; // zero-copy borrow on CPU
+        let mut rows = Vec::with_capacity(ids.len() * self.row_bytes);
+        for &id in &ids {
+            let off = id as usize * self.row_bytes;
+            rows.extend_from_slice(&data[off..off + self.row_bytes]);
+        }
+        let storage = candle::quantized::QStorage::from_data(
+            std::borrow::Cow::Owned(rows),
+            &candle::Device::Cpu,
+            self.weight.dtype(),
+        )?;
+        let gathered = QTensor::new(storage, (ids.len(), self.hidden))?;
+        let emb = gathered.dequantize(&candle::Device::Cpu)?;
+        let mut out_dims = dims;
+        out_dims.push(self.hidden);
+        emb.reshape(out_dims)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Linear {
     weight: QMatMul,

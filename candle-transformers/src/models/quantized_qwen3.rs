@@ -7,12 +7,14 @@
 //! - [Qwen3 Models](https://huggingface.co/Qwen/Qwen3-0.6B) (architecture based on official implementations)
 //!
 use super::with_tracing::QMatMul;
-use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
+use crate::quantized_nn::{EmbedTokens, QuantizedEmbedding, RmsNorm};
+use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QTensor};
-use candle::{DType, Device, Result, Storage, Tensor};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
-use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle::{DType, Device, Result, Storage, Tensor, D};
+use candle_nn::attention::cpu_flash::causal::{
+    causal_decode_f16kv_interleaved, causal_prefill_f16kv_headmajor,
+};
+use candle_nn::kv_cache::{ConcatKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -47,10 +49,55 @@ impl<R: Read + Seek> Gguf<R> {
     }
 }
 
+/// Two projections of the same input, fused into one quantized matmul when their
+/// weights share a dtype. Rows are quantized independently in every ggml format, so
+/// the fusion is a bit-exact row concatenation; it halves the dispatch / fork-join
+/// cost and shares one activation quantization. CPU only; other devices keep the
+/// split projections.
+#[derive(Debug, Clone)]
+enum FusedPairProj {
+    Fused { proj: QMatMul, n1: usize, n2: usize },
+    Split(QMatMul, QMatMul),
+}
+
+impl FusedPairProj {
+    fn load<R: Read + Seek>(gg: &mut Gguf<R>, name1: &str, name2: &str) -> Result<Self> {
+        let t1 = gg.tensor(name1)?;
+        let t2 = gg.tensor(name2)?;
+        let (n1, k1) = t1.shape().dims2()?;
+        let (n2, k2) = t2.shape().dims2()?;
+        if gg.device.is_cpu() && t1.dtype() == t2.dtype() && k1 == k2 {
+            let fused = QTensor::cat_rows(&[&t1, &t2])?;
+            Ok(Self::Fused {
+                proj: QMatMul::from_weights(fused.into())?,
+                n1,
+                n2,
+            })
+        } else {
+            Ok(Self::Split(
+                QMatMul::from_weights(t1.into())?,
+                QMatMul::from_weights(t2.into())?,
+            ))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Fused { proj, n1, n2 } => {
+                let y = proj.forward(x)?;
+                Ok((
+                    y.narrow(D::Minus1, 0, *n1)?.contiguous()?,
+                    y.narrow(D::Minus1, *n1, *n2)?.contiguous()?,
+                ))
+            }
+            Self::Split(p1, p2) => Ok((p1.forward(x)?, p2.forward(x)?)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MlpWeights {
-    gate_proj: QMatMul,
-    up_proj: QMatMul,
+    gate_up: FusedPairProj,
     down_proj: QMatMul,
     act_fn: Activation,
     span: tracing::Span,
@@ -58,14 +105,16 @@ struct MlpWeights {
 
 impl MlpWeights {
     fn new<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str) -> Result<Self> {
-        let gate_proj = gg.qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
-        let up_proj = gg.qmatmul(&format!("{prefix}.ffn_up.weight"))?;
+        let gate_up = FusedPairProj::load(
+            gg,
+            &format!("{prefix}.ffn_gate.weight"),
+            &format!("{prefix}.ffn_up.weight"),
+        )?;
         let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
         let act_fn = Activation::Silu;
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up,
             down_proj,
             act_fn,
             span,
@@ -76,8 +125,8 @@ impl MlpWeights {
 impl Module for MlpWeights {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?;
-        let up = self.up_proj.forward(x)?;
+        let (gate, up) = self.gate_up.forward(x)?;
+        let gate = gate.apply(&self.act_fn)?;
         let gated = (gate * up)?;
         self.down_proj.forward(&gated)
     }
@@ -205,8 +254,7 @@ impl RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 struct AttentionWeights {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
+    qk_proj: FusedPairProj,
     v_proj: QMatMul,
     o_proj: QMatMul,
     q_norm: RmsNorm,
@@ -218,7 +266,6 @@ struct AttentionWeights {
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<ConcatKvCache>,
-    interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
 }
@@ -238,8 +285,13 @@ impl AttentionWeights {
         let num_kv_groups = num_heads / num_kv_heads;
         let hidden_size = num_heads * head_dim;
 
-        let q_proj = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
-        let k_proj = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
+        // attn_v is often promoted to a wider quant (e.g. Q6_K in *_M files), so only
+        // q/k - which share a dtype - are fused; v stays separate.
+        let qk_proj = FusedPairProj::load(
+            gg,
+            &format!("{prefix}.attn_q.weight"),
+            &format!("{prefix}.attn_k.weight"),
+        )?;
         let v_proj = gg.qmatmul(&format!("{prefix}.attn_v.weight"))?;
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
 
@@ -254,13 +306,18 @@ impl AttentionWeights {
         } else {
             Some(ConcatKvCache::new(2))
         };
-        let interleaved_cache = if on_cpu {
-            Some(InterleavedKvCache::new(head_dim))
-        } else {
-            None
-        };
         let raw_cache = if on_cpu {
-            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 4096))
+            // Per-layer KV prealloc (f16). The cache GROWS on demand, so this is just
+            // the initial reservation; for serverless, size it to the task's expected
+            // max context via CANDLE_KV_PREALLOC to cut idle RAM (each position costs
+            // num_layers * h_kv * d * 2 * 2 bytes; e.g. Qwen3-0.6B ~ 0.11 MB/position,
+            // so 1024 ~ 117 MB, 256 ~ 29 MB). Default 1024 (unchanged).
+            let prealloc = std::env::var("CANDLE_KV_PREALLOC")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1024);
+            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, prealloc))
         } else {
             None
         };
@@ -268,8 +325,7 @@ impl AttentionWeights {
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
         Ok(Self {
-            q_proj,
-            k_proj,
+            qk_proj,
             v_proj,
             o_proj,
             q_norm,
@@ -281,7 +337,6 @@ impl AttentionWeights {
             hidden_size,
             rotary_emb,
             kv_cache,
-            interleaved_cache,
             raw_cache,
             span_attn,
         })
@@ -291,9 +346,8 @@ impl AttentionWeights {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
 
-        // QKV projections
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
+        // QKV projections (q/k in one fused matmul when dtypes match)
+        let (q, k) = self.qk_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         let q = q
@@ -352,58 +406,65 @@ impl AttentionWeights {
                 // Run interleaved decode kernel
                 let kv_len = rc.len();
                 let q_len = self.num_heads * self.head_dim;
-                let ctx = causal_decode_f16kv_interleaved(
-                    &q_data[..q_len],
-                    rc.data(),
-                    rc.head_stride(),
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    kv_len,
-                    scale,
-                )?;
+                let ctx = {
+                    let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
+                    causal_decode_f16kv_interleaved(
+                        &q_data[..q_len],
+                        rc.data(),
+                        rc.head_stride(),
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        kv_len,
+                        scale,
+                    )?
+                };
 
                 let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             } else {
-                // Prefill: interleaved cache + flash_attn; also populate raw cache for decode.
-                let ic = self.interleaved_cache.as_mut().unwrap();
-                let kv = ic.append(&k, &v)?;
+                // Prefill: write the f16 raw cache, then run causal flash directly
+                // over it - the same cache decode reads, so there is no separate
+                // f32 KV copy and no per-layer cat of the full cache.
+                let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                let (kg, kl) = k_cont.storage_and_layout();
+                let k_d: &[f32] = match &*kg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
+                let (vg, vl) = v_cont.storage_and_layout();
+                let v_d: &[f32] = match &*vg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
+                let rc = self.raw_cache.as_mut().unwrap();
+                rc.write_kv_batch(k_d, v_d, l);
+                let kv_len = rc.len();
 
-                // Populate raw cache for subsequent decode steps
-                {
-                    let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                    let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-                    let (kg, kl) = k_cont.storage_and_layout();
-                    let k_d: &[f32] = match &*kg {
-                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
-                    };
-                    let (vg, vl) = v_cont.storage_and_layout();
-                    let v_d: &[f32] = match &*vg {
-                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
-                        _ => candle::bail!("Expected CPU"),
-                    };
-                    self.raw_cache.as_mut().unwrap().write_kv_batch(k_d, v_d, l);
-                }
+                let q_t = q.transpose(1, 2)?.contiguous()?; // (b, l, h_q, d)
+                let (qg, ql) = q_t.storage_and_layout();
+                let q_d: &[f32] = match &*qg {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[ql.start_offset()..],
+                    _ => candle::bail!("Expected CPU"),
+                };
 
-                let kv_k = kv.narrow(2, 0, self.head_dim)?.unsqueeze(0)?;
-                let kv_v = kv.narrow(2, self.head_dim, self.head_dim)?.unsqueeze(0)?;
-
-                let q = q.transpose(1, 2)?.contiguous()?;
-                let k = kv_k.contiguous()?;
-                let v = kv_v.contiguous()?;
-
-                let ctx = flash_attn::<f32>(
-                    &q,
-                    &k,
-                    &v,
-                    scale,
-                    AttnMask::causal_with_offset(offset),
-                    None,
-                    None,
-                )?;
-                let ctx = ctx.transpose(1, 2)?;
+                let ctx = {
+                    let _flash = tracing::span!(tracing::Level::TRACE, "flash").entered();
+                    causal_prefill_f16kv_headmajor(
+                        &q_d[..l * self.num_heads * self.head_dim],
+                        rc.data(),
+                        rc.head_stride(),
+                        l,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        kv_len,
+                        scale,
+                        offset,
+                    )?
+                };
+                let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             }
         } else {
@@ -433,9 +494,6 @@ impl AttentionWeights {
 
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
-            c.reset();
-        }
-        if let Some(c) = &mut self.interleaved_cache {
             c.reset();
         }
         if let Some(c) = &mut self.raw_cache {
@@ -503,7 +561,7 @@ impl LayerWeights {
 
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
-    embed_tokens: Embedding,
+    embed_tokens: EmbedTokens,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -543,8 +601,15 @@ impl ModelWeights {
             None => DType::F16,
         };
 
-        let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
+        let embed_tokens = if device.is_cpu() {
+            EmbedTokens::Quantized(QuantizedEmbedding::from_arc(embed_tensor.clone())?)
+        } else {
+            EmbedTokens::Full(Embedding::new(
+                embed_tensor.dequantize(device)?,
+                hidden_size,
+            ))
+        };
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
@@ -569,12 +634,12 @@ impl ModelWeights {
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        // Load output projection tensor, falling back to tied embeddings like gemma3
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
+        // Load output projection tensor, falling back to tied embeddings like gemma3;
+        // the tied case shares the quantized bytes already held by embed_tokens.
+        let lm_head = match gg.tensor("output.weight") {
+            Ok(tensor) => QMatMul::from_weights(tensor.into())?,
+            Err(_) => QMatMul::from_weights(embed_tensor.clone())?,
         };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
@@ -620,8 +685,10 @@ impl ModelWeights {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
-        // Skip mask materialization when using CPU flash attention
-        let causal_mask = if l == 1 || self.device.is_cpu() {
+        // Skip mask materialization only when the CPU flash path will actually
+        // run (it requires b == 1); batched CPU falls back to standard attention,
+        // which needs the causal mask.
+        let causal_mask = if l == 1 || (self.device.is_cpu() && b == 1) {
             None
         } else {
             Some(self.causal_mask(b, l, offset, None)?)
