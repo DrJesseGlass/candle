@@ -2,7 +2,7 @@
 //! methodology so candle and llama.cpp numbers are comparable:
 //!   - prefill (pp): one forward over a dummy prompt of `--pp` tokens.
 //!   - decode  (tg): `--tg` greedy single-token forwards.
-//! No tokenizer, no sampling, no repeat penalty — raw model throughput only.
+//! No tokenizer, no sampling, no repeat penalty - raw model throughput only.
 //! Reports median tokens/s over `--reps` measured runs (after `--warmup`).
 //!
 //! Pair with thread pinning to simulate a Lambda tier, e.g.:
@@ -244,12 +244,12 @@ rope {:.1}ms ({:.1}%) + copy {:.1}ms ({:.1}%) + glue {:.1}ms ({:.1}%)",
         // qmatmul_fwd = full QMatMul::forward (dispatch + dot + quant). dispatch =
         // the per-op Tensor machinery (apply_op1/cpu_fwd allocs/from_storage) =
         // fwd - dot - quant. It lives inside "matmul_dot+quant" timing-wise but is
-        // NOT the kernel — this isolates it.
+        // NOT the kernel - this isolates it.
         let fwd = tg_fwd_ns as f64;
         let dispatch = (fwd - dot - quant).max(0.0);
         let pct = |x: f64| 100.0 * x / wall;
         eprintln!(
-            "\n[decode profile over {} reps × {} tok]  wall={:.1}ms\n  \
+            "\n[decode profile over {} reps x {} tok]  wall={:.1}ms\n  \
 matmul_dot={:.1}ms ({:.1}%)  matmul_quant={:.1}ms ({:.1}%)\n  \
 qmatmul_fwd_total={:.1}ms ({:.1}%)  => DISPATCH overhead={:.1}ms ({:.1}%)\n  \
 REST={:.1}ms ({:.1}%) = flash {:.1}ms ({:.1}%) + norm {:.1}ms ({:.1}%) + \

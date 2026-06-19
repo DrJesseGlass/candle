@@ -31,8 +31,8 @@ rand_distr = { workspace = true }
 criterion = { workspace = true }
 
 [features]
-# f16-attn-dot ON by default: native-fp16 (f16-accumulating) q·k dot in the decode
-# flash kernel — +1.4% N1 decode, greedy-text coherent. NOT bit-exact (~1e-3 rel);
+# f16-attn-dot ON by default: native-fp16 (f16-accumulating) q.k dot in the decode
+# flash kernel - +1.4% N1 decode, greedy-text coherent. NOT bit-exact (~1e-3 rel);
 # build --no-default-features (or drop it) to restore the f32-accumulating dot.
 default = ["f16-attn-dot"]
 f16-attn-dot = []

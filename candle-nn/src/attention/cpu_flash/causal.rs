@@ -364,7 +364,7 @@ pub fn causal_decode_f16kv_interleaved(
 
         // `f16-attn-dot`: narrow this kv-head's `rk` query rows to f16 ONCE here
         // (amortized over all `kv_len` positions), so the inner score is a pure
-        // f16·f16 dot. Default build skips this entirely.
+        // f16.f16 dot. Default build skips this entirely.
         #[cfg(feature = "f16-attn-dot")]
         let q_f16: Vec<half::f16> = {
             let base = kv_h * rk * d;
@@ -414,7 +414,7 @@ pub fn causal_decode_f16kv_interleaved(
         }
     };
 
-    // Single-thread pool (the common Lambda 1-vCPU tier) — only ~h_kv tiny tasks,
+    // Single-thread pool (the common Lambda 1-vCPU tier) - only ~h_kv tiny tasks,
     // so the rayon split/join machinery is pure per-call overhead. Run serially.
     // (A/B-gated: CANDLE_FLASH_SERIAL=0 forces the rayon path.)
     static FLASH_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {

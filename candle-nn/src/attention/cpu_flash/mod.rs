@@ -86,11 +86,11 @@ pub(crate) fn dot_f32_f16(a: &[f32], b: &[half::f16]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y.to_f32()).sum()
 }
 
-/// Dot product of two f16 rows with **f16 accumulation** (q·k score).
+/// Dot product of two f16 rows with **f16 accumulation** (q.k score).
 ///
-/// `f16-attn-dot` feature only — NOT bit-exact. This is the llama.cpp-style
+/// `f16-attn-dot` feature only - NOT bit-exact. This is the llama.cpp-style
 /// approximation: both operands stream as f16 and the FMA runs in native fp16
-/// (`fmla .8h`, 8 lanes/instr, FEAT_FP16 — present on Neoverse-N1), so there is
+/// (`fmla .8h`, 8 lanes/instr, FEAT_FP16 - present on Neoverse-N1), so there is
 /// no in-loop `fcvtl` widening and twice the lanes per instruction vs the f32
 /// path. The accumulator is f16, so a head_dim-long sum loses low-order bits
 /// (~1e-3 rel); softmax + greedy argmax absorb it (verified: identical text).

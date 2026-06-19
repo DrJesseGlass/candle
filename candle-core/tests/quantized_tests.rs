@@ -1405,7 +1405,7 @@ fn quantized_matmul_q8k() -> Result<()> {
 
 /// Round-tripping owned bytes through `QStorage::from_data` must reproduce the
 /// original values. Regression test for a use-after-free where `as_t_slice`
-/// consumed an owned Cow and returned a dangling slice — gathered rows then
+/// consumed an owned Cow and returned a dangling slice - gathered rows then
 /// dequantized to zeros (or worse, stale heap contents).
 #[test]
 fn qstorage_from_owned_data_roundtrip() -> Result<()> {

@@ -3,8 +3,8 @@
 //! Recent llama.cpp beats a per-row Q4_K dot kernel on aarch64 by repacking the
 //! weight matrix into an 8-row-interleaved layout (`block_q4_Kx8`) with the 6-bit
 //! scales/mins pre-unpacked, then running dedicated SDOT (and i8mm) GEMM kernels
-//! over it. This module is candle's own take on that idea — designed to fit
-//! `GgmlType` cleanly rather than mirror ggml's byte layout — with llama.cpp's
+//! over it. This module is candle's own take on that idea - designed to fit
+//! `GgmlType` cleanly rather than mirror ggml's byte layout - with llama.cpp's
 //! `make_block_q4_Kx8` kept as a fallback reference if this layout underperforms.
 //!
 //! Step 1 (this file): the packed type + repack-on-load + integer-exact extraction
@@ -31,10 +31,10 @@ pub(crate) const CHUNKS: usize = QK_K / 64; // 4
 /// - `d`/`dmin`: per-row super-block scales, kept as f16 (no precision change).
 /// - `scales`/`mins`: the 6-bit values **pre-unpacked to bytes**, indexed
 ///   `[row * SUBBLOCKS + sub]`. This removes the per-call 6-bit bit-twiddle from
-///   the inner loop — one of the two structural wins of repacking.
+///   the inner loop - one of the two structural wins of repacking.
 /// - `qs`: 4-bit quants kept packed, reorganized to `[chunk][row][32 bytes]`
 ///   (`j * (Q4KX8_ROWS*32) + r*32 + b`) so the kernel streams all 8 rows' data
-///   for a chunk from one contiguous 256-byte run — the second win.
+///   for a chunk from one contiguous 256-byte run - the second win.
 #[repr(C)]
 #[derive(Clone)]
 pub struct BlockQ4Kx8 {
@@ -84,7 +84,7 @@ pub(crate) fn q4k_unpack_scales_mins(packed: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
 
 /// Repack `Q4KX8_ROWS` weight rows (each `nb` Q4_K super-blocks long) into `nb`
 /// interleaved `BlockQ4Kx8`. Rows are output channels of the weight matrix; all
-/// eight must have the same super-block count. Done once at load — not perf
+/// eight must have the same super-block count. Done once at load - not perf
 /// critical, so it uses the scalar scale/min unpack.
 pub(crate) fn repack_q4k_x8(rows: &[&[BlockQ4K]; Q4KX8_ROWS]) -> Vec<BlockQ4Kx8> {
     let nb = rows[0].len();
@@ -116,7 +116,7 @@ pub(crate) fn repack_q4k_x8(rows: &[&[BlockQ4K]; Q4KX8_ROWS]) -> Vec<BlockQ4Kx8>
 // Laneq layout (N1 parity path): 8 columns interleaved 8 bytes at a time, with
 // the 6-bit scales/mins repacked into a 96-byte block aligned for a vector load.
 // This is the byte layout llama.cpp's arm `ggml_gemm_q4_K_8x8_q8_K` consumes via
-// `vdotq_laneq_s32` — chosen because that lane-broadcast kernel reaches llama's
+// `vdotq_laneq_s32` - chosen because that lane-broadcast kernel reaches llama's
 // N1 speed (our earlier separate-channel BlockQ4Kx8 can't feed laneq). Ported
 // from llama's `make_block_q4_Kx8` (blck_size_interleave = 8); the matching laneq
 // GEMM lands next. Distinct from BlockQ4Kx8 (kept for the shipped +25% path).
@@ -264,14 +264,14 @@ pub(crate) fn packed_q4k_applicable(k: usize, n: usize) -> bool {
     k % QK_K == 0 && n % Q4KX8_ROWS == 0
 }
 
-/// `dst(m,n) = lhs(m,k) × rhs_q4k(n,k)^T` via the interleaved packed SDOT kernels.
+/// `dst(m,n) = lhs(m,k) x rhs_q4k(n,k)^T` via the interleaved packed SDOT kernels.
 /// Activations are quantized to Q8K here (as the baseline does). Weights are
 /// repacked once and cached. Parallelized over 8-channel groups on `pool`. Decode
-/// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot —
+/// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot -
 /// MR=4 spills) with a 1-row remainder. Bit-identical to baseline `matmul`.
-/// Prefill tile strategy for the packed GEMM. `nc4mr4` (DEFAULT): two 4-channel ×
-/// 4-row calls per group (16 acc each, most activation reuse without spilling —
-/// measured best on N1). `nc8mr2`: one 8-channel × 2-row call (16 acc). Override
+/// Prefill tile strategy for the packed GEMM. `nc4mr4` (DEFAULT): two 4-channel x
+/// 4-row calls per group (16 acc each, most activation reuse without spilling -
+/// measured best on N1). `nc8mr2`: one 8-channel x 2-row call (16 acc). Override
 /// with `CANDLE_PACKED_PREFILL=nc8mr2`.
 static PACKED_PREFILL_NC4: LazyLock<bool> = LazyLock::new(|| {
     !std::env::var("CANDLE_PACKED_PREFILL")
@@ -293,9 +293,9 @@ pub(crate) fn matmul_q4k_packed(
 }
 
 /// GEMM over an already-interleaved `BlockQ4Kx8` weight (no repack/cache step):
-/// `dst(m,n) = lhs(m,k) × W^T`, `packed` holding the `n/8` channel groups
+/// `dst(m,n) = lhs(m,k) x W^T`, `packed` holding the `n/8` channel groups
 /// (`nb = k/256` blocks each, group g at `g*nb`). Activations are quantized to Q8K
-/// here. Identical inner kernels/tiling to `matmul_q4k_packed` — split out so a
+/// here. Identical inner kernels/tiling to `matmul_q4k_packed` - split out so a
 /// pre-packed (offline-baked) weight can drive the same SDOT GEMM. Bit-exact.
 #[cfg(target_feature = "neon")]
 pub(crate) fn matmul_q4kx8_prepacked(
@@ -329,7 +329,7 @@ pub(crate) fn matmul_q4kx8_prepacked(
             let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
             let mut r = 0;
             if use_nc4 {
-                // nc4mr4: 4 rows × {channels 0..4, 4..8} per call.
+                // nc4mr4: 4 rows x {channels 0..4, 4..8} per call.
                 while r + 4 <= m {
                     let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
                     for half in 0..2 {
@@ -373,8 +373,8 @@ pub(crate) fn matmul_q4kx8_prepacked(
 // ===========================================================================
 // Pre-packed Q4_Kx8 as a first-class quantized storage type (GgmlDType::Q4Kx8).
 //
-// The interleaved BlockQ4Kx8 layout — normally produced by repack-on-load and
-// cached — can instead be baked into a GGUF offline (see the gguf-requant
+// The interleaved BlockQ4Kx8 layout - normally produced by repack-on-load and
+// cached - can instead be baked into a GGUF offline (see the gguf-requant
 // `--pack` flag) and loaded as a SINGLE copy with no runtime repack. Owned or
 // mmap-backed; the mmap path is zero-copy (GGUF tensors are 32-aligned, which
 // covers BlockQ4Kx8's f16/u8 alignment of 2).
@@ -732,7 +732,7 @@ mod tests {
         check!(2);
         check!(4);
 
-        // NC=4 halves (c_off 0 and 4), MR=4 — the nc4mr4 prefill path.
+        // NC=4 halves (c_off 0 and 4), MR=4 - the nc4mr4 prefill path.
         use crate::quantized::neon::gemm_q4kx_q8k;
         for c_off in [0usize, 4usize] {
             let ys: [&[BlockQ8K]; 4] = std::array::from_fn(|a| aq[a].as_slice());
@@ -918,7 +918,7 @@ mod tests {
             2.0 * ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
 
-        // Weights: n output channels × k, quantized. Baseline rhs_t is row-major
+        // Weights: n output channels x k, quantized. Baseline rhs_t is row-major
         // (channel r at r*nb). Packed is channel-group-major (group g at g*nb).
         let mut rhs_t = vec![BlockQ4K::zeros(); n * nb];
         for r in 0..n {

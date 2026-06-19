@@ -112,7 +112,7 @@ fn requant_dtype(env: &str) -> Option<candle::quantized::GgmlDType> {
     }
 }
 
-/// Requantize a weight QTensor to `target` (dequant→quant). NOT bit-exact.
+/// Requantize a weight QTensor to `target` (dequant->quant). NOT bit-exact.
 fn requant_qt(
     qt: std::sync::Arc<QTensor>,
     device: &Device,
@@ -133,7 +133,7 @@ fn requant_qt(
 }
 
 /// lm_head requant target: its own knob, falling back to the whole-model knob.
-/// `CANDLE_REQUANT_LMHEAD` ∈ {q4k,q5k,q3k,q4_0}, else `CANDLE_REQUANT_WEIGHTS`.
+/// `CANDLE_REQUANT_LMHEAD` in {q4k,q5k,q3k,q4_0}, else `CANDLE_REQUANT_WEIGHTS`.
 fn requant_lmhead(qt: std::sync::Arc<QTensor>, device: &Device) -> Result<std::sync::Arc<QTensor>> {
     let target = requant_dtype("CANDLE_REQUANT_LMHEAD").or_else(|| requant_dtype("CANDLE_REQUANT_WEIGHTS"));
     requant_qt(qt, device, target)
@@ -164,7 +164,7 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
-    /// Load one tensor — zero-copy from the mmap when present, else read into a Vec.
+    /// Load one tensor - zero-copy from the mmap when present, else read into a Vec.
     fn load_tensor(&mut self, name: &str) -> Result<QTensor> {
         match &self.mmap {
             Some(m) => self.ct.tensor_mmap(m, name),
@@ -174,7 +174,7 @@ impl<R: Read + Seek> Gguf<R> {
 
     pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         let ws = self.load_tensor(name)?;
-        // Whole-model weight requant (CANDLE_REQUANT_WEIGHTS) — BW lever, not bit-exact.
+        // Whole-model weight requant (CANDLE_REQUANT_WEIGHTS) - BW lever, not bit-exact.
         let qt = requant_qt(
             std::sync::Arc::new(ws),
             &self.device,
@@ -354,7 +354,7 @@ impl RotaryEmbedding {
 
     /// Fused neox RoPE on a CPU f32 tensor (B x H x L x D), bit-identical to
     /// `candle_nn::rotary_emb::rope` but on raw slices with the precomputed f32
-    /// cos/sin — no intermediate cos/sin tensors, no apply_op3 dispatch.
+    /// cos/sin - no intermediate cos/sin tensors, no apply_op3 dispatch.
     fn rope_neox_f32(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
         use candle::Storage;
         let (b, h, t, d) = x.dims4()?;
@@ -427,7 +427,7 @@ impl AttentionWeights {
         let hidden_size = num_heads * head_dim;
 
         // attn_v is often promoted to a wider quant (e.g. Q6_K in *_M files), so only
-        // q/k — which share a dtype — are fused; v stays separate.
+        // q/k - which share a dtype - are fused; v stays separate.
         let qk_proj = FusedPairProj::load(
             gg,
             &format!("{prefix}.attn_q.weight"),
@@ -451,8 +451,8 @@ impl AttentionWeights {
             // Per-layer KV prealloc (f16). The cache GROWS on demand, so this is just
             // the initial reservation; for serverless, size it to the task's expected
             // max context via CANDLE_KV_PREALLOC to cut idle RAM (each position costs
-            // num_layers * h_kv * d * 2 * 2 bytes; e.g. Qwen3-0.6B ≈ 0.11 MB/position,
-            // so 1024 ≈ 117 MB, 256 ≈ 29 MB). Default 1024 (unchanged).
+            // num_layers * h_kv * d * 2 * 2 bytes; e.g. Qwen3-0.6B ~ 0.11 MB/position,
+            // so 1024 ~ 117 MB, 256 ~ 29 MB). Default 1024 (unchanged).
             let prealloc = std::env::var("CANDLE_KV_PREALLOC")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -565,7 +565,7 @@ impl AttentionWeights {
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             } else {
                 // Prefill: write the f16 raw cache, then run causal flash directly
-                // over it — the same cache decode reads, so there is no separate
+                // over it - the same cache decode reads, so there is no separate
                 // f32 KV copy and no per-layer cat of the full cache.
                 let k_cont = timed(&COPY_NS, || k.squeeze(0)?.transpose(0, 1)?.contiguous())?;
                 let v_cont = timed(&COPY_NS, || v.squeeze(0)?.transpose(0, 1)?.contiguous())?;
@@ -722,7 +722,7 @@ impl ModelWeights {
     }
 
     /// Like [`from_gguf`](Self::from_gguf) but loads tensors zero-copy from a
-    /// memory-mapped view of the file — lower load time and resident memory, ideal
+    /// memory-mapped view of the file - lower load time and resident memory, ideal
     /// for serverless cold starts. The `Arc<Mmap>` is held by the weights.
     pub fn from_gguf_mmap<R: Read + Seek>(
         ct: gguf_file::Content,
@@ -801,7 +801,7 @@ impl ModelWeights {
         // the tied case shares the quantized bytes already held by embed_tokens.
         // The lm_head is ~36% of the decode weight stream (Q6_K); decode is BW-bound,
         // so CANDLE_REQUANT_LMHEAD=q4k|q5k|q3k|q4_0 requantizes it lower to cut that BW
-        // (NOT bit-exact — shifts logits slightly; greedy text checked separately).
+        // (NOT bit-exact - shifts logits slightly; greedy text checked separately).
         // The input-embedding copy stays Q6_K (a cheap lookup, no BW benefit to change).
         let lm_head = match gg.tensor("output.weight") {
             Ok(tensor) => QMatMul::from_weights(requant_lmhead(std::sync::Arc::new(tensor), device)?)?,

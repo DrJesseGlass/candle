@@ -90,11 +90,11 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
         }
     }
 
-    /// Compute a `cols.len()` × `rows.len()` output tile: weight column `c` dotted
+    /// Compute a `cols.len()` x `rows.len()` output tile: weight column `c` dotted
     /// against activation row `r`, written to `dst[c * rows.len() + r]`. The default
     /// loops `vec_dot`; SIMD backends override it with a 2-D register-blocked kernel
     /// that reuses BOTH operands (weight unpack across rows, activation load across
-    /// columns) — the GEMM micro-kernel. Must stay numerically identical to `vec_dot`.
+    /// columns) - the GEMM micro-kernel. Must stay numerically identical to `vec_dot`.
     fn vec_dot_tile(n: usize, cols: &[&[Self]], rows: &[&[Self::VecDotType]], dst: &mut [f32]) {
         let nrows = rows.len();
         for (c, col) in cols.iter().enumerate() {
@@ -1420,10 +1420,10 @@ impl GgmlType for BlockQ4K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
-    /// 4 weight columns × 1 activation row, sharing the activation (Q8K) load
+    /// 4 weight columns x 1 activation row, sharing the activation (Q8K) load
     /// (PR #3627's `vec_dot_4`). NEON kernel mirrors `vec_dot`'s SDOT chain per
     /// column, so each result is bit-identical to `vec_dot`. Used by the BarrierPool
-    /// matmul path; the default (4× `vec_dot`) covers non-NEON targets.
+    /// matmul path; the default (4x `vec_dot`) covers non-NEON targets.
     #[cfg(target_feature = "neon")]
     fn vec_dot_4(
         n: usize,
@@ -1439,7 +1439,7 @@ impl GgmlType for BlockQ4K {
 
     /// Groups rows through the multi-row NEON kernel so each weight superblock is
     /// unpacked once per group instead of once per row. Group width is capped by
-    /// `CANDLE_Q4K_XR_R` (2..=8); a descending 8→4→2→1 ladder settles the remainder.
+    /// `CANDLE_Q4K_XR_R` (2..=8); a descending 8->4->2->1 ladder settles the remainder.
     /// One weight column => 4 nibble vectors shared across the group, so R=8 fits
     /// N1's register file (unlike the 2-D tile). Bit-identical to `vec_dot`.
     #[cfg(target_feature = "neon")]
@@ -1518,7 +1518,7 @@ impl GgmlType for BlockQ4K {
             (1, 4) => k!(1, 4),
             _ => {}
         }
-        // Edge tiles (partial group at the matrix boundary) and 1×1: scalar.
+        // Edge tiles (partial group at the matrix boundary) and 1x1: scalar.
         let nrows = rows.len();
         for (c, col) in cols.iter().enumerate() {
             for (r, rrow) in rows.iter().enumerate() {
@@ -2440,9 +2440,9 @@ static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| 
         .unwrap_or(128)
 });
 
-// Rows per prefill tile. The Q8K activation tile (m_tile × k/256 × 292 B) should stay
+// Rows per prefill tile. The Q8K activation tile (m_tile x k/256 x 292 B) should stay
 // cache-resident while each weight column streams once per tile instead of once per row;
-// 64 rows × 12.5 KB (k=11008) ≈ 800 KB, inside a 1-2 MB L2.
+// 64 rows x 12.5 KB (k=11008) ~ 800 KB, inside a 1-2 MB L2.
 static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_MATMUL_M_TILE")
         .ok()
@@ -2454,7 +2454,7 @@ static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
 // Max row-group width for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`)
 // inside `vec_dot_multi`. R=2 was the Cortex-X925 default; N1 has 32 regs and one
 // weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
-// and amortize the unpack further. `vec_dot_multi` uses a descending 8→4→2→1
+// and amortize the unpack further. `vec_dot_multi` uses a descending 8->4->2->1
 // ladder capped here. Clamped to 2..=8; default 4 (the validated N1 win).
 static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_Q4K_XR_R")
@@ -2474,9 +2474,9 @@ static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
 });
 
 // Opt-in: route Q4_K matmuls through the interleaved packed SDOT kernels
-// (`repack::matmul_q4k_packed`). RUNTIME repack — keeps BOTH the Q4_K and repacked
+// (`repack::matmul_q4k_packed`). RUNTIME repack - keeps BOTH the Q4_K and repacked
 // copies resident (+~250MB). SUPERSEDED by the baked Q4Kx8 format (gguf-requant
-// --pack): bake the packed layout offline → single copy, same speed, −160MB RAM,
+// --pack): bake the packed layout offline -> single copy, same speed, -160MB RAM,
 // no repack-on-first-use. So DEFAULT OFF; set CANDLE_MATMUL_PACKED_Q4K=1 only to
 // runtime-pack a plain Q4_K model (speed at the +250MB memory cost). Bit-exact.
 static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -2493,9 +2493,9 @@ static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 
 // Upstream PR #3627 matmul threading: persistent BarrierPool REPLACES rayon as the
 // sole matmul pool (busy-spins, so it can't coexist with rayon). Decode (m==1, multi)
-// → vec_dot_4 column-quads; 1-vCPU → serial GEMV; prefill → row-tile + `_xr` via pool.
+// -> vec_dot_4 column-quads; 1-vCPU -> serial GEMV; prefill -> row-tile + `_xr` via pool.
 // DEFAULT OFF: WINS on Apple Silicon (M1 decode +14-20% @2/4 threads) but LOSES on
-// Graviton2/Neoverse-N1 = our Lambda target (N1 decode −3%/−9% @2/4, prefill −14% @4;
+// Graviton2/Neoverse-N1 = our Lambda target (N1 decode -3%/-9% @2/4, prefill -14% @4;
 // the spin-barrier + static split lose to rayon's work-stealing on N1). Bit-exact
 // either way. Set CANDLE_MATMUL_BARRIER=1 to opt in (e.g. on M-series).
 static MATMUL_BARRIER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -2509,10 +2509,10 @@ static GEMV_PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_GEMV_PREFETCH").map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false)
 });
 
-// Tile dims (weight columns NR × activation rows MR) for the int8-tile prefill.
+// Tile dims (weight columns NR x activation rows MR) for the int8-tile prefill.
 // `vec_dot_tile` dispatches a fused micro-kernel for supported shapes and falls
-// back to scalar otherwise — so NR=MR=1 routes the SAME matmul_tile structure
-// through plain `vec_dot` (a clean isolation: if 1×1 also regresses, the loss is
+// back to scalar otherwise - so NR=MR=1 routes the SAME matmul_tile structure
+// through plain `vec_dot` (a clean isolation: if 1x1 also regresses, the loss is
 // structural, not in the kernel). Clamped to 1..=8.
 static INT8_NR: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_INT8_NR")
@@ -2546,7 +2546,7 @@ pub(crate) static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
         // P-cores minus one: the orchestrating thread wakes between the ~200
         // per-token dispatches, and a pool owning every P-core gets one worker
-        // preempted at each wake — a straggler in every join. Measured faster
+        // preempted at each wake - a straggler in every join. Measured faster
         // than both 2 (bandwidth-starved) and cores/2 (preemption) on M-series.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -2582,7 +2582,7 @@ pub fn matmul_profile_reset() {
 
 /// 2-D register-blocked prefill GEMM: `dst(m,n) = lhs(m,k) x rhs_t(n,k)^T`, with
 /// pre-quantized activations `lhs_b` (m rows). Parallelizes over groups of NR=4
-/// weight columns; each task walks the m rows in MR=4 groups, emitting a 4×4 tile
+/// weight columns; each task walks the m rows in MR=4 groups, emitting a 4x4 tile
 /// via `T::vec_dot_tile` (fused micro-kernel for Q4_K, scalar elsewhere/at edges).
 /// Every (row,col) cell is written by exactly one task, so the raw writes are disjoint.
 fn matmul_tile<T: GgmlType>(
@@ -2593,7 +2593,7 @@ fn matmul_tile<T: GgmlType>(
     k_in_blocks: usize,
 ) {
     // Tile dims are runtime-selectable (env) for the shape sweep; buffers sized to
-    // the 8×8 max. NR weight columns × MR activation rows per micro-kernel call.
+    // the 8x8 max. NR weight columns x MR activation rows per micro-kernel call.
     const MAXB: usize = 8;
     let nr_blk = (*INT8_NR).min(MAXB);
     let mr_blk = (*INT8_MR).min(MAXB);
@@ -2754,7 +2754,7 @@ pub fn matmul<T: GgmlType>(
         None
     };
 
-    // Upstream PR #3627 threading (default; CANDLE_MATMUL_BARRIER=0 → legacy rayon):
+    // Upstream PR #3627 threading (default; CANDLE_MATMUL_BARRIER=0 -> legacy rayon):
     // the persistent BarrierPool is the SOLE matmul pool. Three regimes:
     //  - decode (m==1) @1 vCPU (0 workers): serial GEMV, single kernel/col (best);
     //  - decode (m==1) multi-thread: vec_dot_4 column-quads across the pool
@@ -2862,7 +2862,7 @@ pub fn matmul<T: GgmlType>(
         return Ok(());
     }
 
-    // Opt-in 2-D tiled prefill (NR=4 × MR=4) via the fused int8 micro-kernel.
+    // Opt-in 2-D tiled prefill (NR=4 x MR=4) via the fused int8 micro-kernel.
     if *MATMUL_INT8_TILE && m > 1 {
         matmul_tile::<T>((m, k, n), &lhs_b, rhs_t, dst, k_in_blocks);
         if let Some(t) = t_dot {
@@ -2878,7 +2878,7 @@ pub fn matmul<T: GgmlType>(
     } else {
         &*QMATMUL_PREFILL_POOL
     };
-    // Decode (m=1) on a single-thread pool — the common Lambda 1-vCPU tier — runs
+    // Decode (m=1) on a single-thread pool - the common Lambda 1-vCPU tier - runs
     // the GEMV serially. Going through `pool.install` + `into_par_iter` there is
     // pure rayon split/join overhead per matmul call (and decode issues ~200
     // matmuls/token), with no parallelism to gain. (A/B-gated for benchmarking;
@@ -2929,9 +2929,9 @@ pub fn matmul<T: GgmlType>(
                 });
         } else {
             // Row-tiled GEMM: iterating rows in the outer loop streams the full weight
-            // matrix once per row (m× total). Tiling rows keeps an activation tile
+            // matrix once per row (mx total). Tiling rows keeps an activation tile
             // cache-resident while each weight column is streamed once per tile,
-            // cutting weight traffic by ~m_tile×. Each (row, col) cell is written by
+            // cutting weight traffic by ~m_tilex. Each (row, col) cell is written by
             // exactly one task, so the raw-pointer writes are disjoint.
             struct DstPtr(*mut f32);
             unsafe impl Sync for DstPtr {}
@@ -3296,7 +3296,7 @@ mod tile_matmul_tests {
     }
 
     // vec_dot_multi (the per-column-parallel row-grouping path) must be bit-exact
-    // vs per-row vec_dot for every group count up to 8 (exercises the 8→4→2→1
+    // vs per-row vec_dot for every group count up to 8 (exercises the 8->4->2->1
     // ladder regardless of the env cap, since the ladder always runs).
     #[cfg(target_feature = "neon")]
     #[test]

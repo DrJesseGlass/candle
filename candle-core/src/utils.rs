@@ -298,7 +298,7 @@ pub(crate) fn candle_pool() -> &'static rayon::ThreadPool {
 #[inline(always)]
 fn set_thread_affinity() {
     // Upstream PR #3627 elevated macOS thread QoS to prefer P-cores (via libc).
-    // Dropped to avoid a libc dep — Lambda/N1 (Linux) is the target; no-op here.
+    // Dropped to avoid a libc dep - Lambda/N1 (Linux) is the target; no-op here.
 }
 
 pub fn has_accelerate() -> bool {

@@ -13,7 +13,7 @@ use core::arch::arm::*;
 use core::arch::aarch64::*;
 
 // Dot of two int8x16 vectors, grouped into four int32 lane-sums. Callers always reduce
-// across lanes afterwards, so the lane grouping is irrelevant — only the total matters.
+// across lanes afterwards, so the lane grouping is irrelevant - only the total matters.
 // Uses the hardware ARMv8.2 DotProd `SDOT` instruction when available (it is on Apple
 // Silicon / any `-Ctarget-feature=+dotprod` build), replacing ~5 emulation ops with one;
 // otherwise falls back to the widening-multiply emulation.
@@ -43,7 +43,7 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
 
 // Accumulating SDOT: `acc += dot4(a, b)` lane-wise, using SDOT's native accumulate
 // so chains of sub-block dots reuse one register (vs `vdupq_n_s32(0)` + separate
-// `vaddq` per call, which emits a redundant `movi` and an add — the candle-vs-ggml
+// `vaddq` per call, which emits a redundant `movi` and an add - the candle-vs-ggml
 // instruction-count gap). Integer accumulation is associative, so chaining is
 // bit-identical to summing separate `vdotq_s32` results.
 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
@@ -73,7 +73,7 @@ static SDOT_CHAIN: std::sync::LazyLock<bool> =
 // Vector-accumulation in the single-row Q4_K kernel: accumulate `p*scale` into an
 // int32x4 vector (vmlaq_n) + ONE `vaddvq` per superblock, vs a cross-lane `vaddvq`
 // per sub-block-half. MEASURED slightly SLOWER on the decode GEMV (it's memory-bound,
-// so the per-sub-block reduction latency is hidden, while vmlaq_n adds a scalar→vec
+// so the per-sub-block reduction latency is hidden, while vmlaq_n adds a scalar->vec
 // dup + a serial accumulator dependency). DEFAULT OFF (chain-only wins); set
 // CANDLE_VEC_ACC=1 to A/B. (Opposite holds for _xr/prefill, which already uses this.)
 static VEC_ACC: std::sync::LazyLock<bool> =
@@ -454,8 +454,8 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
-/// Four-column Q4K×Q8K dot sharing ONE activation (Q8K) load across 4 weight
-/// columns — the LHS-load-once amortization from upstream PR #3627, the mirror of
+/// Four-column Q4KxQ8K dot sharing ONE activation (Q8K) load across 4 weight
+/// columns - the LHS-load-once amortization from upstream PR #3627, the mirror of
 /// `_xr` (which shares the *weight* unpack across rows). `xs0..xs3` are 4 weight
 /// columns, `ys` the single activation row; returns `[dot(xs0,ys)..dot(xs3,ys)]`.
 /// Each activation q8 sub-block is loaded once and reused across the 4 weights;
@@ -479,7 +479,7 @@ pub(crate) fn vec_dot_q4k_q8k_4col(n: usize, xs: [&[BlockQ4K]; 4], ys: &[BlockQ8
         for i in 0..nb {
             let y = ys.get_unchecked(i);
             let yd = y.d;
-            // Shared activation: q8 block sums for the per-weight `-dmin·Σ(mins·bsums)`.
+            // Shared activation: q8 block sums for the per-weight `-dmin.sum(mins.bsums)`.
             let q8sums = vpaddq_s16(
                 vld1q_s16(y.bsums.as_ptr()),
                 vld1q_s16(y.bsums.as_ptr().add(8)),
@@ -550,7 +550,7 @@ pub(crate) fn vec_dot_q4k_q8k_4col(n: usize, xs: [&[BlockQ4K]; 4], ys: &[BlockQ8
     sumf
 }
 
-/// Multi-row Q4K×Q8K dot (R ≤ 4 rows): unpacks each weight superblock once and dots
+/// Multi-row Q4KxQ8K dot (R <= 4 rows): unpacks each weight superblock once and dots
 /// it against R activation rows. The nibble load/mask/shift work is shared, which is
 /// the dominant non-SDOT cost of the single-row kernel; per-row arithmetic order is
 /// identical to `vec_dot_q4k_q8k`, so results match it bit-for-bit.
@@ -567,9 +567,9 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
     );
     let nrows = R;
     // R up to 8: one weight column is unpacked into 4 nibble vectors (lo.0/.1,
-    // hi.0/.1) shared across all R rows, plus R int32 accumulators. R=8 → ~12
-    // live vectors, within N1's 32-register file (the 2-D NR×MR kernel spilled
-    // because it held NR× the nibble vectors; this holds exactly one column's).
+    // hi.0/.1) shared across all R rows, plus R int32 accumulators. R=8 -> ~12
+    // live vectors, within N1's 32-register file (the 2-D NRxMR kernel spilled
+    // because it held NRx the nibble vectors; this holds exactly one column's).
     debug_assert!(nrows >= 1 && nrows <= 8 && dst.len() == nrows);
     let mut utmp = [0u32; 4];
     let mut scales = [0u8; 16];
@@ -599,9 +599,9 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             let xd = x.d.to_f32();
             let xdmin = x.dmin.to_f32();
 
-            // Per row: the -dmin * Σ(mins · bsums) correction. `ys[r]` is a fixed-size
+            // Per row: the -dmin * sum(mins . bsums) correction. `ys[r]` is a fixed-size
             // array index (no check); `[i]` is in-bounds by construction (xs/ys share
-            // nb) — use get_unchecked to drop the per-superblock bounds check.
+            // nb) - use get_unchecked to drop the per-superblock bounds check.
             for (r, sf) in sumf.iter_mut().enumerate().take(nrows) {
                 let y = ys.get_unchecked(r).get_unchecked(i);
                 let q8sums = vpaddq_s16(
@@ -691,14 +691,14 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
     dst.copy_from_slice(&sumf[..nrows]);
 }
 
-/// 2-D register-blocked Q4_K × Q8_K microkernel: `NR` weight columns × `MR`
+/// 2-D register-blocked Q4_K x Q8_K microkernel: `NR` weight columns x `MR`
 /// activation rows in one pass. Each weight superblock's nibble unpack is shared
 /// across the `MR` rows (as in `_xr`), and each activation's Q8 load is shared
-/// across the `NR` weight columns — so *both* operands are reused from registers,
-/// cutting weight-decode by `MR×` and activation traffic by `NR×` (the structure
+/// across the `NR` weight columns - so *both* operands are reused from registers,
+/// cutting weight-decode by `MRx` and activation traffic by `NRx` (the structure
 /// llama.cpp's GEMM uses). Per-(col,row) arithmetic order is identical to
-/// `vec_dot_q4k_q8k`, so results are bit-for-bit identical. `dst` is `NR×MR`
-/// row-major: `dst[w * MR + a]` = column `w` · row `a`.
+/// `vec_dot_q4k_q8k`, so results are bit-for-bit identical. `dst` is `NRxMR`
+/// row-major: `dst[w * MR + a]` = column `w` . row `a`.
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
@@ -749,7 +749,7 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
                 q4p[w] = x.qs.as_ptr();
             }
 
-            // --- per activation row: base pointer; the -dmin·Σ(mins·bsums) term ---
+            // --- per activation row: base pointer; the -dmin.sum(mins.bsums) term ---
             let mut q8p = [core::ptr::null::<i8>(); MR];
             for a in 0..MR {
                 let y = &ys[a][i];
@@ -768,11 +768,11 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
                 }
             }
 
-            // --- main: NR×MR int32 accumulators, both operands reused in-register ---
+            // --- main: NRxMR int32 accumulators, both operands reused in-register ---
             let mut acc = [[vdupq_n_s32(0); MR]; NR];
             let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
             for j in 0..QK_K / 64 {
-                // Register-pressure note: 16 int32 accumulators (NR×MR) already use
+                // Register-pressure note: 16 int32 accumulators (NRxMR) already use
                 // half the NEON file. Materializing lo+hi nibbles for all NR columns
                 // (16 vectors) on top of that spills on N1. So split into two passes,
                 // each holding only the 8 nibble vectors it needs; q4bits is reloaded
@@ -824,14 +824,14 @@ pub(crate) fn vec_dot_q4k_q8k_mn<const NR: usize, const MR: usize>(
 }
 
 /// SDOT GEMM over candle's interleaved `BlockQ4Kx8`: `NC` output channels starting
-/// at `c_off` (NC + c_off ≤ 8) × `MR` activation rows. Output `dst[c * MR + a]` =
-/// channel `c_off+c` · row `a`, numerically identical to `vec_dot_q4k_q8k` per pair.
+/// at `c_off` (NC + c_off <= 8) x `MR` activation rows. Output `dst[c * MR + a]` =
+/// channel `c_off+c` . row `a`, numerically identical to `vec_dot_q4k_q8k` per pair.
 ///
 /// The repacking payoff is the loop order: scales/mins read pre-unpacked (no 6-bit
 /// twiddle), each chunk's channel weights contiguous, and each q8 activation load
 /// reused across all NC channels. Nibbles taken a half at a time (lo then hi) to
-/// keep `NC × 2` weight vectors live alongside the `NC × MR` accumulators — so the
-/// NC/MR product sets register pressure (8×4 spills on N1; 4×4 and 8×2 fit).
+/// keep `NC x 2` weight vectors live alongside the `NC x MR` accumulators - so the
+/// NC/MR product sets register pressure (8x4 spills on N1; 4x4 and 8x2 fit).
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
@@ -844,7 +844,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
     debug_assert!(dst.len() == NC * MR && c_off + NC <= PACK_ROWS);
     let nb = packed.len();
     // Running accumulator per (channel, row), updated as `-= mins` then `+= main`
-    // per super-block — the SAME two-op float sequence as `vec_dot`/`_xr`, so the
+    // per super-block - the SAME two-op float sequence as `vec_dot`/`_xr`, so the
     // result is bit-identical. Written to `dst` once at the end.
     let mut sumf = [[0f32; MR]; NC];
     unsafe {
@@ -859,7 +859,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                 cdmin[c] = blk.dmin[c_off + c].to_f32();
             }
 
-            // mins correction: per (c, a)  -= y.d * dmin[c] * Σ_s min[c][s]·q8sums[a][s],
+            // mins correction: per (c, a)  -= y.d * dmin[c] * sum_s min[c][s].q8sums[a][s],
             // q8sums[a][s] = bsums[2s] + bsums[2s+1].  (matches _xr / vec_dot.)
             let mut q8sums = [vdupq_n_s16(0); MR];
             for a in 0..MR {
@@ -881,7 +881,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
             let mut acc = [[vdupq_n_s32(0); MR]; NC];
             let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
             for j in 0..QK_K / 64 {
-                // chunk j is always a row-interleaved 8×32-byte run; channel c_off+c
+                // chunk j is always a row-interleaved 8x32-byte run; channel c_off+c
                 // lives at qs[j*256 + (c_off+c)*32].
                 let wbase = j * (PACK_ROWS * 32);
                 let sc_lo = 2 * j;
@@ -933,7 +933,7 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
     }
 }
 
-/// Convenience wrapper: all 8 channels of the packed block × `MR` rows.
+/// Convenience wrapper: all 8 channels of the packed block x `MR` rows.
 #[inline(always)]
 pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
     packed: &[BlockQ4Kx8],
