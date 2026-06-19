@@ -491,7 +491,6 @@ pub fn causal_decode_f16kv_interleaved(
     Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
 }
 
-
 /// Causal prefill over the f16 head-major interleaved KV cache (the same layout
 /// [`causal_decode_f16kv_interleaved`] reads, so prefill and decode share one cache).
 ///
@@ -528,10 +527,10 @@ pub fn causal_prefill_f16kv_headmajor(
         (0..h_kv * n_qblocks).into_par_iter().for_each_init(
             || {
                 (
-                    vec![0f32; rk * d],          // accumulators
-                    vec![0f32; rk * KB],         // weights (scores in pass 1)
-                    vec![f32::NEG_INFINITY; rk], // running max
-                    vec![0f32; rk],              // running sum
+                    vec![0f32; rk * d],            // accumulators
+                    vec![0f32; rk * KB],           // weights (scores in pass 1)
+                    vec![f32::NEG_INFINITY; rk],   // running max
+                    vec![0f32; rk],                // running sum
                     vec![half::f16::ZERO; rk * d], // f16 copy of this position's q rows
                 )
             },
@@ -570,8 +569,7 @@ pub fn causal_prefill_f16kv_headmajor(
                                 prefetch_read(kv_data[kv_base + 2 * d..].as_ptr());
                             }
                             for r in 0..rk {
-                                w[r * KB + j] =
-                                    dot_f32(&qf16[r * d..(r + 1) * d], k_row) * scale;
+                                w[r * KB + j] = dot_f32(&qf16[r * d..(r + 1) * d], k_row) * scale;
                             }
                         }
 
@@ -623,10 +621,7 @@ pub fn causal_prefill_f16kv_headmajor(
                         // SAFETY: each (h_i, q_pos) output row is written by exactly
                         // one task (kv heads and q blocks partition the rows).
                         let dst = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                p.0.add(h_i * s_q * d + q_pos * d),
-                                d,
-                            )
+                            std::slice::from_raw_parts_mut(p.0.add(h_i * s_q * d + q_pos * d), d)
                         };
                         for t in 0..d {
                             dst[t] = acc_r[t] * inv;
