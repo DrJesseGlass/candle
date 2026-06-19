@@ -2425,6 +2425,13 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    // The optimized paths below (and the zero-k fill) write `dst` through raw pointers
+    // and unchecked slices, so individual writes are not bounds-checked. A dst shorter
+    // than m*n would write out of bounds; the old sliced impl panicked instead. Reject
+    // it up front so misuse is a clean error, never UB.
+    if dst.len() < m * n {
+        crate::bail!("matmul: dst len {} < m*n ({m}*{n})", dst.len());
+    }
     // A zero-width contraction sums over no terms, so every output is zero. Handle it
     // before the optimized paths: `k_in_blocks` is 0 here, which would make the prefill
     // `par_chunks_mut(0)` (and the BLAS tiler) panic on chunk_size == 0.
