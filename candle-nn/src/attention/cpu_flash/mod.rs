@@ -22,11 +22,22 @@ use super::AttnMask;
 ///
 /// Thin glue over candle's architecture-tuned `VecOps::vec_dot` intrinsic
 /// (NEON / AVX2 / SIMD128), which `WithDType` already requires. Q and K stream
-/// in their native dtype (no per-row dequantization). f16/bf16 accumulate in
-/// f32 inside the intrinsic; only the returned scalar is narrowed back to `T`.
+/// in their native dtype (no per-row dequantization).
 #[inline]
 pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    // `VecOps::vec_dot` accumulates in f32 internally but stores the result back
+    // through `*mut T`, narrowing the logit to f16/bf16 before we read it. For a
+    // large-but-valid attention score that overflows half range (~65504), that
+    // yields inf/NaN and corrupts the softmax. Keep the accumulation in f32 for
+    // the half dtypes; only f32 (already exact) goes through the intrinsic.
+    if matches!(T::DTYPE, DType::F16 | DType::BF16) {
+        let mut acc = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            acc += (x.to_f64() as f32) * (y.to_f64() as f32);
+        }
+        return acc;
+    }
     let mut res = T::zero();
     // SAFETY: `a` and `b` are both at least `a.len()` long and `res` is a valid
     // out pointer, pre-zeroed for the scalar fallback that accumulates into it.

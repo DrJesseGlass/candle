@@ -10,7 +10,7 @@ use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
-use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Embedding, Module};
@@ -300,9 +300,10 @@ impl AttentionWeights {
                 // Run interleaved decode kernel
                 let kv_len = rc.len();
                 let q_len = self.num_heads * self.head_dim;
-                let ctx = causal_decode_f32_interleaved(
+                let ctx = causal_decode_f16kv_interleaved(
                     &q_data[..q_len],
                     rc.data(),
+                    rc.head_stride(),
                     self.num_heads,
                     self.num_kv_heads,
                     self.head_dim,
