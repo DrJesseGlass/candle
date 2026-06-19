@@ -31,6 +31,26 @@ pub(crate) static FLASH_ATTN_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
         .expect("Failed to build flash-attention thread pool")
 });
 
+// Decode (q_len=1) flash attention saturates well below the logical core count and the
+// E-cores on Apple Silicon drag it down; default to the performance cores (~cores/2).
+pub(crate) static FLASH_DECODE_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let n = std::env::var("CANDLE_FLASH_DECODE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or((cores / 2).max(1));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .start_handler(|_| unsafe {
+            set_thread_affinity();
+        })
+        .build()
+        .expect("Failed to build flash-attention decode pool")
+});
+
 /// Fused softmax(qk^T*scale)v on CPU, B=1 only. Output shape (1, H, S, Dv).
 pub fn run_flash_attn_cpu<T>(
     q: &Tensor,
