@@ -430,8 +430,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
         n.is_multiple_of(QK_K),
         "vec_dot_q4k_q8k_xr: {n} is not divisible by {QK_K}"
     );
-    let nrows = R;
-    debug_assert!(nrows >= 1 && nrows <= 4 && dst.len() == nrows);
+    debug_assert!(R >= 1 && R <= 4 && dst.len() == R);
     let mut utmp = [0u32; 4];
     let mut scales = [0u8; 16];
     const KMASK1: u32 = 0x3f3f3f3f;
@@ -460,7 +459,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             let xdmin = x.dmin.to_f32();
 
             // Per row: the -dmin * sum(mins . bsums) correction.
-            for (r, sf) in sumf.iter_mut().enumerate().take(nrows) {
+            for (r, sf) in sumf.iter_mut().enumerate().take(R) {
                 let y = &ys[r][i];
                 let q8sums = vpaddq_s16(
                     vld1q_s16(y.bsums.as_ptr()),
@@ -475,7 +474,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
 
             let mut q4 = x.qs.as_ptr();
             let mut q8p = [core::ptr::null::<i8>(); R];
-            for r in 0..nrows {
+            for r in 0..R {
                 q8p[r] = ys[r][i].qs.as_ptr();
             }
             // Vector accumulators: one horizontal reduction per superblock per row
@@ -495,7 +494,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
                     vreinterpretq_s8_u8(vshrq_n_u8(q4bits.1, 4)),
                 );
 
-                for r in 0..nrows {
+                for r in 0..R {
                     let q8 = vld1q_s8_x2(q8p[r]);
                     q8p[r] = q8p[r].add(32);
                     let p = vaddq_s32(vdotq_s32(lo.0, q8.0), vdotq_s32(lo.1, q8.1));
@@ -506,12 +505,12 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
                     acc[r] = vmlaq_n_s32(acc[r], p, scales[2 * j + 1] as i32);
                 }
             }
-            for r in 0..nrows {
+            for r in 0..R {
                 sumf[r] += ys[r][i].d * xd * vaddvq_s32(acc[r]) as f32;
             }
         }
     }
-    dst.copy_from_slice(&sumf[..nrows]);
+    dst.copy_from_slice(&sumf[..R]);
 }
 
 #[inline(always)]

@@ -1400,12 +1400,7 @@ impl GgmlType for BlockQ4K {
         // Pairs beat groups of four on Cortex-X925 (R=4 spills / serializes the
         // horizontal reductions); revisit per-arch if more profiles disagree.
         while r + 2 <= dst.len() {
-            super::neon::vec_dot_q4k_q8k_xr::<2>(
-                n,
-                xs,
-                &[row(r), row(r + 1)],
-                &mut dst[r..r + 2],
-            );
+            super::neon::vec_dot_q4k_q8k_xr::<2>(n, xs, &[row(r), row(r + 1)], &mut dst[r..r + 2]);
             r += 2;
         }
         if r < dst.len() {
@@ -2405,6 +2400,13 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    // A zero-width contraction sums over no terms, so every output is zero. Handle it
+    // before the optimized paths: `k_in_blocks` is 0 here, which would make the prefill
+    // `par_chunks_mut(0)` (and the BLAS tiler) panic on chunk_size == 0.
+    if k == 0 {
+        dst[..m * n].fill(0.0);
+        return Ok(());
+    }
     // Wide prefill GEMMs beat the integer-dot path on Accelerate's AMX units once
     // `m` amortizes the per-call weight dequantization, mirroring llama.cpp's BLAS
     // route. Decode (m=1) and short prompts stay on the quantized path.
