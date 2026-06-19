@@ -225,6 +225,23 @@ pub fn clear_packed_cache() {
     PACKED_CACHE.lock().unwrap().clear();
 }
 
+/// Repack a full row-major Q4_K weight matrix (`n` output channels, each `nb`
+/// super-blocks, laid out at row `r` from `r*nb`) into the interleaved
+/// `BlockQ4Kx8` layout for all `n/8` channel groups. Single source of truth for
+/// the row grouping, shared by `packed_cache_get` (runtime repack-on-load) and the
+/// offline pre-packer; requires `n % Q4KX8_ROWS == 0`.
+pub fn repack_q4k_weight(rows: &[BlockQ4K], n: usize, nb: usize) -> Vec<BlockQ4Kx8> {
+    debug_assert_eq!(n % Q4KX8_ROWS, 0, "repack_q4k_weight: n {n} not a multiple of 8");
+    debug_assert_eq!(rows.len(), n * nb, "repack_q4k_weight: rows len mismatch");
+    let mut packed = Vec::with_capacity((n / 8) * nb);
+    for g in 0..n / 8 {
+        let grp: [&[BlockQ4K]; Q4KX8_ROWS] =
+            std::array::from_fn(|r| &rows[(g * 8 + r) * nb..(g * 8 + r + 1) * nb]);
+        packed.extend(repack_q4k_x8(&grp));
+    }
+    packed
+}
+
 fn packed_cache_get(rhs: &[BlockQ4K], n: usize, nb: usize) -> Arc<Vec<BlockQ4Kx8>> {
     let key = rhs.as_ptr() as usize;
     {
@@ -236,13 +253,7 @@ fn packed_cache_get(rhs: &[BlockQ4K], n: usize, nb: usize) -> Arc<Vec<BlockQ4Kx8
     if let Some(p) = map.get(&key) {
         return p.clone();
     }
-    let mut packed = Vec::with_capacity((n / 8) * nb);
-    for g in 0..n / 8 {
-        let grp: [&[BlockQ4K]; Q4KX8_ROWS] =
-            std::array::from_fn(|r| &rhs[(g * 8 + r) * nb..(g * 8 + r + 1) * nb]);
-        packed.extend(repack_q4k_x8(&grp));
-    }
-    let arc = Arc::new(packed);
+    let arc = Arc::new(repack_q4k_weight(rhs, n, nb));
     map.insert(key, arc.clone());
     arc
 }
@@ -276,9 +287,26 @@ pub(crate) fn matmul_q4k_packed(
     dst: &mut [f32],
     pool: &rayon::ThreadPool,
 ) {
-    use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
     let nb = k / QK_K;
     let packed = packed_cache_get(rhs_q4k, n, nb);
+    matmul_q4kx8_prepacked((m, k, n), lhs, &packed, dst, pool);
+}
+
+/// GEMM over an already-interleaved `BlockQ4Kx8` weight (no repack/cache step):
+/// `dst(m,n) = lhs(m,k) × W^T`, `packed` holding the `n/8` channel groups
+/// (`nb = k/256` blocks each, group g at `g*nb`). Activations are quantized to Q8K
+/// here. Identical inner kernels/tiling to `matmul_q4k_packed` — split out so a
+/// pre-packed (offline-baked) weight can drive the same SDOT GEMM. Bit-exact.
+#[cfg(target_feature = "neon")]
+pub(crate) fn matmul_q4kx8_prepacked(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    packed: &[BlockQ4Kx8],
+    dst: &mut [f32],
+    pool: &rayon::ThreadPool,
+) {
+    use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
+    let nb = k / QK_K;
 
     let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
     pool.install(|| {
@@ -340,6 +368,231 @@ pub(crate) fn matmul_q4k_packed(
             }
         });
     });
+}
+
+// ===========================================================================
+// Pre-packed Q4_Kx8 as a first-class quantized storage type (GgmlDType::Q4Kx8).
+//
+// The interleaved BlockQ4Kx8 layout — normally produced by repack-on-load and
+// cached — can instead be baked into a GGUF offline (see the gguf-requant
+// `--pack` flag) and loaded as a SINGLE copy with no runtime repack. Owned or
+// mmap-backed; the mmap path is zero-copy (GGUF tensors are 32-aligned, which
+// covers BlockQ4Kx8's f16/u8 alignment of 2).
+// ===========================================================================
+
+/// Backing store for a `PackedQ4Kx8`: either an owned `Vec` (built from raw bytes)
+/// or a view into a memory-mapped GGUF region (zero-copy, read-only).
+enum PackedStore {
+    Owned(Vec<BlockQ4Kx8>),
+    Mmap {
+        mmap: Arc<memmap2::Mmap>,
+        offset: usize, // byte offset of the first block within the mmap
+        count: usize,  // number of BlockQ4Kx8
+    },
+}
+
+// SAFETY: the Mmap variant references an immutable, file-backed byte region kept
+// alive by the Arc; BlockQ4Kx8 is a POD (#[repr(C)] of f16/u8). Access is
+// read-only and the Arc makes the mapping outlive the view.
+unsafe impl Send for PackedStore {}
+unsafe impl Sync for PackedStore {}
+
+/// A pre-packed Q4_K weight: `n` output channels (`n % 8 == 0`) stored as the
+/// interleaved `BlockQ4Kx8` groups, ready for the SDOT GEMM with no repack.
+pub struct PackedQ4Kx8 {
+    store: PackedStore,
+    n: usize,
+}
+
+impl PackedQ4Kx8 {
+    #[inline]
+    fn as_slice(&self) -> &[BlockQ4Kx8] {
+        match &self.store {
+            PackedStore::Owned(v) => v.as_slice(),
+            PackedStore::Mmap { mmap, offset, count } => {
+                // SAFETY: offset/count/alignment checked in `from_mmap`; Arc keeps
+                // the mapping alive for the lifetime of the returned slice.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        mmap.as_ptr().add(*offset) as *const BlockQ4Kx8,
+                        *count,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Build an owned `PackedQ4Kx8` by copying raw interleaved bytes (e.g. from a
+    /// GGUF tensor read into a Vec). `raw` length must be a whole number of blocks.
+    pub fn from_bytes(raw: &[u8], n: usize) -> Self {
+        let bs = std::mem::size_of::<BlockQ4Kx8>();
+        assert_eq!(
+            raw.len() % bs,
+            0,
+            "PackedQ4Kx8::from_bytes: {} bytes not a multiple of block size {bs}",
+            raw.len()
+        );
+        let count = raw.len() / bs;
+        let mut v = vec![BlockQ4Kx8::zeroed(); count];
+        // Block is #[repr(C)] POD; a raw byte copy reproduces it exactly.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw.as_ptr(),
+                v.as_mut_ptr() as *mut u8,
+                raw.len(),
+            );
+        }
+        Self {
+            store: PackedStore::Owned(v),
+            n,
+        }
+    }
+
+    /// Build a zero-copy `PackedQ4Kx8` viewing `byte_len` bytes at `offset` in an
+    /// mmap'd GGUF. Validates bounds and alignment.
+    pub fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
+        offset: usize,
+        byte_len: usize,
+        n: usize,
+    ) -> crate::Result<Self> {
+        let bs = std::mem::size_of::<BlockQ4Kx8>();
+        if offset + byte_len > mmap.len() {
+            crate::bail!(
+                "Q4Kx8 mmap region end {} exceeds map len {}",
+                offset + byte_len,
+                mmap.len()
+            );
+        }
+        if byte_len % bs != 0 {
+            crate::bail!("Q4Kx8 mmap byte_len {byte_len} not a multiple of block size {bs}");
+        }
+        let base = mmap.as_ptr() as usize + offset;
+        if base % std::mem::align_of::<BlockQ4Kx8>() != 0 {
+            crate::bail!(
+                "Q4Kx8 mmap tensor at offset {offset} not aligned to {}",
+                std::mem::align_of::<BlockQ4Kx8>()
+            );
+        }
+        Ok(Self {
+            store: PackedStore::Mmap {
+                mmap,
+                offset,
+                count: byte_len / bs,
+            },
+            n,
+        })
+    }
+
+    /// Dequantize the packed weight back to f32 of shape `[n, k]` (row-major), where
+    /// `k = elem_count / n`. Mirrors `BlockQ4K::to_float` per channel: per sub-block
+    /// scale/min are the pre-unpacked bytes; nibbles come from the chunk-major,
+    /// row-interleaved `qs`. Correctness-only (not perf).
+    fn dequantize_to(&self, elem_count: usize, ys: &mut [f32]) {
+        let n = self.n;
+        let k = elem_count / n;
+        let nb = k / QK_K;
+        let blocks = self.as_slice();
+        debug_assert_eq!(blocks.len(), (n / Q4KX8_ROWS) * nb);
+        for g in 0..n / Q4KX8_ROWS {
+            for r in 0..Q4KX8_ROWS {
+                let out_row = g * Q4KX8_ROWS + r;
+                for i in 0..nb {
+                    let blk = &blocks[g * nb + i];
+                    let d = blk.d[r].to_f32();
+                    let dmin = blk.dmin[r].to_f32();
+                    let base = out_row * k + i * QK_K;
+                    // 4 chunks of 64 weights; each chunk = 2 sub-blocks (lo, hi).
+                    for j in 0..CHUNKS {
+                        let sub_lo = 2 * j;
+                        let sub_hi = 2 * j + 1;
+                        let d1 = d * blk.scales[r * SUBBLOCKS + sub_lo] as f32;
+                        let m1 = dmin * blk.mins[r * SUBBLOCKS + sub_lo] as f32;
+                        let d2 = d * blk.scales[r * SUBBLOCKS + sub_hi] as f32;
+                        let m2 = dmin * blk.mins[r * SUBBLOCKS + sub_hi] as f32;
+                        let qoff = j * (Q4KX8_ROWS * 32) + r * 32;
+                        let qs = &blk.qs[qoff..qoff + 32];
+                        let cbase = base + j * 64;
+                        for l in 0..32 {
+                            ys[cbase + l] = d1 * (qs[l] & 0xF) as f32 - m1;
+                        }
+                        for l in 0..32 {
+                            ys[cbase + 32 + l] = d2 * (qs[l] >> 4) as f32 - m2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl super::QuantizedType for PackedQ4Kx8 {
+    #[cfg(target_feature = "neon")]
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> crate::Result<()> {
+        let (m, _k, _n) = mkn;
+        let pool = if m == 1 {
+            &*super::k_quants::QMATMUL_DECODE_POOL
+        } else {
+            &*super::k_quants::QMATMUL_PREFILL_POOL
+        };
+        matmul_q4kx8_prepacked(mkn, lhs, self.as_slice(), dst, pool);
+        Ok(())
+    }
+
+    #[cfg(not(target_feature = "neon"))]
+    fn matmul_t(&self, _mkn: (usize, usize, usize), _lhs: &[f32], _dst: &mut [f32]) -> crate::Result<()> {
+        crate::bail!("Q4Kx8 packed matmul requires the neon target feature")
+    }
+
+    fn matmul_t_f16(
+        &self,
+        mkn: (usize, usize, usize),
+        lhs: &[f16],
+        dst: &mut [f16],
+    ) -> crate::Result<()> {
+        // qwen3 runs f32 activations; provide an f32-detour for the rare f16 caller.
+        let lhs_f: Vec<f32> = lhs.iter().map(|x| x.to_f32()).collect();
+        let mut dst_f = vec![0f32; dst.len()];
+        self.matmul_t(mkn, &lhs_f, &mut dst_f)?;
+        for (o, v) in dst.iter_mut().zip(dst_f.iter()) {
+            *o = f16::from_f32(*v);
+        }
+        Ok(())
+    }
+
+    fn dequantize(&self, elem_count: usize) -> crate::Result<super::CpuStorage> {
+        let mut ys = vec![0f32; elem_count];
+        self.dequantize_to(elem_count, &mut ys);
+        Ok(super::CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        self.as_slice().len() * std::mem::size_of::<BlockQ4Kx8>()
+    }
+
+    fn size(&self) -> usize {
+        self.storage_size_in_bytes()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr() as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        QK_K
+    }
+
+    fn dtype(&self) -> super::GgmlDType {
+        super::GgmlDType::Q4Kx8
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        unreachable!("Q4Kx8 is bake-only; quantize-to is not supported")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        unreachable!("Q4Kx8 is bake-only; quantize-to is not supported")
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +823,72 @@ mod tests {
                     dst_pack[i]
                 );
             }
+        }
+    }
+
+    // A pre-packed Q4_Kx8 loaded as raw bytes (PackedQ4Kx8::from_bytes) must drive
+    // a matmul bit-identical to the standard Q4_K matmul over the original weight,
+    // for decode (m=1) and prefill (m=4). This exercises the offline-bake path:
+    // repack -> bytes -> PackedQ4Kx8 -> QuantizedType::matmul_t.
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn packed_q4kx8_from_bytes_matches_baseline() {
+        use crate::quantized::k_quants::matmul;
+        use crate::quantized::QuantizedType;
+
+        let k = 512usize; // 2 super-blocks
+        let n = 24usize; // 3 groups of 8
+        let nb = k / QK_K;
+        let mut st = 0x0bad_f00d_1234_5678u64;
+
+        // Row-major Q4_K weight: channel r at r*nb.
+        let mut rhs_t = vec![BlockQ4K::zeros(); n * nb];
+        for r in 0..n {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            BlockQ4K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
+        }
+
+        // Offline bake: repack -> raw bytes -> PackedQ4Kx8 (owned, from bytes).
+        let packed = repack_q4k_weight(&rhs_t, n, nb);
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                packed.as_ptr() as *const u8,
+                std::mem::size_of_val(packed.as_slice()),
+            )
+        };
+        let pq = PackedQ4Kx8::from_bytes(raw, n);
+
+        for &m in &[1usize, 4usize] {
+            let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
+            let mut dst_base = vec![0f32; m * n];
+            let mut dst_pack = vec![0f32; m * n];
+            matmul::<BlockQ4K>((m, k, n), &lhs, &rhs_t, &mut dst_base).unwrap();
+            pq.matmul_t((m, k, n), &lhs, &mut dst_pack).unwrap();
+            let mut maxdiff_bits = 0u32;
+            for i in 0..m * n {
+                let db = dst_base[i].to_bits() as i64;
+                let dp = dst_pack[i].to_bits() as i64;
+                maxdiff_bits = maxdiff_bits.max((db - dp).unsigned_abs() as u32);
+                assert_eq!(
+                    dst_base[i].to_bits(),
+                    dst_pack[i].to_bits(),
+                    "m={m} idx {i}: base {} packed {}",
+                    dst_base[i],
+                    dst_pack[i]
+                );
+            }
+            assert_eq!(maxdiff_bits, 0, "m={m} not bit-exact");
+        }
+
+        // dequantize() must reproduce the original Q4_K dequant (same formula).
+        let mut want = vec![0f32; n * k];
+        BlockQ4K::to_float(&rhs_t, &mut want);
+        let got = match pq.dequantize(n * k).unwrap() {
+            crate::CpuStorage::F32(v) => v,
+            _ => panic!("expected f32"),
+        };
+        for i in 0..n * k {
+            assert_eq!(want[i].to_bits(), got[i].to_bits(), "dequant idx {i}");
         }
     }
 

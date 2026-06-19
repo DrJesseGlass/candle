@@ -1036,6 +1036,8 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        // Candle-only pre-packed Q4_K; not exercised by this reference test.
+        GgmlDType::Q4Kx8 => bail!("Q4Kx8 not covered by ggml reference matmul"),
     };
     Ok(err)
 }

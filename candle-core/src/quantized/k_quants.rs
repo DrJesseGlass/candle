@@ -2474,14 +2474,15 @@ static MATMUL_INT8_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
 });
 
 // Opt-in: route Q4_K matmuls through the interleaved packed SDOT kernels
-// (`repack::matmul_q4k_packed`). Weights are repacked once and cached. DEFAULT ON
-// (N1-validated): interleaved packing wins prefill at every core count (+15-25%,
-// scales best of all — 193 t/s @8vCPU vs rayon 167) and decode ≤4 vCPU (+7-16%),
-// ~neutral decode @8 vCPU. Bit-exact. Set CANDLE_MATMUL_PACKED_Q4K=0 to disable.
+// (`repack::matmul_q4k_packed`). RUNTIME repack — keeps BOTH the Q4_K and repacked
+// copies resident (+~250MB). SUPERSEDED by the baked Q4Kx8 format (gguf-requant
+// --pack): bake the packed layout offline → single copy, same speed, −160MB RAM,
+// no repack-on-first-use. So DEFAULT OFF; set CANDLE_MATMUL_PACKED_Q4K=1 only to
+// runtime-pack a plain Q4_K model (speed at the +250MB memory cost). Bit-exact.
 static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_MATMUL_PACKED_Q4K")
-        .map(|s| s != "0")
-        .unwrap_or(true)
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 });
 
 // Serial GEMV fast-path for single-thread decode (default on; set
@@ -2541,7 +2542,7 @@ fn env_threads(name: &str, default: usize) -> usize {
 // including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
 // GEMVs are memory-bandwidth bound; prefill (m>1) is compute bound and wants the
 // performance cores (~cores/2). Routed by `m` in `matmul`.
-static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+pub(crate) static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
         // P-cores minus one: the orchestrating thread wakes between the ~200
         // per-token dispatches, and a pool owning every P-core gets one worker
@@ -2559,7 +2560,7 @@ static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
             .build()
             .expect("Failed to build qmatmul decode pool")
     });
-static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+pub(crate) static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())

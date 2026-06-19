@@ -118,6 +118,11 @@ fn requant_qt(
     device: &Device,
     target: Option<candle::quantized::GgmlDType>,
 ) -> Result<std::sync::Arc<QTensor>> {
+    // Pre-packed Q4_Kx8 weights are bake-only: dequantizing/requantizing them would
+    // discard the interleaved layout (and quantize-to is unsupported). Leave as-is.
+    if qt.dtype() == candle::quantized::GgmlDType::Q4Kx8 {
+        return Ok(qt);
+    }
     match target {
         Some(dt) if qt.dtype() != dt => {
             let f = qt.dequantize(device)?;
