@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
+memmap2 = { workspace = true }
 candle = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 candle-nn = { workspace = true }

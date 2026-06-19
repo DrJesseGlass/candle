@@ -84,6 +84,10 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
+    /// Load weights zero-copy via mmap (lower load time + resident memory).
+    #[arg(long)]
+    mmap: bool,
+
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
@@ -224,7 +228,14 @@ fn main() -> anyhow::Result<()> {
             &format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
-        Qwen3::from_gguf(model, &mut file, &device)?
+        if args.mmap {
+            // SAFETY: the file is not mutated while mapped; the Arc keeps it alive
+            // for the lifetime of the weights.
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Qwen3::from_gguf_mmap(model, &mut file, std::sync::Arc::new(mmap), &device)?
+        } else {
+            Qwen3::from_gguf(model, &mut file, &device)?
+        }
     };
     println!("model built");
 

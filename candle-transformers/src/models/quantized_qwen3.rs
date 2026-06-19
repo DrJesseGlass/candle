@@ -95,6 +95,8 @@ pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
+    /// When set, tensors are loaded zero-copy from this memory-mapped file.
+    mmap: Option<std::sync::Arc<memmap2::Mmap>>,
 }
 
 /// Parse a requant target dtype from an env var (decode is BW-bound; lower-bit
@@ -134,11 +136,39 @@ fn requant_lmhead(qt: std::sync::Arc<QTensor>, device: &Device) -> Result<std::s
 
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        Self { ct, reader, device }
+        Self {
+            ct,
+            reader,
+            device,
+            mmap: None,
+        }
+    }
+
+    /// Construct a loader that reads tensors zero-copy from a memory-mapped file.
+    pub fn new_mmap(
+        ct: gguf_file::Content,
+        reader: R,
+        device: Device,
+        mmap: std::sync::Arc<memmap2::Mmap>,
+    ) -> Self {
+        Self {
+            ct,
+            reader,
+            device,
+            mmap: Some(mmap),
+        }
+    }
+
+    /// Load one tensor — zero-copy from the mmap when present, else read into a Vec.
+    fn load_tensor(&mut self, name: &str) -> Result<QTensor> {
+        match &self.mmap {
+            Some(m) => self.ct.tensor_mmap(m, name),
+            None => self.ct.tensor(&mut self.reader, name, &self.device),
+        }
     }
 
     pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_tensor(name)?;
         // Whole-model weight requant (CANDLE_REQUANT_WEIGHTS) — BW lever, not bit-exact.
         let qt = requant_qt(
             std::sync::Arc::new(ws),
@@ -149,7 +179,7 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_tensor(name)?;
         RmsNorm::from_qtensor(ws, eps)
     }
 
@@ -158,7 +188,7 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, &self.device)
+        self.load_tensor(name)
     }
 }
 
@@ -675,7 +705,22 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let mut gg = Gguf::new(ct, reader, device.clone());
+        Self::build(Gguf::new(ct, reader, device.clone()), device)
+    }
+
+    /// Like [`from_gguf`](Self::from_gguf) but loads tensors zero-copy from a
+    /// memory-mapped view of the file — lower load time and resident memory, ideal
+    /// for serverless cold starts. The `Arc<Mmap>` is held by the weights.
+    pub fn from_gguf_mmap<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::build(Gguf::new_mmap(ct, reader, device.clone(), mmap), device)
+    }
+
+    fn build<R: Read + Seek>(mut gg: Gguf<R>, device: &Device) -> Result<Self> {
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
