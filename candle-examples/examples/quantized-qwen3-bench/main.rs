@@ -2,6 +2,7 @@
 //! methodology so candle and llama.cpp numbers are comparable:
 //!   - prefill (pp): one forward over a dummy prompt of `--pp` tokens.
 //!   - decode  (tg): `--tg` greedy single-token forwards.
+//!
 //! No tokenizer, no sampling, no repeat penalty - raw model throughput only.
 //! Reports median tokens/s over `--reps` measured runs (after `--warmup`).
 //!
@@ -12,7 +13,7 @@
 
 use anyhow::Result;
 use candle::quantized::gguf_file;
-use candle::{Device, Tensor};
+use candle::{Device, Tensor, D};
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3;
 use clap::Parser;
 use std::time::Instant;
@@ -49,28 +50,26 @@ struct Args {
     json: bool,
 }
 
-fn argmax(v: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > best_v {
-            best_v = x;
-            best = i;
-        }
-    }
-    best as u32
+/// Greedy next token from a 1-D logits tensor, computed on-device so the host
+/// copy stays out of the decode loop.
+fn argmax(logits: &Tensor) -> Result<u32> {
+    Ok(logits.argmax(D::Minus1)?.to_scalar::<u32>()?)
 }
 
-fn median(xs: &mut [f64]) -> f64 {
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = xs.len();
+/// (median, min, max) of a sample. Returns zeros for an empty slice.
+fn stats(xs: &[f64]) -> (f64, f64, f64) {
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
     if n == 0 {
-        0.0
-    } else if n % 2 == 1 {
-        xs[n / 2]
-    } else {
-        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+        return (0.0, 0.0, 0.0);
     }
+    let median = if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    };
+    (median, s[0], s[n - 1])
 }
 
 fn main() -> Result<()> {
@@ -78,8 +77,7 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
 
     let mut file = std::fs::File::open(&args.model)?;
-    let content =
-        gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
+    let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
     let mut model = Qwen3::from_gguf(content, &mut file, &device)?;
 
     let prompt: Vec<u32> = vec![args.token_id; args.pp];
@@ -96,14 +94,14 @@ fn main() -> Result<()> {
         let t = Instant::now();
         let logits = model.forward(&input, 0)?.squeeze(0)?;
         let pp_dt = t.elapsed().as_secs_f64();
-        let mut next = argmax(&logits.to_vec1::<f32>()?);
+        let mut next = argmax(&logits)?;
 
         // Decode: tg greedy single-token forwards.
         let t = Instant::now();
         for i in 0..args.tg {
             let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, args.pp + i)?.squeeze(0)?;
-            next = argmax(&logits.to_vec1::<f32>()?);
+            next = argmax(&logits)?;
         }
         let tg_dt = t.elapsed().as_secs_f64();
 
@@ -115,18 +113,12 @@ fn main() -> Result<()> {
         }
         if !args.json {
             let tag = if rep < args.warmup { "warmup" } else { "run" };
-            eprintln!(
-                "{tag} {rep}: pp {pp_rate:.2} t/s   tg {tg_rate:.2} t/s",
-            );
+            eprintln!("{tag} {rep}: pp {pp_rate:.2} t/s   tg {tg_rate:.2} t/s");
         }
     }
 
-    let pp_med = median(&mut pp_rates.clone());
-    let tg_med = median(&mut tg_rates.clone());
-    let pp_min = pp_rates.iter().cloned().fold(f64::INFINITY, f64::min);
-    let pp_max = pp_rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let tg_min = tg_rates.iter().cloned().fold(f64::INFINITY, f64::min);
-    let tg_max = tg_rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (pp_med, pp_min, pp_max) = stats(&pp_rates);
+    let (tg_med, tg_min, tg_max) = stats(&tg_rates);
 
     if args.json {
         println!(

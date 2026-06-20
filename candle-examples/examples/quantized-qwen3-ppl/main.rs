@@ -40,7 +40,9 @@ fn main() -> Result<()> {
         Some(p) => Tokenizer::from_file(p).map_err(anyhow::Error::msg)?,
         None => {
             let api = hf_hub::api::sync::Api::new()?;
-            let path = api.model("Qwen/Qwen3-0.6B".to_string()).get("tokenizer.json")?;
+            let path = api
+                .model("Qwen/Qwen3-0.6B".to_string())
+                .get("tokenizer.json")?;
             Tokenizer::from_file(path).map_err(anyhow::Error::msg)?
         }
     };
@@ -57,21 +59,20 @@ fn main() -> Result<()> {
 
     model.clear_kv_cache();
     let mut nll = 0f64;
-    let mut count = 0usize;
+    let count = n - 1;
     let t0 = std::time::Instant::now();
-    for i in 0..n - 1 {
+    for i in 0..count {
         let input = Tensor::new(&[tokens[i]], &device)?.unsqueeze(0)?; // [1, 1]
         let logits = model.forward(&input, i)?.squeeze(0)?.to_dtype(DType::F32)?; // [vocab]
         let logp = candle_nn::ops::log_softmax(&logits, 0)?;
         let tgt = tokens[i + 1] as usize;
         let lp: f32 = logp.get(tgt)?.to_scalar()?;
         nll += -(lp as f64);
-        count += 1;
-        if count % 256 == 0 {
+        let done = i + 1;
+        if done.is_multiple_of(256) {
             print!(
-                "\r  {count}/{}  running PPL={:.3}",
-                n - 1,
-                (nll / count as f64).exp()
+                "\r  {done}/{count}  running PPL={:.3}",
+                (nll / done as f64).exp()
             );
             use std::io::Write;
             std::io::stdout().flush().ok();
