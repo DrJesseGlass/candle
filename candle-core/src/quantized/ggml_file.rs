@@ -1,7 +1,7 @@
 //! Support for the GGML file format.
 
 use super::{k_quants, GgmlDType, QStorage};
-use crate::{Device, Result};
+use crate::{Context, Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
 
@@ -184,7 +184,148 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::Q4Kx8 => {
+            // Pre-packed interleaved Q4_K: owned copy from the raw bytes. n = dims[0]
+            // (output channels); k = dims[1]. CPU only.
+            if !matches!(device, Device::Cpu) {
+                crate::bail!("Q4Kx8 is CPU-only");
+            }
+            let n = *dims.first().context("Q4Kx8 tensor has no dims")?;
+            let packed = super::repack::PackedQ4Kx8::from_bytes(&raw_data[..size_in_bytes], n);
+            let storage = QStorage::Cpu(Box::new(packed));
+            super::QTensor::new(storage, dims)
+        }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
+    }
+}
+
+/// Zero-copy quantized storage over a memory-mapped file region. Used for
+/// low-memory / fast GGUF loading: the weight blocks are read straight from the
+/// mmap (clean, file-backed pages, no owned `Vec` copy). Read-only.
+pub struct MmapBlocks<T> {
+    mmap: std::sync::Arc<memmap2::Mmap>,
+    offset: usize, // byte offset into the mmap of the first block
+    count: usize,  // number of `T` blocks
+    _marker: std::marker::PhantomData<T>,
+}
+
+// SAFETY: the data is an immutable byte region kept alive by the Arc<Mmap>; T is a
+// POD block type. Access is read-only and the Arc makes the mapping outlive us.
+unsafe impl<T: Send> Send for MmapBlocks<T> {}
+unsafe impl<T: Sync> Sync for MmapBlocks<T> {}
+
+impl<T> MmapBlocks<T> {
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: offset/count/alignment validated in `from_mmap_data`; Arc keeps it alive.
+        unsafe {
+            std::slice::from_raw_parts(self.mmap.as_ptr().add(self.offset) as *const T, self.count)
+        }
+    }
+}
+
+impl<T: k_quants::GgmlType + Send + Sync> super::QuantizedType for MmapBlocks<T> {
+    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        k_quants::matmul(mkn, lhs, self.as_slice(), dst)
+    }
+    fn matmul_t_f16(
+        &self,
+        mkn: (usize, usize, usize),
+        lhs: &[half::f16],
+        dst: &mut [half::f16],
+    ) -> Result<()> {
+        k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
+    }
+    fn size(&self) -> usize {
+        self.count * std::mem::size_of::<T>()
+    }
+    fn from_float(&mut self, _xs: &[f32]) {
+        unreachable!("mmap-backed quantized tensor is read-only")
+    }
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        unreachable!("mmap-backed quantized tensor is read-only")
+    }
+    fn dtype(&self) -> GgmlDType {
+        T::DTYPE
+    }
+    fn block_size(&self) -> usize {
+        T::BLCK_SIZE
+    }
+    fn dequantize(&self, elem_count: usize) -> Result<super::CpuStorage> {
+        let mut ys = vec![0f32; elem_count];
+        T::to_float(self.as_slice(), &mut ys);
+        Ok(super::CpuStorage::F32(ys))
+    }
+    fn storage_size_in_bytes(&self) -> usize {
+        self.count * std::mem::size_of::<T>()
+    }
+    fn as_ptr(&self) -> *const u8 {
+        unsafe { self.mmap.as_ptr().add(self.offset) }
+    }
+}
+
+fn from_mmap_data<T: k_quants::GgmlType + Send + Sync + 'static>(
+    mmap: std::sync::Arc<memmap2::Mmap>,
+    offset: usize,
+    size_in_bytes: usize,
+    dims: Vec<usize>,
+) -> Result<super::QTensor> {
+    if offset + size_in_bytes > mmap.len() {
+        crate::bail!(
+            "mmap tensor region end {} exceeds map len {}",
+            offset + size_in_bytes,
+            mmap.len()
+        );
+    }
+    let base = mmap.as_ptr() as usize + offset;
+    if !base.is_multiple_of(std::mem::align_of::<T>()) {
+        crate::bail!(
+            "mmap tensor at byte offset {offset} is not aligned to {} for {:?}",
+            std::mem::align_of::<T>(),
+            T::DTYPE
+        );
+    }
+    let count = size_in_bytes / std::mem::size_of::<T>();
+    let storage = QStorage::Cpu(Box::new(MmapBlocks::<T> {
+        mmap,
+        offset,
+        count,
+        _marker: std::marker::PhantomData,
+    }));
+    super::QTensor::new(storage, dims)
+}
+
+/// Build a zero-copy [`super::QTensor`] referencing a region of an mmap'd GGUF file.
+pub fn qtensor_from_mmap(
+    mmap: std::sync::Arc<memmap2::Mmap>,
+    offset: usize,
+    size_in_bytes: usize,
+    ggml_dtype: GgmlDType,
+    dims: Vec<usize>,
+) -> Result<super::QTensor> {
+    match ggml_dtype {
+        GgmlDType::F32 => from_mmap_data::<f32>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::F16 => from_mmap_data::<half::f16>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::BF16 => from_mmap_data::<half::bf16>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q4_0 => from_mmap_data::<k_quants::BlockQ4_0>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q4_1 => from_mmap_data::<k_quants::BlockQ4_1>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q5_0 => from_mmap_data::<k_quants::BlockQ5_0>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q5_1 => from_mmap_data::<k_quants::BlockQ5_1>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q8_0 => from_mmap_data::<k_quants::BlockQ8_0>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q2K => from_mmap_data::<k_quants::BlockQ2K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q3K => from_mmap_data::<k_quants::BlockQ3K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q4K => from_mmap_data::<k_quants::BlockQ4K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q5K => from_mmap_data::<k_quants::BlockQ5K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q6K => from_mmap_data::<k_quants::BlockQ6K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q8K => from_mmap_data::<k_quants::BlockQ8K>(mmap, offset, size_in_bytes, dims),
+        GgmlDType::Q4Kx8 => {
+            // Zero-copy view of the interleaved Q4_K blocks. n = dims[0].
+            let n = *dims.first().context("Q4Kx8 tensor has no dims")?;
+            let packed = super::repack::PackedQ4Kx8::from_mmap(mmap, offset, size_in_bytes, n)?;
+            let storage = QStorage::Cpu(Box::new(packed));
+            super::QTensor::new(storage, dims)
+        }
+        _ => crate::bail!("dtype {ggml_dtype:?} not supported for mmap load"),
     }
 }
 

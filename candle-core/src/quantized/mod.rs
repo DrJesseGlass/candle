@@ -33,6 +33,7 @@ mod cuda {
 
 #[cfg(target_feature = "neon")]
 pub mod neon;
+pub mod repack;
 #[cfg(target_feature = "simd128")]
 pub mod simd128;
 pub mod utils;
@@ -110,6 +111,7 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q4Kx8 => crate::bail!("Q4Kx8 is CPU-only"),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -127,6 +129,7 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q4Kx8 => crate::bail!("Q4Kx8 is CPU-only"),
             },
         }
     }
@@ -293,6 +296,9 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    /// Candle-only: pre-packed interleaved Q4_K (8 channels per superblock,
+    /// `repack::BlockQ4Kx8`). Baked offline; llama.cpp will not read it.
+    Q4Kx8,
 }
 
 impl GgmlDType {
@@ -314,6 +320,8 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            // Candle-only pre-packed Q4_K; chosen high to avoid colliding with ggml.
+            1000 => Self::Q4Kx8,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -337,6 +345,7 @@ impl GgmlDType {
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::Q4Kx8 => 1000,
         }
     }
 
@@ -358,6 +367,9 @@ impl GgmlDType {
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+            // Q4Kx8 is bake-only and needs `n` (not derivable here) to construct;
+            // it is loaded via qtensor_from_ggml/qtensor_from_mmap, never zero-init.
+            Self::Q4Kx8 => unreachable!("Q4Kx8 loaded via qtensor_from_ggml/mmap"),
         }
     }
 
@@ -379,6 +391,8 @@ impl GgmlDType {
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+            // n is not available here; Q4Kx8 is built in qtensor_from_ggml/mmap.
+            Self::Q4Kx8 => unreachable!("Q4Kx8 loaded via qtensor_from_ggml/mmap"),
         }
     }
 
@@ -401,6 +415,14 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            // GGUF tensor byte count = elem_count/block_size * type_size. With
+            // block_size = QK_K (256) this gives (n*k/256)*(sizeof/8) =
+            // (n/8)*(k/256)*sizeof = exactly the BlockQ4Kx8 byte count.
+            Self::Q4Kx8 => {
+                let sz = std::mem::size_of::<repack::BlockQ4Kx8>();
+                debug_assert_eq!(sz % repack::Q4KX8_ROWS, 0, "BlockQ4Kx8 size {sz} not /8");
+                sz / repack::Q4KX8_ROWS
+            }
         }
     }
 
@@ -416,6 +438,8 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            // 256 so check_shape passes for a [n,k] weight (k % 256 == 0).
+            Self::Q4Kx8 => k_quants::QK_K,
         }
     }
 }
@@ -531,6 +555,18 @@ impl QTensor {
             }
             rows += r;
             data.extend_from_slice(&t.data()?);
+        }
+        // Q4Kx8 packs 8 rows per group and never crosses a group boundary, so
+        // concatenating the packed byte-arrays of tensors with n%8==0 yields the
+        // fused packed tensor. It cannot route through `from_data` (which lacks n),
+        // so build the storage directly. CPU only.
+        if dtype == GgmlDType::Q4Kx8 {
+            if !first.device().is_cpu() {
+                crate::bail!("Q4Kx8 cat_rows is CPU-only")
+            }
+            let packed = repack::PackedQ4Kx8::from_bytes(&data, rows);
+            let storage = QStorage::Cpu(Box::new(packed));
+            return Self::new(storage, (rows, k));
         }
         let storage = QStorage::from_data(Cow::Owned(data), &first.device(), dtype)?;
         Self::new(storage, (rows, k))
@@ -923,10 +959,29 @@ impl crate::CustomOp1 for QTensor {
     }
 }
 
+/// Total wall-ns inside `QMatMul::forward` for QTensor matmuls (dispatch + kernel),
+/// when `CANDLE_MATMUL_PROFILE` is set. Subtract MATMUL_DOT_NS+MATMUL_QUANT_NS to get
+/// the per-op Tensor-dispatch overhead (apply_op1 / cpu_fwd allocs / from_storage).
+pub static QMATMUL_FWD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QMATMUL_FWD_PROFILE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_MATMUL_PROFILE").is_ok());
+
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
+            Self::QTensor(t) => {
+                if *QMATMUL_FWD_PROFILE {
+                    let s = std::time::Instant::now();
+                    let r = xs.apply_op1_no_bwd(t.as_ref());
+                    QMATMUL_FWD_NS.fetch_add(
+                        s.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    r
+                } else {
+                    xs.apply_op1_no_bwd(t.as_ref())
+                }
+            }
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,

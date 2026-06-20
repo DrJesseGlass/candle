@@ -2439,7 +2439,7 @@ fn build_qmatmul_pool(env: &str, default_threads: usize, what: &str) -> rayon::T
 // including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
 // GEMVs are memory-bandwidth bound; prefill (m>1) is compute bound and wants the
 // performance cores (~cores/2). Routed by `m` in `matmul`.
-static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+pub(crate) static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
         // P-cores minus one: the orchestrating thread wakes between the ~200
         // per-token dispatches, and a pool owning every P-core gets one worker
@@ -2458,7 +2458,7 @@ static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
             "decode",
         )
     });
-static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+pub(crate) static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
         build_qmatmul_pool(
             "CANDLE_QMATMUL_PREFILL_THREADS",

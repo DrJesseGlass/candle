@@ -1082,6 +1082,8 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        // Interleaved repacking of Q4_K; same numeric content, same error.
+        GgmlDType::Q4Kx8 => 0.002425,
     };
     Ok(err)
 }
