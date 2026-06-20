@@ -83,6 +83,16 @@ impl Module for MlpWeights {
     }
 }
 
+// Fused CPU/f32 RoPE: operate on raw slices via the precomputed f32 cos/sin,
+// skipping the per-call narrow + to_dtype + contiguous-as-op + apply_op3 chain
+// (rope is ~13% of decode, almost all per-Tensor-op framework overhead). Default
+// on; CANDLE_ROPE_FUSED=0 forces the original path for A/B benchmarking.
+static FUSED_ROPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_ROPE_FUSED")
+        .map(|s| s != "0")
+        .unwrap_or(true)
+});
+
 #[derive(Debug, Clone)]
 pub struct RotaryEmbedding {
     sin: Tensor,
@@ -135,11 +145,53 @@ impl RotaryEmbedding {
     /// Apply RoPE (q, k shape: B x H x L x D)
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
+        // Only take the fused path when every position stays within the precomputed
+        // cos/sin tables; otherwise fall through to `narrow`, which returns a
+        // recoverable error instead of panicking on an out-of-range slice.
+        let in_range = offset + seq_len <= self.cos_f32.len() / self.half_d;
+        if *FUSED_ROPE && in_range && q.device().is_cpu() && q.dtype() == DType::F32 {
+            return Ok((
+                self.rope_neox_f32(q, offset)?,
+                self.rope_neox_f32(k, offset)?,
+            ));
+        }
         let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
+    }
+
+    /// Fused neox RoPE on a CPU f32 tensor (B x H x L x D), bit-identical to
+    /// `candle_nn::rotary_emb::rope` but on raw slices with the precomputed f32
+    /// cos/sin - no intermediate cos/sin tensors, no apply_op3 dispatch.
+    fn rope_neox_f32(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
+        use candle::Storage;
+        let (b, h, t, d) = x.dims4()?;
+        let half = self.half_d;
+        let xc = x.contiguous()?; // cheap if already contiguous
+        let (storage, layout) = xc.storage_and_layout();
+        let src: &[f32] = match &*storage {
+            Storage::Cpu(c) => &c.as_slice::<f32>()?[layout.start_offset()..],
+            _ => candle::bail!("rope_neox_f32: expected CPU storage"),
+        };
+        let mut dst = vec![0f32; b * h * t * d];
+        // Same op order as the neox kernel: dst[i1]=a*cos - bb*sin; dst[i2]=a*sin + bb*cos.
+        // Per-row subslices hoist the bounds checks out of the inner loop and let it vectorize.
+        for bh in 0..b * h {
+            let chunk = bh * t * d;
+            for it in 0..t {
+                let (cos, sin) = self.cos_sin_at(offset + it);
+                let tb = chunk + it * d;
+                let (sa, sb) = src[tb..tb + d].split_at(half);
+                let (da, db) = dst[tb..tb + d].split_at_mut(half);
+                for j in 0..half {
+                    da[j] = sa[j] * cos[j] - sb[j] * sin[j];
+                    db[j] = sa[j] * sin[j] + sb[j] * cos[j];
+                }
+            }
+        }
+        Tensor::from_vec(dst, (b, h, t, d), x.device())
     }
 
     /// Zero-allocation cos/sin slices for a single position.
