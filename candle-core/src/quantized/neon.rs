@@ -467,7 +467,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
         n.is_multiple_of(QK_K),
         "vec_dot_q4k_q8k_xr: {n} is not divisible by {QK_K}"
     );
-    debug_assert!(R >= 1 && R <= 4 && dst.len() == R);
+    debug_assert!(R >= 1 && R <= 8 && dst.len() == R);
     let mut utmp = [0u32; 4];
     let mut scales = [0u8; 16];
     const KMASK1: u32 = 0x3f3f3f3f;

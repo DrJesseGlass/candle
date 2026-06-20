@@ -1406,7 +1406,10 @@ impl GgmlType for BlockQ4K {
     }
 
     /// Groups rows through the multi-row NEON kernel so each weight superblock is
-    /// unpacked once per group of four instead of once per row.
+    /// unpacked once per group instead of once per row. Group width is capped by
+    /// `CANDLE_Q4K_XR_R` (2..=8, default 4); a descending 8->4->2->1 ladder settles
+    /// the remainder. One weight column = 4 nibble vectors shared across the group,
+    /// so R=8 fits N1's register file. Bit-identical to `vec_dot`.
     #[cfg(target_feature = "neon")]
     fn vec_dot_multi(
         n: usize,
@@ -1417,15 +1420,48 @@ impl GgmlType for BlockQ4K {
     ) {
         let nb = xs.len();
         let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        let maxr = *Q4K_XR_R;
+        let len = dst.len();
         let mut r = 0;
-        // Pairs beat groups of four on Cortex-X925 (R=4 spills / serializes the
-        // horizontal reductions); revisit per-arch if more profiles disagree.
-        while r + 2 <= dst.len() {
-            super::neon::vec_dot_q4k_q8k_xr::<2>(n, xs, &[row(r), row(r + 1)], &mut dst[r..r + 2]);
-            r += 2;
-        }
-        if r < dst.len() {
-            dst[r] = Self::vec_dot(n, xs, row(r));
+        while r < len {
+            let rem = len - r;
+            if maxr >= 8 && rem >= 8 {
+                super::neon::vec_dot_q4k_q8k_xr::<8>(
+                    n,
+                    xs,
+                    &[
+                        row(r),
+                        row(r + 1),
+                        row(r + 2),
+                        row(r + 3),
+                        row(r + 4),
+                        row(r + 5),
+                        row(r + 6),
+                        row(r + 7),
+                    ],
+                    &mut dst[r..r + 8],
+                );
+                r += 8;
+            } else if maxr >= 4 && rem >= 4 {
+                super::neon::vec_dot_q4k_q8k_xr::<4>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1), row(r + 2), row(r + 3)],
+                    &mut dst[r..r + 4],
+                );
+                r += 4;
+            } else if maxr >= 2 && rem >= 2 {
+                super::neon::vec_dot_q4k_q8k_xr::<2>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1)],
+                    &mut dst[r..r + 2],
+                );
+                r += 2;
+            } else {
+                dst[r] = Self::vec_dot(n, xs, row(r));
+                r += 1;
+            }
         }
     }
 
@@ -2347,6 +2383,19 @@ static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| 
 });
 
 // Rows per prefill tile. The Q8K activation tile (m_tile x k/256 x 292 B) should stay
+// Max row-group width for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`)
+// inside `vec_dot_multi`. R=2 was the Cortex-X925 default; N1 has 32 regs and one
+// weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
+// and amortize the unpack further. `vec_dot_multi` uses a descending 8->4->2->1
+// ladder capped here. Clamped to 2..=8; default 4 (the validated N1 win).
+static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_Q4K_XR_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (2..=8).contains(&v))
+        .unwrap_or(4)
+});
+
 // cache-resident while each weight column streams once per tile instead of once per row;
 // 64 rows x 12.5 KB (k=11008) ~ 800 KB, inside a 1-2 MB L2.
 static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
