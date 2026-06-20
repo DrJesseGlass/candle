@@ -236,6 +236,36 @@ fn quantized_matmul_zero_k() -> Result<()> {
     Ok(())
 }
 
+// `matmul` permits a dst longer than m*n (it only rejects dst.len() < m*n). The m == 1
+// decode path used to iterate the whole dst and index `rhs_t` past its `n` columns;
+// check an over-long buffer still computes the first `n` outputs and leaves the tail
+// untouched, matching the exact-size result.
+#[test]
+fn quantized_matmul_oversized_dst() -> Result<()> {
+    let (k, n) = (64, 4);
+    let blocks_per_col = k / 32; // Q4_0 block size is 32
+    for m in [1, 2] {
+        let lhs = (0..(m * k)).map(|v| v as f32).collect::<Vec<_>>();
+        let rhs = (0..(k * n)).map(|v| v as f32).collect::<Vec<_>>();
+        let mut rhs_t = vec![k_quants::BlockQ4_0::zeros(); n * blocks_per_col];
+        k_quants::BlockQ4_0::from_float(&rhs, &mut rhs_t);
+
+        // Reference: exact-size dst.
+        let mut want = vec![0f32; m * n];
+        k_quants::matmul((m, k, n), &lhs, &rhs_t, &mut want)?;
+
+        // Over-long dst: only the first m*n entries are outputs; the tail stays as-is.
+        let mut got = vec![-1f32; m * n + 5];
+        k_quants::matmul((m, k, n), &lhs, &rhs_t, &mut got)?;
+        assert_eq!(&got[..m * n], &want[..], "outputs differ (m={m})");
+        assert!(
+            got[m * n..].iter().all(|&x| x == -1f32),
+            "tail clobbered (m={m})"
+        );
+    }
+    Ok(())
+}
+
 fn qmm_batch(dev: &Device) -> Result<()> {
     let (lhs, rhs, _mm) = get_random_tensors(2, 256, 6, dev)?;
     let rhs = quantized::QTensor::quantize(&rhs, GgmlDType::Q2K)?;

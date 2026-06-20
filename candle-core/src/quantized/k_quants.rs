@@ -2591,7 +2591,11 @@ pub fn matmul<T: GgmlType>(
     pool.install(|| {
         if m == 1 {
             let lhs_row = &lhs_b[..k_in_blocks];
-            dst.into_par_iter()
+            // Only the first `n` entries are outputs; a caller may pass a longer scratch
+            // buffer (we only reject dst.len() < m*n). Bound to `n` so the tail is left
+            // untouched instead of indexing `rhs_t` past its `n` columns.
+            dst[..n]
+                .par_iter_mut()
                 .enumerate()
                 .with_min_len(*MATMUL_MIN_LEN)
                 .for_each(|(col_idx, dst)| {

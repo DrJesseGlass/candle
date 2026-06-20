@@ -91,7 +91,13 @@ impl Module for QuantizedEmbedding {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let dims = ids.dims().to_vec();
-        let ids = ids.flatten_all()?.to_vec1::<u32>()?;
+        // Normalize to U32 first: token-id tensors are often I64 (and U8 is also a valid
+        // index dtype), all of which `index_select` accepts. Reading straight to_vec1::<u32>
+        // would reject those and fail before lookup, unlike the dense embedding path.
+        let ids = ids
+            .flatten_all()?
+            .to_dtype(candle::DType::U32)?
+            .to_vec1::<u32>()?;
         // Gather the quantized rows, dequantize them as one small QTensor.
         let data = self.weight.data()?; // zero-copy borrow on CPU
         let mut rows = Vec::with_capacity(ids.len() * self.row_bytes);

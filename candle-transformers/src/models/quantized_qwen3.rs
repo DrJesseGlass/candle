@@ -431,12 +431,12 @@ impl AttentionWeights {
                 let (kg, kl) = k_cont.storage_and_layout();
                 let k_d: &[f32] = match &*kg {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
-                    _ => candle::bail!("Expected CPU"),
+                    _ => candle::bail!("Expected CPU storage"),
                 };
                 let (vg, vl) = v_cont.storage_and_layout();
                 let v_d: &[f32] = match &*vg {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
-                    _ => candle::bail!("Expected CPU"),
+                    _ => candle::bail!("Expected CPU storage"),
                 };
                 let rc = self.raw_cache.as_mut().unwrap();
                 rc.write_kv_batch(k_d, v_d, l);
@@ -446,7 +446,7 @@ impl AttentionWeights {
                 let (qg, ql) = q_t.storage_and_layout();
                 let q_d: &[f32] = match &*qg {
                     Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[ql.start_offset()..],
-                    _ => candle::bail!("Expected CPU"),
+                    _ => candle::bail!("Expected CPU storage"),
                 };
 
                 let ctx = {
