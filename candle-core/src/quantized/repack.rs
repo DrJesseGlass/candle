@@ -18,9 +18,14 @@
 // a range loop is clearer here than zipped iterators.
 #![allow(clippy::needless_range_loop)]
 
-use super::k_quants::{BlockQ4K, BlockQ8K, GgmlType, QK_K};
+use super::k_quants::{BlockQ4K, QK_K};
+// The packed GEMM kernels (and the trait helpers / rayon they pull in) are
+// aarch64/neon-only; the imports they need would be unused on other targets.
+#[cfg(target_feature = "neon")]
+use super::k_quants::{BlockQ8K, GgmlType};
 use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
+#[cfg(target_feature = "neon")]
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -95,7 +100,10 @@ pub(crate) fn q4k_unpack_scales_mins(packed: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
 /// critical, so it uses the scalar scale/min unpack.
 pub(crate) fn repack_q4k_x8(rows: &[&[BlockQ4K]; Q4KX8_ROWS]) -> Vec<BlockQ4Kx8> {
     let nb = rows[0].len();
-    debug_assert!(rows.iter().all(|r| r.len() == nb), "ragged rows in repack_q4k_x8");
+    debug_assert!(
+        rows.iter().all(|r| r.len() == nb),
+        "ragged rows in repack_q4k_x8"
+    );
     let mut out = Vec::with_capacity(nb);
     for i in 0..nb {
         let mut blk = BlockQ4Kx8::zeroed();
@@ -166,8 +174,7 @@ fn make_q4kx8_laneq(cols: &[&[BlockQ4K]; 8], i: usize) -> BlockQ4Kx8L {
         let src_id = t % 8;
         let src_off = (t / 8) * 8;
         let dst_off = t * 8;
-        out.qs[dst_off..dst_off + 8]
-            .copy_from_slice(&cols[src_id][i].qs[src_off..src_off + 8]);
+        out.qs[dst_off..dst_off + 8].copy_from_slice(&cols[src_id][i].qs[src_off..src_off + 8]);
     }
     // scales: repack the 6-bit packed scales/mins of all 8 columns into 96 bytes.
     let mut s = [0u8; 8];
@@ -194,7 +201,8 @@ fn make_q4kx8_laneq(cols: &[&[BlockQ4K]; 8], i: usize) -> BlockQ4Kx8L {
     for ii in 0..4 {
         for j in 0..8 {
             s[j] = ((cols[j][i].scales[ii] & 192) >> 2) | (cols[j][i].scales[ii + 8] & 15);
-            m[j] = ((cols[j][i].scales[ii + 4] & 192) >> 2) | ((cols[j][i].scales[ii + 8] & 240) >> 4);
+            m[j] =
+                ((cols[j][i].scales[ii + 4] & 192) >> 2) | ((cols[j][i].scales[ii + 8] & 240) >> 4);
         }
         let b = ii * 12 + 48;
         out.scales[b] = (s[0] & 63) + ((s[4] & 48) << 2);
@@ -238,7 +246,11 @@ pub fn clear_packed_cache() {
 /// the row grouping, shared by `packed_cache_get` (runtime repack-on-load) and the
 /// offline pre-packer; requires `n % Q4KX8_ROWS == 0`.
 pub fn repack_q4k_weight(rows: &[BlockQ4K], n: usize, nb: usize) -> Vec<BlockQ4Kx8> {
-    debug_assert_eq!(n % Q4KX8_ROWS, 0, "repack_q4k_weight: n {n} not a multiple of 8");
+    debug_assert_eq!(
+        n % Q4KX8_ROWS,
+        0,
+        "repack_q4k_weight: n {n} not a multiple of 8"
+    );
     debug_assert_eq!(rows.len(), n * nb, "repack_q4k_weight: rows len mismatch");
     let mut packed = Vec::with_capacity((n / 8) * nb);
     for g in 0..n / 8 {
@@ -416,7 +428,11 @@ impl PackedQ4Kx8 {
     fn as_slice(&self) -> &[BlockQ4Kx8] {
         match &self.store {
             PackedStore::Owned(v) => v.as_slice(),
-            PackedStore::Mmap { mmap, offset, count } => {
+            PackedStore::Mmap {
+                mmap,
+                offset,
+                count,
+            } => {
                 // SAFETY: offset/count/alignment checked in `from_mmap`; Arc keeps
                 // the mapping alive for the lifetime of the returned slice.
                 unsafe {
@@ -440,14 +456,12 @@ impl PackedQ4Kx8 {
             raw.len()
         );
         let count = raw.len() / bs;
-        let mut v = vec![BlockQ4Kx8::zeroed(); count];
-        // Block is #[repr(C)] POD; a raw byte copy reproduces it exactly.
+        // Block is #[repr(C)] POD; a raw byte copy reproduces it exactly, so copy
+        // straight into uninitialized capacity rather than zero-filling first.
+        let mut v: Vec<BlockQ4Kx8> = Vec::with_capacity(count);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                raw.as_ptr(),
-                v.as_mut_ptr() as *mut u8,
-                raw.len(),
-            );
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, raw.len());
+            v.set_len(count);
         }
         Self {
             store: PackedStore::Owned(v),
@@ -535,7 +549,12 @@ impl PackedQ4Kx8 {
 
 impl super::QuantizedType for PackedQ4Kx8 {
     #[cfg(target_feature = "neon")]
-    fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> crate::Result<()> {
+    fn matmul_t(
+        &self,
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        dst: &mut [f32],
+    ) -> crate::Result<()> {
         let (m, _k, _n) = mkn;
         let pool = if m == 1 {
             &*super::k_quants::QMATMUL_DECODE_POOL
@@ -547,7 +566,12 @@ impl super::QuantizedType for PackedQ4Kx8 {
     }
 
     #[cfg(not(target_feature = "neon"))]
-    fn matmul_t(&self, _mkn: (usize, usize, usize), _lhs: &[f32], _dst: &mut [f32]) -> crate::Result<()> {
+    fn matmul_t(
+        &self,
+        _mkn: (usize, usize, usize),
+        _lhs: &[f32],
+        _dst: &mut [f32],
+    ) -> crate::Result<()> {
         crate::bail!("Q4Kx8 packed matmul requires the neon target feature")
     }
 
@@ -675,12 +699,28 @@ mod tests {
                 let src = &rows_q[r][i];
                 let (sc, mn) = q4k_unpack_scales_mins(&src.scales);
                 for s in 0..SUBBLOCKS {
-                    assert_eq!(packed[i].scales[r * SUBBLOCKS + s], sc[s], "scale r{r} i{i} s{s}");
-                    assert_eq!(packed[i].mins[r * SUBBLOCKS + s], mn[s], "min r{r} i{i} s{s}");
+                    assert_eq!(
+                        packed[i].scales[r * SUBBLOCKS + s],
+                        sc[s],
+                        "scale r{r} i{i} s{s}"
+                    );
+                    assert_eq!(
+                        packed[i].mins[r * SUBBLOCKS + s],
+                        mn[s],
+                        "min r{r} i{i} s{s}"
+                    );
                 }
                 assert_eq!(packed[i].d[r].to_bits(), src.d.to_bits(), "d r{r} i{i}");
-                assert_eq!(packed[i].dmin[r].to_bits(), src.dmin.to_bits(), "dmin r{r} i{i}");
-                assert_eq!(packed_nibbles(&packed[i], r), ref_nibbles(src), "nibbles r{r} i{i}");
+                assert_eq!(
+                    packed[i].dmin[r].to_bits(),
+                    src.dmin.to_bits(),
+                    "dmin r{r} i{i}"
+                );
+                assert_eq!(
+                    packed_nibbles(&packed[i], r),
+                    ref_nibbles(src),
+                    "nibbles r{r} i{i}"
+                );
             }
         }
     }
@@ -690,8 +730,8 @@ mod tests {
     #[cfg(target_feature = "neon")]
     #[test]
     fn gemm_q4kx8_bit_exact() {
-        use crate::quantized::neon::gemm_q4kx8_q8k;
         use crate::quantized::k_quants::BlockQ8K;
+        use crate::quantized::neon::gemm_q4kx8_q8k;
 
         let nb = 3usize;
         let k = nb * QK_K;
@@ -729,7 +769,9 @@ mod tests {
                             got[c * $mr + a].to_bits(),
                             want.to_bits(),
                             "MR={} channel {c} row {a}: got {} want {}",
-                            $mr, got[c * $mr + a], want
+                            $mr,
+                            got[c * $mr + a],
+                            want
                         );
                     }
                 }
@@ -752,7 +794,8 @@ mod tests {
                         got[c * 4 + a].to_bits(),
                         want.to_bits(),
                         "NC4 c_off={c_off} channel {c} row {a}: got {} want {}",
-                        got[c * 4 + a], want
+                        got[c * 4 + a],
+                        want
                     );
                 }
             }
@@ -788,8 +831,16 @@ mod tests {
             got.sort_unstable();
             assert_eq!(src, got, "qs not a permutation at block {i}");
             for c in 0..8 {
-                assert_eq!(packed[i].d[c].to_bits(), wq[c][i].d.to_bits(), "d c{c} i{i}");
-                assert_eq!(packed[i].dmin[c].to_bits(), wq[c][i].dmin.to_bits(), "dmin c{c} i{i}");
+                assert_eq!(
+                    packed[i].d[c].to_bits(),
+                    wq[c][i].d.to_bits(),
+                    "d c{c} i{i}"
+                );
+                assert_eq!(
+                    packed[i].dmin[c].to_bits(),
+                    wq[c][i].dmin.to_bits(),
+                    "dmin c{c} i{i}"
+                );
             }
         }
     }
@@ -812,7 +863,10 @@ mod tests {
             BlockQ4K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
         }
         let rhs_q4k: &[BlockQ4K] = &rhs_t;
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
 
         for &m in &[1usize, 5usize, 16usize] {
             let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
@@ -907,6 +961,8 @@ mod tests {
     #[cfg(target_feature = "neon")]
     #[test]
     #[ignore]
+    // The tile-height sweep macro expands `r + $main <= m` for $main == 1.
+    #[allow(clippy::int_plus_one)]
     fn q4kx8_microbench() {
         use crate::quantized::k_quants::{matmul, BlockQ8K};
         use crate::quantized::neon::gemm_q4kx8_q8k;
@@ -918,7 +974,7 @@ mod tests {
         let nb = k / QK_K;
         let reps = 6usize;
         let mut st = 0xdead_beef_0123_4567u64;
-        let mut rnd = |s: &mut u64| {
+        let rnd = |s: &mut u64| {
             *s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);

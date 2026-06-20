@@ -582,11 +582,7 @@ impl Content {
     /// Zero-copy load of a tensor from a memory-mapped view of the whole file.
     /// The returned [`QTensor`] references the mapped bytes (no owned `Vec`), so the
     /// `Arc<Mmap>` must outlive it. CPU only; lower load time and resident memory.
-    pub fn tensor_mmap(
-        &self,
-        mmap: &std::sync::Arc<memmap2::Mmap>,
-        name: &str,
-    ) -> Result<QTensor> {
+    pub fn tensor_mmap(&self, mmap: &std::sync::Arc<memmap2::Mmap>, name: &str) -> Result<QTensor> {
         let tensor_info = match self.tensor_infos.get(name) {
             Some(tensor_info) => tensor_info,
             None => crate::bail!("cannot find tensor info for {name}"),

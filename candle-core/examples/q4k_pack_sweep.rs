@@ -20,7 +20,7 @@
 // Env knobs: M = prefill rows (default 128), ITERS = timed reps (default 40).
 
 use candle_core::quantized::k_quants::{BlockQ4K, GgmlType, QK_K};
-use candle_core::quantized::repack::{repack_q4k_weight, PackedQ4Kx8, BlockQ4Kx8};
+use candle_core::quantized::repack::{repack_q4k_weight, BlockQ4Kx8, PackedQ4Kx8};
 use candle_core::quantized::QuantizedType;
 use std::time::Instant;
 
@@ -39,10 +39,7 @@ fn fill(n: usize, seed: usize) -> Vec<f32> {
 // #[repr(C)] POD, so this reinterprets the same bytes the GGUF loader would.
 fn blocks_as_bytes(blocks: &[BlockQ4Kx8]) -> &[u8] {
     unsafe {
-        std::slice::from_raw_parts(
-            blocks.as_ptr() as *const u8,
-            std::mem::size_of_val(blocks),
-        )
+        std::slice::from_raw_parts(blocks.as_ptr() as *const u8, std::mem::size_of_val(blocks))
     }
 }
 
@@ -64,9 +61,16 @@ fn bench(iters: usize, mut f: impl FnMut() -> f32) -> f64 {
 }
 
 fn main() {
-    let m: usize = std::env::var("M").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
-    let threads = std::env::var("CANDLE_QMATMUL_PREFILL_THREADS").unwrap_or_else(|_| "default".into());
+    let m: usize = std::env::var("M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let threads =
+        std::env::var("CANDLE_QMATMUL_PREFILL_THREADS").unwrap_or_else(|_| "default".into());
 
     // Representative Qwen3-0.6B prefill GEMM shapes: (name, k=in_features, n=out_features).
     let shapes = [
@@ -75,9 +79,7 @@ fn main() {
         ("ffn_down", 3072, 1024),
     ];
 
-    println!(
-        "# m={m} iters={iters} prefill_threads={threads}  (median of {iters} reps)"
-    );
+    println!("# m={m} iters={iters} prefill_threads={threads}  (median of {iters} reps)");
     println!(
         "{:<12} {:>6} {:>6} {:>10} {:>10} {:>9} {:>9} {:>9} {:>10}",
         "shape", "k", "n", "xr_us", "pack_us", "xr_GFs", "pk_GFs", "speedup", "maxdiff"
