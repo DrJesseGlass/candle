@@ -2382,7 +2382,6 @@ static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| 
         .unwrap_or(128)
 });
 
-// Rows per prefill tile. The Q8K activation tile (m_tile x k/256 x 292 B) should stay
 // Max row-group width for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`)
 // inside `vec_dot_multi`. R=2 was the Cortex-X925 default; N1 has 32 regs and one
 // weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
@@ -2399,6 +2398,7 @@ static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         .unwrap_or(4)
 });
 
+// Rows per prefill tile. The Q8K activation tile (m_tile x k/256 x 292 B) should stay
 // cache-resident while each weight column streams once per tile instead of once per row;
 // 64 rows x 12.5 KB (k=11008) ~ 800 KB, inside a 1-2 MB L2.
 static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {

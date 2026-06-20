@@ -81,10 +81,6 @@ impl QuantizedEmbedding {
             span,
         })
     }
-
-    pub fn from_qtensor(weight: QTensor) -> Result<Self> {
-        Self::from_arc(std::sync::Arc::new(weight))
-    }
 }
 
 impl Module for QuantizedEmbedding {
