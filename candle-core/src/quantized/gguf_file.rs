@@ -578,6 +578,32 @@ impl Content {
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
     }
+
+    /// Zero-copy load of a tensor from a memory-mapped view of the whole file.
+    /// The returned [`QTensor`] references the mapped bytes (no owned `Vec`), so the
+    /// `Arc<Mmap>` must outlive it. CPU only; lower load time and resident memory.
+    pub fn tensor_mmap(&self, mmap: &std::sync::Arc<memmap2::Mmap>, name: &str) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        let tensor_elems = tensor_info.shape.elem_count();
+        let block_size = tensor_info.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+            )
+        }
+        let size_in_bytes = tensor_elems / block_size * tensor_info.ggml_dtype.type_size();
+        let offset = (self.tensor_data_offset + tensor_info.offset) as usize;
+        super::ggml_file::qtensor_from_mmap(
+            mmap.clone(),
+            offset,
+            size_in_bytes,
+            tensor_info.ggml_dtype,
+            tensor_info.shape.dims().to_vec(),
+        )
+    }
 }
 
 fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {

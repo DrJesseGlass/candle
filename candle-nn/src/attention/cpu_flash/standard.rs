@@ -31,6 +31,26 @@ pub(crate) static FLASH_ATTN_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
         .expect("Failed to build flash-attention thread pool")
 });
 
+// Decode (q_len=1) flash attention saturates well below the logical core count and the
+// E-cores on Apple Silicon drag it down; default to the performance cores (~cores/2).
+pub(crate) static FLASH_DECODE_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let n = std::env::var("CANDLE_FLASH_DECODE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or((cores / 2).max(1));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .start_handler(|_| unsafe {
+            set_thread_affinity();
+        })
+        .build()
+        .expect("Failed to build flash-attention decode pool")
+});
+
 /// Fused softmax(qk^T*scale)v on CPU, B=1 only. Output shape (1, H, S, Dv).
 pub fn run_flash_attn_cpu<T>(
     q: &Tensor,
@@ -97,10 +117,11 @@ where
 
     if q.shape().dims()[1] == 1 {
         if lean {
-            return flash_attn_decode_lean::<T>(
+            return flash_attn_decode::<true, T>(
                 q_data,
                 k_data,
                 v_data,
+                None,
                 q.shape().dims(),
                 k.shape().dims(),
                 v.shape().dims(),
@@ -108,9 +129,11 @@ where
                 k_stride,
                 v_stride,
                 softmax_scale,
+                max_bias,
+                logit_softcap,
             );
         }
-        return flash_attn_decode::<T>(
+        return flash_attn_decode::<false, T>(
             q_data,
             k_data,
             v_data,
@@ -128,10 +151,11 @@ where
     }
 
     if lean {
-        return flash_attn_prefill_lean::<T>(
+        return flash_attn_prefill::<true, T>(
             q_data,
             k_data,
             v_data,
+            None,
             q.shape().dims(),
             k.shape().dims(),
             v.shape().dims(),
@@ -139,9 +163,11 @@ where
             k_stride,
             v_stride,
             softmax_scale,
+            max_bias,
+            logit_softcap,
         );
     }
-    flash_attn_prefill::<T>(
+    flash_attn_prefill::<false, T>(
         q_data,
         k_data,
         v_data,
@@ -158,79 +184,12 @@ where
     )
 }
 
+// Decode (q_len == 1) and prefill share this skeleton; `LEAN` is a const generic so
+// the mask/ALiBi/softcap branches monomorphize away entirely on the hot lean path
+// (no mask, no bias, no softcap) while the full path keeps them. Same machine code
+// as the former hand-split `_lean`/full pair, one source of truth.
 #[allow(clippy::too_many_arguments)]
-fn flash_attn_decode_lean<T: WithDType>(
-    q_data: &[T],
-    k_data: &[T],
-    v_data: &[T],
-    qshape: &[usize],
-    kshape: &[usize],
-    vshape: &[usize],
-    qstride: &[usize],
-    kstride: &[usize],
-    vstride: &[usize],
-    scale: f32,
-) -> Result<Tensor> {
-    let (h, d) = (qshape[2], qshape[3]);
-    let kv_len = kshape[1];
-    let k_h = kshape[2];
-    let v_h = vshape[2];
-    let rk2 = h / k_h;
-    let rv2 = h / v_h;
-    let dv = d;
-    let v_contiguous = vstride[3] == 1;
-
-    let mut out = vec![0f32; h * dv];
-
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(dv).enumerate().for_each_init(
-            || vec![0f32; dv],
-            |acc, (h_i, out_chunk)| {
-                let k_head = h_i / rk2;
-                let v_head = h_i / rv2;
-
-                let q_base = h_i * qstride[2];
-                let q_row = &q_data[q_base..q_base + d];
-
-                acc.fill(0.0);
-                let mut m = f32::NEG_INFINITY;
-                let mut ssum = 0.0f32;
-
-                for kv_pos in 0..kv_len {
-                    let k_base = kv_pos * kstride[1] + k_head * kstride[2];
-                    let k_row = &k_data[k_base..k_base + d];
-
-                    let score = dot_f32(q_row, k_row) * scale;
-
-                    let v_base = kv_pos * vstride[1] + v_head * vstride[2];
-
-                    online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                        if v_contiguous {
-                            let v_row = &v_data[v_base..v_base + dv];
-                            for d_i in 0..dv {
-                                acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                            }
-                        } else {
-                            for d_i in 0..dv {
-                                acc[d_i] += v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;
-                            }
-                        }
-                    });
-                }
-
-                let inv_s = if ssum > 0.0 { 1.0 / ssum } else { 0.0 };
-                for (out_v, acc_v) in out_chunk.iter_mut().zip(acc.iter()) {
-                    *out_v = *acc_v * inv_s;
-                }
-            },
-        );
-    });
-
-    Tensor::from_vec(out, (1usize, h, 1usize, dv), &Device::Cpu)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flash_attn_decode<T: WithDType>(
+fn flash_attn_decode<const LEAN: bool, T: WithDType>(
     q_data: &[T],
     k_data: &[T],
     v_data: &[T],
@@ -269,7 +228,7 @@ fn flash_attn_decode<T: WithDType>(
         out.par_chunks_mut(dv).enumerate().for_each_init(
             || vec![0f32; dv],
             |acc, (h_i, out_chunk)| {
-                let slope = if max_bias > 0.0 {
+                let slope = if !LEAN && max_bias > 0.0 {
                     2.0f32.powf(-max_bias * ((h_i + 1) as f32) / n2 as f32)
                 } else {
                     1.0
@@ -286,24 +245,29 @@ fn flash_attn_decode<T: WithDType>(
                 let mut ssum = 0.0f32;
 
                 for kv_pos in 0..kv_len {
-                    let mv = if let Some(mv_vec) = mask_vec {
-                        let mval = mv_vec[kv_pos];
-                        slope * mval.to_f64() as f32
+                    let mv = if LEAN {
+                        0.0
+                    } else if let Some(mv_vec) = mask_vec {
+                        slope * mv_vec[kv_pos].to_f64() as f32
                     } else {
                         0.0
                     };
-                    if mv == f32::NEG_INFINITY {
+                    if !LEAN && mv == f32::NEG_INFINITY {
                         continue;
                     }
 
                     let k_base = kv_pos * kstride[1] + k_head * kstride[2];
                     let k_row = &k_data[k_base..k_base + d];
 
-                    let mut score = dot_f32(q_row, k_row) * scale_pre;
-                    if do_softcap {
-                        score = logit_softcap * score.tanh();
-                    }
-                    score += mv;
+                    let score = if LEAN {
+                        dot_f32(q_row, k_row) * scale
+                    } else {
+                        let mut s = dot_f32(q_row, k_row) * scale_pre;
+                        if do_softcap {
+                            s = logit_softcap * s.tanh();
+                        }
+                        s + mv
+                    };
 
                     let v_base = kv_pos * vstride[1] + v_head * vstride[2];
 
@@ -333,85 +297,7 @@ fn flash_attn_decode<T: WithDType>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn flash_attn_prefill_lean<T: WithDType>(
-    q_data: &[T],
-    k_data: &[T],
-    v_data: &[T],
-    qshape: &[usize],
-    kshape: &[usize],
-    vshape: &[usize],
-    qstride: &[usize],
-    kstride: &[usize],
-    vstride: &[usize],
-    scale: f32,
-) -> Result<Tensor> {
-    let (q_len, h, d) = (qshape[1], qshape[2], qshape[3]);
-    let kv_len = kshape[1];
-    let k_h = kshape[2];
-    let v_h = vshape[2];
-    let rk2 = h / k_h;
-    let rv2 = h / v_h;
-    let dv = d;
-    let v_contiguous = vstride[3] == 1;
-
-    let mut out = vec![0f32; h * q_len * dv];
-
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(dv)
-            .with_min_len(64)
-            .enumerate()
-            .for_each_init(
-                || vec![0f32; dv],
-                |acc, (row_idx, out_chunk)| {
-                    let h_i = row_idx / q_len;
-                    let q_pos = row_idx % q_len;
-
-                    let k_head = h_i / rk2;
-                    let v_head = h_i / rv2;
-
-                    let q_base = q_pos * qstride[1] + h_i * qstride[2];
-                    let q_row = &q_data[q_base..q_base + d];
-
-                    acc.fill(0.0);
-                    let mut m = f32::NEG_INFINITY;
-                    let mut ssum = 0.0f32;
-
-                    for kv_pos in 0..kv_len {
-                        let k_base = kv_pos * kstride[1] + k_head * kstride[2];
-                        let k_row = &k_data[k_base..k_base + d];
-
-                        let score = dot_f32(q_row, k_row) * scale;
-
-                        let v_base = kv_pos * vstride[1] + v_head * vstride[2];
-
-                        online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                            if v_contiguous {
-                                let v_row = &v_data[v_base..v_base + dv];
-                                for d_i in 0..dv {
-                                    acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                                }
-                            } else {
-                                for d_i in 0..dv {
-                                    acc[d_i] +=
-                                        v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;
-                                }
-                            }
-                        });
-                    }
-
-                    let inv_s = if ssum > 0.0 { 1.0 / ssum } else { 0.0 };
-                    for (out_v, acc_v) in out_chunk.iter_mut().zip(acc.iter()) {
-                        *out_v = *acc_v * inv_s;
-                    }
-                },
-            );
-    });
-
-    Tensor::from_vec(out, (1usize, h, q_len, dv), &Device::Cpu)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flash_attn_prefill<T: WithDType>(
+fn flash_attn_prefill<const LEAN: bool, T: WithDType>(
     q_data: &[T],
     k_data: &[T],
     v_data: &[T],
@@ -456,7 +342,7 @@ fn flash_attn_prefill<T: WithDType>(
                     let h_i = row_idx / q_len;
                     let q_pos = row_idx % q_len;
 
-                    let slope = if max_bias > 0.0 {
+                    let slope = if !LEAN && max_bias > 0.0 {
                         2.0f32.powf(-max_bias * ((h_i + 1) as f32) / n2 as f32)
                     } else {
                         1.0
@@ -473,24 +359,29 @@ fn flash_attn_prefill<T: WithDType>(
                     let mut ssum = 0.0f32;
 
                     for kv_pos in 0..kv_len {
-                        let mv = if let Some(mv_vec) = mask_vec {
-                            let mval = mv_vec[q_pos * kv_len + kv_pos];
-                            slope * mval.to_f64() as f32
+                        let mv = if LEAN {
+                            0.0
+                        } else if let Some(mv_vec) = mask_vec {
+                            slope * mv_vec[q_pos * kv_len + kv_pos].to_f64() as f32
                         } else {
                             0.0
                         };
-                        if mv == f32::NEG_INFINITY {
+                        if !LEAN && mv == f32::NEG_INFINITY {
                             continue;
                         }
 
                         let k_base = kv_pos * kstride[1] + k_head * kstride[2];
                         let k_row = &k_data[k_base..k_base + d];
 
-                        let mut score = dot_f32(q_row, k_row) * scale_pre;
-                        if do_softcap {
-                            score = logit_softcap * score.tanh();
-                        }
-                        score += mv;
+                        let score = if LEAN {
+                            dot_f32(q_row, k_row) * scale
+                        } else {
+                            let mut s = dot_f32(q_row, k_row) * scale_pre;
+                            if do_softcap {
+                                s = logit_softcap * s.tanh();
+                            }
+                            s + mv
+                        };
 
                         let v_base = kv_pos * vstride[1] + v_head * vstride[2];
 

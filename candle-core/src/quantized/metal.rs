@@ -115,6 +115,11 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::Q4Kx8 => {
+                crate::bail!(
+                    "Q4Kx8 is a CPU-only packed dtype and cannot be read from a Metal buffer"
+                )
+            }
         }
 
         let buffer = self
@@ -439,6 +444,9 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
+            GgmlDType::Q4Kx8 => {
+                panic!("Q4Kx8 is a CPU-only packed dtype with no Metal kernel equivalent")
+            }
         }
     }
 }

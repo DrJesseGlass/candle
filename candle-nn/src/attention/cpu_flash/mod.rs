@@ -20,20 +20,20 @@ use super::AttnMask;
 
 /// Dot product of two equal-length `T` rows, returned as f32.
 ///
-/// Q and K stream in their native dtype (no per-row dequantization).
-///
-/// For f32 this is thin glue over candle's architecture-tuned `VecOps::vec_dot`
-/// intrinsic (NEON / AVX2 / SIMD128). For f16/bf16 we accumulate in f32 by hand:
-/// `VecOps::vec_dot` narrows its internal f32 accumulator back to the half type
-/// before returning, which would round the attention score (and can overflow it
-/// to `inf`) *before* softmax. Keeping the score in f32 preserves its full range
-/// and precision, matching the pre-standardization half kernels.
+/// Thin glue over candle's architecture-tuned `VecOps::vec_dot` intrinsic
+/// (NEON / AVX2 / SIMD128), which `WithDType` already requires. Q and K stream
+/// in their native dtype (no per-row dequantization).
 #[inline]
 pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    // `VecOps::vec_dot` accumulates in f32 internally but stores the result back
+    // through `*mut T`, narrowing the logit to f16/bf16 before we read it. For a
+    // large-but-valid attention score that overflows half range (~65504), that
+    // yields inf/NaN and corrupts the softmax. Keep the accumulation in f32 for
+    // the half dtypes; only f32 (already exact) goes through the intrinsic.
     if matches!(T::DTYPE, DType::F16 | DType::BF16) {
         let mut acc = 0f32;
-        for (&x, &y) in a.iter().zip(b.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
             acc += (x.to_f64() as f32) * (y.to_f64() as f32);
         }
         return acc;
@@ -43,6 +43,176 @@ pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     // out pointer, pre-zeroed for the scalar fallback that accumulates into it.
     unsafe { T::vec_dot(a.as_ptr(), b.as_ptr(), &mut res, a.len()) };
     res.to_f64() as f32
+}
+
+/// Dot product of an f32 query row against an f16 KV row, f32 accumulation.
+///
+/// Decode attention is bandwidth-bound on the KV cache; storing KV in f16 halves
+/// the bytes streamed per token. The f16 elements are widened in-register
+/// (`fcvtl`, baseline aarch64 NEON) so there is no scratch buffer and no
+/// precision loss beyond the f16 storage itself.
+#[cfg(all(target_arch = "aarch64", not(feature = "f16-attn-dot")))]
+#[inline]
+pub(crate) fn dot_f32_f16(a: &[f32], b: &[half::f16]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 8;
+    unsafe {
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        let mut ap = a.as_ptr();
+        let mut bp = b.as_ptr();
+        for _ in 0..chunks {
+            let lo: float32x4_t;
+            let hi: float32x4_t;
+            // f16 NEON intrinsics are unstable; widen via asm and FMA via intrinsics.
+            std::arch::asm!(
+                "ldr {kv:q}, [{bp}]",
+                "fcvtl {lo:v}.4s, {kv:v}.4h",
+                "fcvtl2 {hi:v}.4s, {kv:v}.8h",
+                bp = in(reg) bp,
+                kv = out(vreg) _,
+                lo = out(vreg) lo,
+                hi = out(vreg) hi,
+                options(nostack, pure, readonly),
+            );
+            sum0 = vfmaq_f32(sum0, vld1q_f32(ap), lo);
+            sum1 = vfmaq_f32(sum1, vld1q_f32(ap.add(4)), hi);
+            ap = ap.add(8);
+            bp = bp.add(8);
+        }
+        let mut acc = vaddvq_f32(vaddq_f32(sum0, sum1));
+        for i in (chunks * 8)..n {
+            acc += a[i] * b[i].to_f32();
+        }
+        acc
+    }
+}
+
+#[cfg(all(not(target_arch = "aarch64"), not(feature = "f16-attn-dot")))]
+#[inline]
+pub(crate) fn dot_f32_f16(a: &[f32], b: &[half::f16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| x * y.to_f32()).sum()
+}
+
+/// Native-fp16 q.k dot for the decode flash kernel (opt-in `f16-attn-dot`).
+/// The accumulator is f16, so a head_dim-long sum loses low-order bits
+/// (~1e-3 rel); softmax + greedy argmax absorb it (verified: identical text).
+/// Two accumulators hide the fp16-FMA latency. The exact f32-accumulating
+/// `dot_f32_f16` above is the default and is what runs without this feature.
+#[cfg(all(target_arch = "aarch64", feature = "f16-attn-dot"))]
+#[inline]
+pub(crate) fn dot_f16_f16(a: &[half::f16], b: &[half::f16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let chunks = n / 16; // two 8-lane accumulators per iteration
+    unsafe {
+        use std::arch::aarch64::*;
+        // Opaque 128-bit vregs holding f16x8 accumulators (no stable f16 vec type).
+        let mut acc0 = vreinterpretq_f32_u32(vdupq_n_u32(0));
+        let mut acc1 = vreinterpretq_f32_u32(vdupq_n_u32(0));
+        let mut ap = a.as_ptr();
+        let mut bp = b.as_ptr();
+        for _ in 0..chunks {
+            std::arch::asm!(
+                "ldp {a0:q}, {a1:q}, [{ap}]",
+                "ldp {b0:q}, {b1:q}, [{bp}]",
+                "fmla {acc0:v}.8h, {a0:v}.8h, {b0:v}.8h",
+                "fmla {acc1:v}.8h, {a1:v}.8h, {b1:v}.8h",
+                ap = in(reg) ap,
+                bp = in(reg) bp,
+                a0 = out(vreg) _, a1 = out(vreg) _,
+                b0 = out(vreg) _, b1 = out(vreg) _,
+                acc0 = inout(vreg) acc0,
+                acc1 = inout(vreg) acc1,
+                options(nostack, readonly),
+            );
+            ap = ap.add(16);
+            bp = bp.add(16);
+        }
+        // Widen both f16 accumulators to f32 and horizontally reduce.
+        let lo0: float32x4_t;
+        let hi0: float32x4_t;
+        let lo1: float32x4_t;
+        let hi1: float32x4_t;
+        std::arch::asm!(
+            "fcvtl {lo0:v}.4s, {acc0:v}.4h",
+            "fcvtl2 {hi0:v}.4s, {acc0:v}.8h",
+            "fcvtl {lo1:v}.4s, {acc1:v}.4h",
+            "fcvtl2 {hi1:v}.4s, {acc1:v}.8h",
+            acc0 = in(vreg) acc0,
+            acc1 = in(vreg) acc1,
+            lo0 = out(vreg) lo0, hi0 = out(vreg) hi0,
+            lo1 = out(vreg) lo1, hi1 = out(vreg) hi1,
+            options(nostack, pure, nomem),
+        );
+        let s = vaddq_f32(vaddq_f32(lo0, hi0), vaddq_f32(lo1, hi1));
+        let mut acc = vaddvq_f32(s);
+        for i in (chunks * 16)..n {
+            acc += a[i].to_f32() * b[i].to_f32();
+        }
+        acc
+    }
+}
+
+#[cfg(all(not(target_arch = "aarch64"), feature = "f16-attn-dot"))]
+#[inline]
+pub(crate) fn dot_f16_f16(a: &[half::f16], b: &[half::f16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    // Portable reference: f16 products into an f16 running sum (matches the
+    // lossy-accumulation semantics of the aarch64 path closely enough for tests).
+    let mut acc = half::f16::ZERO;
+    for (x, y) in a.iter().zip(b) {
+        acc += *x * *y;
+    }
+    acc.to_f32()
+}
+
+/// `acc[i] += v[i] * w` with an f16 value row widened in-register (f32 accumulator).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn axpy_f16(acc: &mut [f32], v: &[half::f16], w: f32) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(acc.len(), v.len());
+    let n = acc.len();
+    let chunks = n / 8;
+    unsafe {
+        let wv = vdupq_n_f32(w);
+        let mut ap = acc.as_mut_ptr();
+        let mut vp = v.as_ptr();
+        for _ in 0..chunks {
+            let lo: float32x4_t;
+            let hi: float32x4_t;
+            std::arch::asm!(
+                "ldr {kv:q}, [{vp}]",
+                "fcvtl {lo:v}.4s, {kv:v}.4h",
+                "fcvtl2 {hi:v}.4s, {kv:v}.8h",
+                vp = in(reg) vp,
+                kv = out(vreg) _,
+                lo = out(vreg) lo,
+                hi = out(vreg) hi,
+                options(nostack, pure, readonly),
+            );
+            vst1q_f32(ap, vfmaq_f32(vld1q_f32(ap), lo, wv));
+            vst1q_f32(ap.add(4), vfmaq_f32(vld1q_f32(ap.add(4)), hi, wv));
+            ap = ap.add(8);
+            vp = vp.add(8);
+        }
+        for i in (chunks * 8)..n {
+            acc[i] += v[i].to_f32() * w;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn axpy_f16(acc: &mut [f32], v: &[half::f16], w: f32) {
+    debug_assert_eq!(acc.len(), v.len());
+    for (a, x) in acc.iter_mut().zip(v) {
+        *a += x.to_f32() * w;
+    }
 }
 
 /// Flash attention with automatic dispatch.
