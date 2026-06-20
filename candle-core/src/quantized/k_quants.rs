@@ -2516,9 +2516,12 @@ pub fn matmul<T: GgmlType>(
     }
     // Wide prefill GEMMs beat the integer-dot path on Accelerate's AMX units once
     // `m` amortizes the per-call weight dequantization, mirroring llama.cpp's BLAS
-    // route. Decode (m=1) and short prompts stay on the quantized path.
+    // route. Decode (m=1) and short prompts stay on the quantized path. Q8_1 is
+    // excluded: its `to_float` is unimplemented (it exists only as a vec-dot
+    // activation type), so BLAS would panic on a wide prompt where the integer
+    // vec-dot path runs fine.
     #[cfg(feature = "accelerate")]
-    if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 {
+    if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 && T::DTYPE != GgmlDType::Q8_1 {
         return matmul_blas((m, k, n), lhs, rhs_t, dst);
     }
     // Confine writes to the requested m*n outputs. The decode loops below iterate
