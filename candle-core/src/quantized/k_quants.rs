@@ -7,6 +7,7 @@ use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
+use rayon::prelude::*;
 
 // Default to QK_K 256 rather than 64.
 pub const QK_K: usize = 256;
@@ -72,6 +73,21 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
 
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32;
+
+    /// Dot one quantized weight column against `dst.len()` activation rows spaced
+    /// `row_stride` blocks apart in `ys`. The default loops `vec_dot`; SIMD backends
+    /// can override it to share the weight unpack across rows (GEMM micro-kernel).
+    fn vec_dot_multi(
+        n: usize,
+        xs: &[Self],
+        ys: &[Self::VecDotType],
+        row_stride: usize,
+        dst: &mut [f32],
+    ) {
+        for (r, d) in dst.iter_mut().enumerate() {
+            *d = Self::vec_dot(n, xs, &ys[r * row_stride..r * row_stride + xs.len()]);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1389,6 +1405,66 @@ impl GgmlType for BlockQ4K {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    /// Groups rows through the multi-row NEON kernel so each weight superblock is
+    /// unpacked once per group instead of once per row. Group width is capped by
+    /// `CANDLE_Q4K_XR_R` (2..=8, default 4); a descending 8->4->2->1 ladder settles
+    /// the remainder. One weight column = 4 nibble vectors shared across the group,
+    /// so R=8 fits N1's register file. Bit-identical to `vec_dot`.
+    #[cfg(target_feature = "neon")]
+    fn vec_dot_multi(
+        n: usize,
+        xs: &[Self],
+        ys: &[Self::VecDotType],
+        row_stride: usize,
+        dst: &mut [f32],
+    ) {
+        let nb = xs.len();
+        let row = |r: usize| &ys[r * row_stride..r * row_stride + nb];
+        let maxr = *Q4K_XR_R;
+        let len = dst.len();
+        let mut r = 0;
+        while r < len {
+            let rem = len - r;
+            if maxr >= 8 && rem >= 8 {
+                super::neon::vec_dot_q4k_q8k_xr::<8>(
+                    n,
+                    xs,
+                    &[
+                        row(r),
+                        row(r + 1),
+                        row(r + 2),
+                        row(r + 3),
+                        row(r + 4),
+                        row(r + 5),
+                        row(r + 6),
+                        row(r + 7),
+                    ],
+                    &mut dst[r..r + 8],
+                );
+                r += 8;
+            } else if maxr >= 4 && rem >= 4 {
+                super::neon::vec_dot_q4k_q8k_xr::<4>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1), row(r + 2), row(r + 3)],
+                    &mut dst[r..r + 4],
+                );
+                r += 4;
+            } else if maxr >= 2 && rem >= 2 {
+                super::neon::vec_dot_q4k_q8k_xr::<2>(
+                    n,
+                    xs,
+                    &[row(r), row(r + 1)],
+                    &mut dst[r..r + 2],
+                );
+                r += 2;
+            } else {
+                dst[r] = Self::vec_dot(n, xs, row(r));
+                r += 1;
+            }
+        }
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK_K),
@@ -2289,6 +2365,124 @@ impl GgmlType for BlockQ8K {
 }
 
 // https://github.com/ggml-org/llama.cpp/blob/aa3ee0eb0b80efca126cedf9bcb4fb5864b46ce3/ggml/src/ggml-cpu/ggml-cpu.c#L1205
+// --- lightweight matmul profiling (set CANDLE_MATMUL_PROFILE=1) -----------------
+// Splits matmul wall-time into the activation-quant (alloc + from_float) phase vs the
+// parallel dot-loop. Zero overhead when the env flag is unset.
+pub static MATMUL_QUANT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MATMUL_DOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MATMUL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MATMUL_PROFILE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_MATMUL_PROFILE").is_ok());
+// Min columns per rayon task. Larger => fewer tasks => less fork-join overhead on the
+// tiny per-token (m=1) GEMVs, which are badly over-parallelized at the default 128.
+static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_MIN_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128)
+});
+
+// Max row-group width for the Q4_K multi-row NEON kernel (`vec_dot_q4k_q8k_xr`)
+// inside `vec_dot_multi`. R=2 was the Cortex-X925 default; N1 has 32 regs and one
+// weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
+// and amortize the unpack further. `vec_dot_multi` uses a descending 8->4->2->1
+// ladder capped here. Clamped to 2..=8; default 4 (the validated N1 win).
+// Only the NEON `vec_dot_multi` reads this; gate it to match so non-NEON
+// targets (x86 CI) don't flag it as dead code.
+#[cfg(target_feature = "neon")]
+static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_Q4K_XR_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| (2..=8).contains(&v))
+        .unwrap_or(4)
+});
+
+// Rows per prefill tile. The Q8K activation tile (m_tile x k/256 x 292 B) should stay
+// cache-resident while each weight column streams once per tile instead of once per row;
+// 64 rows x 12.5 KB (k=11008) ~ 800 KB, inside a 1-2 MB L2.
+static MATMUL_M_TILE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_M_TILE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(64)
+});
+
+fn env_threads(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+        .max(1)
+}
+
+// Performance-core estimate: half the logical cores. On Apple Silicon's even P/E
+// split this isolates the fast cores; on uniform CPUs it just halves the pool. The
+// per-pool defaults re-floor this to their measured sweet spots.
+fn qmatmul_half_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 2
+}
+
+fn build_qmatmul_pool(env: &str, default_threads: usize, what: &str) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(env_threads(env, default_threads))
+        .build()
+        .unwrap_or_else(|e| panic!("Failed to build qmatmul {what} pool: {e}"))
+}
+
+// Dedicated pools for quantized matmul. The global rayon pool spans all logical cores,
+// including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
+// GEMVs are memory-bandwidth bound; prefill (m>1) is compute bound and wants the
+// performance cores (~cores/2). Routed by `m` in `matmul`.
+pub(crate) static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+    std::sync::LazyLock::new(|| {
+        // P-cores minus one: the orchestrating thread wakes between the ~200
+        // per-token dispatches, and a pool owning every P-core gets one worker
+        // preempted at each wake - a straggler in every join. Measured faster
+        // than both 2 (bandwidth-starved) and cores/2 (preemption) on M-series.
+        // Cap at the logical core count so the .max(2) floor can't fabricate a
+        // 2-worker pool on a 1-vCPU host (half_cores=0): that would leave
+        // current_num_threads()=2 and defeat the m==1 serial GEMV fast-path
+        // below, which exists precisely for the 1-vCPU/Lambda decode tier.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        build_qmatmul_pool(
+            "CANDLE_QMATMUL_DECODE_THREADS",
+            qmatmul_half_cores().saturating_sub(1).max(2).min(cores),
+            "decode",
+        )
+    });
+pub(crate) static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
+    std::sync::LazyLock::new(|| {
+        build_qmatmul_pool(
+            "CANDLE_QMATMUL_PREFILL_THREADS",
+            qmatmul_half_cores().max(1),
+            "prefill",
+        )
+    });
+
+/// Reset the matmul profiling counters (e.g. to isolate decode from prefill).
+pub fn matmul_profile_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    MATMUL_QUANT_NS.store(0, Relaxed);
+    MATMUL_DOT_NS.store(0, Relaxed);
+    MATMUL_CALLS.store(0, Relaxed);
+}
+
+// Serial GEMV fast-path for single-thread decode (default on; set
+// CANDLE_DECODE_SERIAL=0 to force the rayon path, for A/B benchmarking).
+static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_DECODE_SERIAL")
+        .map(|s| s != "0")
+        .unwrap_or(true)
+});
+
 pub fn matmul<T: GgmlType>(
     (m, k, n): (usize, usize, usize),
     lhs: &[f32],
@@ -2306,106 +2500,228 @@ pub fn matmul<T: GgmlType>(
         "unexpected lhs length {} ({m},{k},{n})",
         lhs.len()
     );
+    // The optimized paths below (and the zero-k fill) write `dst` through raw pointers
+    // and unchecked slices, so individual writes are not bounds-checked. A dst shorter
+    // than m*n would write out of bounds; the old sliced impl panicked instead. Reject
+    // it up front so misuse is a clean error, never UB.
+    if dst.len() < m * n {
+        crate::bail!("matmul: dst len {} < m*n ({m}*{n})", dst.len());
+    }
+    // A zero-width contraction sums over no terms, so every output is zero. Handle it
+    // before the optimized paths: `k_in_blocks` is 0 here, which would make the prefill
+    // `par_chunks_mut(0)` (and the BLAS tiler) panic on chunk_size == 0.
+    if k == 0 {
+        dst[..m * n].fill(0.0);
+        return Ok(());
+    }
+    // Wide prefill GEMMs beat the integer-dot path on Accelerate's AMX units once
+    // `m` amortizes the per-call weight dequantization, mirroring llama.cpp's BLAS
+    // route. Decode (m=1) and short prompts stay on the quantized path. Q8_1 is
+    // excluded: its `to_float` is unimplemented (it exists only as a vec-dot
+    // activation type), so BLAS would panic on a wide prompt where the integer
+    // vec-dot path runs fine.
+    #[cfg(feature = "accelerate")]
+    if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 && T::DTYPE != GgmlDType::Q8_1 {
+        return matmul_blas((m, k, n), lhs, rhs_t, dst);
+    }
+    // Confine writes to the requested m*n outputs. The decode loops below iterate
+    // `dst` directly, so a caller passing a longer backing buffer would otherwise
+    // spill past column n into entries the old row-sliced impl never touched.
+    let dst = &mut dst[..m * n];
+
+    let prof = *MATMUL_PROFILE;
+    let t_quant = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
 
-    // Thread-local scratch buffer reused across calls to avoid per-matmul
-    // heap allocation of the quantized LHS.
-    // Using u64 ensures sufficient alignment regardless of `T::VecDotType`.
-    thread_local! {
-        static LHS_SCRATCH: std::cell::RefCell<Vec<u64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+    // TODO: Pre-allocate this.
+    let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_blocks];
+    // f32, f16, and bf16 support direct copy
+    if T::DIRECT_COPY {
+        T::VecDotType::direct_copy(lhs, &mut lhs_b);
+    } else if m == 1 {
+        T::VecDotType::from_float(&lhs[..k], &mut lhs_b[..k_in_blocks]);
+    } else {
+        // Prefill quantizes m rows; spread them over the prefill pool (the serial
+        // loop showed up as a constant ~2% of prefill wall time).
+        QMATMUL_PREFILL_POOL.install(|| {
+            lhs_b
+                .par_chunks_mut(k_in_blocks)
+                .enumerate()
+                .with_min_len(8)
+                .for_each(|(row_idx, lhs_b_row)| {
+                    T::VecDotType::from_float(&lhs[row_idx * k..(row_idx + 1) * k], lhs_b_row)
+                });
+        });
     }
 
-    let elem_size = std::mem::size_of::<T::VecDotType>();
-    // Required scratch buffer length in u64
-    let required_scratch_len = (m * k_in_blocks * elem_size).div_ceil(8);
+    let t_dot = if let Some(t) = t_quant {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_QUANT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
-    LHS_SCRATCH.with(|cell| -> Result<()> {
-        let mut scratch = cell.borrow_mut();
-        if scratch.len() < required_scratch_len {
-            scratch.resize(required_scratch_len, 0);
+    let pool = if m == 1 {
+        &*QMATMUL_DECODE_POOL
+    } else {
+        &*QMATMUL_PREFILL_POOL
+    };
+    // Decode (m=1) on a single-thread pool - the common Lambda 1-vCPU tier - runs
+    // the GEMV serially. Going through pool.install + into_par_iter there is pure
+    // rayon split/join overhead per call (decode issues ~200 matmuls/token) with no
+    // parallelism to gain. CANDLE_DECODE_SERIAL=0 forces the rayon path.
+    if m == 1 && pool.current_num_threads() <= 1 && *DECODE_SERIAL {
+        let lhs_row = &lhs_b[..k_in_blocks];
+        for (col_idx, d) in dst.iter_mut().enumerate() {
+            let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+            *d = T::vec_dot(k, rhs_col, lhs_row);
         }
-        // SAFETY: u64 ensures sufficient alignment. Resize ensures sufficient size.
-        // All elements written before reading.
-        let lhs_b: &mut [T::VecDotType] = unsafe {
-            std::slice::from_raw_parts_mut(
-                scratch.as_mut_ptr() as *mut T::VecDotType,
-                m * k_in_blocks,
-            )
-        };
-        // f32, f16, and bf16 support direct copy
-        if T::DIRECT_COPY {
-            T::VecDotType::direct_copy(lhs, lhs_b);
+        if let Some(t) = t_dot {
+            use std::sync::atomic::Ordering::Relaxed;
+            MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            MATMUL_CALLS.fetch_add(1, Relaxed);
+        }
+        return Ok(());
+    }
+    pool.install(|| {
+        if m == 1 {
+            let lhs_row = &lhs_b[..k_in_blocks];
+            // Only the first `n` entries are outputs; a caller may pass a longer scratch
+            // buffer (we only reject dst.len() < m*n). Bound to `n` so the tail is left
+            // untouched instead of indexing `rhs_t` past its `n` columns.
+            dst[..n]
+                .par_iter_mut()
+                .enumerate()
+                .with_min_len(*MATMUL_MIN_LEN)
+                .for_each(|(col_idx, dst)| {
+                    let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                    *dst = T::vec_dot(k, rhs_col, lhs_row);
+                });
         } else {
-            for row_idx in 0..m {
-                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-                let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-                T::VecDotType::from_float(lhs, lhs_b_mut)
+            // Row-tiled GEMM: iterating rows in the outer loop streams the full weight
+            // matrix once per row (mx total). Tiling rows keeps an activation tile
+            // cache-resident while each weight column is streamed once per tile,
+            // cutting weight traffic by ~m_tilex. Each (row, col) cell is written by
+            // exactly one task, so the raw-pointer writes are disjoint.
+            struct DstPtr(*mut f32);
+            unsafe impl Sync for DstPtr {}
+            let dst_ptr = DstPtr(dst.as_mut_ptr());
+            let m_tile = *MATMUL_M_TILE;
+            for row0 in (0..m).step_by(m_tile) {
+                let row1 = (row0 + m_tile).min(m);
+                (0..n)
+                    .into_par_iter()
+                    .with_min_len(*MATMUL_MIN_LEN)
+                    .for_each(|col_idx| {
+                        let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+                        let p = &dst_ptr;
+                        let mut out = [0f32; 8];
+                        let mut r = row0;
+                        while r < row1 {
+                            let nr = (row1 - r).min(8);
+                            T::vec_dot_multi(
+                                k,
+                                rhs_col,
+                                &lhs_b[r * k_in_blocks..],
+                                k_in_blocks,
+                                &mut out[..nr],
+                            );
+                            for (i, v) in out[..nr].iter().enumerate() {
+                                unsafe { *p.0.add((r + i) * n + col_idx) = *v };
+                            }
+                            r += nr;
+                        }
+                    });
             }
         }
-        let n_quad = n & !3;
-        let quads_total = n_quad / 4;
-        let n_tail = n - n_quad; // 0..=3
-        let pool = crate::utils::barrier_pool();
-        // Workers 0..n_workers + calling thread as worker n_workers.
-        let n_total = pool.n_workers() + 1;
-        let quads_per_thread = quads_total.div_ceil(n_total);
-        let lhs_b: &[T::VecDotType] = lhs_b;
+    });
 
-        for row_idx in 0..m {
-            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-            let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-            let (main, tail) = dst_row.split_at_mut(n_quad);
-            let main_ptr = main.as_mut_ptr() as usize;
+    if let Some(t) = t_dot {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        MATMUL_CALLS.fetch_add(1, Relaxed);
+    }
+    Ok(())
+}
 
-            pool.execute(|tid| {
-                let start = tid * quads_per_thread;
-                if start >= quads_total {
-                    return;
-                }
-                let end = quads_total.min((tid + 1) * quads_per_thread);
-                let main_ptr = main_ptr as *mut f32;
-                for quad_idx in start..end {
-                    let col = quad_idx * 4;
-                    let (d0, d1, d2, d3) = T::vec_dot_4(
-                        k,
-                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
-                        &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
-                        &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks],
-                        &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks],
-                        lhs_row,
-                    );
-                    unsafe {
-                        let base = main_ptr.add(quad_idx * 4);
-                        *base = d0;
-                        *base.add(1) = d1;
-                        *base.add(2) = d2;
-                        *base.add(3) = d3;
-                    }
-                }
-            });
-            if n_tail >= 2 {
-                let col = n_quad;
-                let (d0, d1) = T::vec_dot_2(
-                    k,
-                    &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
-                    &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
-                    lhs_row,
-                );
-                tail[0] = d0;
-                tail[1] = d1;
-            }
-            if n_tail & 1 == 1 {
-                let col = n - 1;
-                tail[n_tail - 1] = T::vec_dot(
-                    k,
-                    &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
-                    lhs_row,
-                );
-            }
+/// Minimum `m` (token count) before prefill matmuls route through BLAS.
+#[cfg(feature = "accelerate")]
+static MATMUL_BLAS_MIN_M: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_BLAS_MIN_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32)
+});
+
+/// `dst(m,n) = lhs(m,k) x rhs_t(n,k)^T` via per-tile weight dequantization and
+/// Accelerate sgemm. Activations are used in f32 directly (no Q8 quantization),
+/// so this path is slightly *more* accurate than the integer-dot path. The weight
+/// is dequantized in row tiles to bound scratch memory.
+#[cfg(feature = "accelerate")]
+fn matmul_blas<T: GgmlType>(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_t: &[T],
+    dst: &mut [f32],
+) -> Result<()> {
+    let prof = *MATMUL_PROFILE;
+    let t_all = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let k_in_blocks = k / T::BLCK_SIZE;
+
+    // Tile rows so the f32 scratch stays ~8 MB regardless of n.
+    let tile_rows = ((8 << 20) / (4 * k)).clamp(64, n.max(64));
+    let mut scratch = vec![0f32; tile_rows * k];
+
+    let mut row = 0;
+    while row < n {
+        let nc = tile_rows.min(n - row);
+        let tile = &rhs_t[row * k_in_blocks..(row + nc) * k_in_blocks];
+        QMATMUL_PREFILL_POOL.install(|| {
+            scratch[..nc * k]
+                .par_chunks_mut(k)
+                .zip(tile.par_chunks(k_in_blocks))
+                .for_each(|(out_row, q_row)| T::to_float(q_row, out_row));
+        });
+
+        // Row-major D = L * W^T  <=>  column-major D^T(nc x m) = W(nc x k) * L^T.
+        // The scratch buffer is W in row-major = W^T column-major, hence 'T'; the
+        // lhs buffer is L row-major = L^T column-major, hence 'N'. Output columns
+        // land in dst rows at stride n (ldc), offset by the tile's first row.
+        unsafe {
+            crate::accelerate::sgemm(
+                b'T',
+                b'N',
+                nc as i32,
+                m as i32,
+                k as i32,
+                1.0,
+                &scratch[..nc * k],
+                k as i32,
+                lhs,
+                k as i32,
+                0.0,
+                &mut dst[row..],
+                n as i32,
+            );
         }
-        Ok(())
-    })
+        row += nc;
+    }
+
+    if let Some(t) = t_all {
+        use std::sync::atomic::Ordering::Relaxed;
+        MATMUL_DOT_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        MATMUL_CALLS.fetch_add(1, Relaxed);
+    }
+    Ok(())
 }
 
 pub fn matmul_f16<T: GgmlType>(
