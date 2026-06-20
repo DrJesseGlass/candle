@@ -2388,6 +2388,9 @@ static MATMUL_MIN_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| 
 // weight column needs only 4 nibble vectors, so wider groups (R=8) are feasible
 // and amortize the unpack further. `vec_dot_multi` uses a descending 8->4->2->1
 // ladder capped here. Clamped to 2..=8; default 4 (the validated N1 win).
+// Only the NEON `vec_dot_multi` reads this; gate it to match so non-NEON
+// targets (x86 CI) don't flag it as dead code.
+#[cfg(target_feature = "neon")]
 static Q4K_XR_R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("CANDLE_Q4K_XR_R")
         .ok()
@@ -2442,9 +2445,16 @@ static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
         // per-token dispatches, and a pool owning every P-core gets one worker
         // preempted at each wake - a straggler in every join. Measured faster
         // than both 2 (bandwidth-starved) and cores/2 (preemption) on M-series.
+        // Cap at the logical core count so the .max(2) floor can't fabricate a
+        // 2-worker pool on a 1-vCPU host (half_cores=0): that would leave
+        // current_num_threads()=2 and defeat the m==1 serial GEMV fast-path
+        // below, which exists precisely for the 1-vCPU/Lambda decode tier.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         build_qmatmul_pool(
             "CANDLE_QMATMUL_DECODE_THREADS",
-            qmatmul_half_cores().saturating_sub(1).max(2),
+            qmatmul_half_cores().saturating_sub(1).max(2).min(cores),
             "decode",
         )
     });
