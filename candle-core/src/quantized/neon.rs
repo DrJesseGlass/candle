@@ -497,7 +497,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             let xdmin = x.dmin.to_f32();
 
             // Per row: the -dmin * sum(mins . bsums) correction.
-            for (r, sf) in sumf.iter_mut().enumerate().take(R) {
+            for (r, sf) in sumf.iter_mut().enumerate() {
                 let y = &ys[r][i];
                 let q8sums = vpaddq_s16(
                     vld1q_s16(y.bsums.as_ptr()),
@@ -511,10 +511,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             }
 
             let mut q4 = x.qs.as_ptr();
-            let mut q8p = [core::ptr::null::<i8>(); R];
-            for r in 0..R {
-                q8p[r] = ys[r][i].qs.as_ptr();
-            }
+            let mut q8p: [*const i8; R] = std::array::from_fn(|r| ys[r][i].qs.as_ptr());
             // Vector accumulators: one horizontal reduction per superblock per row
             // instead of one per 32 weights (i32 adds are associative, so this is
             // bit-identical to the scalar-sum form).
@@ -548,7 +545,7 @@ pub(crate) fn vec_dot_q4k_q8k_xr<const R: usize>(
             }
         }
     }
-    dst.copy_from_slice(&sumf[..R]);
+    dst.copy_from_slice(&sumf);
 }
 
 #[inline(always)]

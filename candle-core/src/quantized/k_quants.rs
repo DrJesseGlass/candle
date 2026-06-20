@@ -2366,6 +2366,23 @@ fn env_threads(name: &str, default: usize) -> usize {
         .max(1)
 }
 
+// Performance-core estimate: half the logical cores. On Apple Silicon's even P/E
+// split this isolates the fast cores; on uniform CPUs it just halves the pool. The
+// per-pool defaults re-floor this to their measured sweet spots.
+fn qmatmul_half_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        / 2
+}
+
+fn build_qmatmul_pool(env: &str, default_threads: usize, what: &str) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(env_threads(env, default_threads))
+        .build()
+        .unwrap_or_else(|e| panic!("Failed to build qmatmul {what} pool: {e}"))
+}
+
 // Dedicated pools for quantized matmul. The global rayon pool spans all logical cores,
 // including the slow E-cores on Apple Silicon, which drag down both phases. Decode (m=1)
 // GEMVs are memory-bandwidth bound; prefill (m>1) is compute bound and wants the
@@ -2376,28 +2393,19 @@ static QMATMUL_DECODE_POOL: std::sync::LazyLock<rayon::ThreadPool> =
         // per-token dispatches, and a pool owning every P-core gets one worker
         // preempted at each wake - a straggler in every join. Measured faster
         // than both 2 (bandwidth-starved) and cores/2 (preemption) on M-series.
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let n = env_threads(
+        build_qmatmul_pool(
             "CANDLE_QMATMUL_DECODE_THREADS",
-            (cores / 2).saturating_sub(1).max(2),
-        );
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .expect("Failed to build qmatmul decode pool")
+            qmatmul_half_cores().saturating_sub(1).max(2),
+            "decode",
+        )
     });
 static QMATMUL_PREFILL_POOL: std::sync::LazyLock<rayon::ThreadPool> =
     std::sync::LazyLock::new(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let n = env_threads("CANDLE_QMATMUL_PREFILL_THREADS", (cores / 2).max(1));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .expect("Failed to build qmatmul prefill pool")
+        build_qmatmul_pool(
+            "CANDLE_QMATMUL_PREFILL_THREADS",
+            qmatmul_half_cores().max(1),
+            "prefill",
+        )
     });
 
 /// Reset the matmul profiling counters (e.g. to isolate decode from prefill).
@@ -2411,7 +2419,9 @@ pub fn matmul_profile_reset() {
 // Serial GEMV fast-path for single-thread decode (default on; set
 // CANDLE_DECODE_SERIAL=0 to force the rayon path, for A/B benchmarking).
 static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("CANDLE_DECODE_SERIAL").map(|s| s != "0").unwrap_or(true)
+    std::env::var("CANDLE_DECODE_SERIAL")
+        .map(|s| s != "0")
+        .unwrap_or(true)
 });
 
 pub fn matmul<T: GgmlType>(
@@ -2452,6 +2462,10 @@ pub fn matmul<T: GgmlType>(
     if m >= *MATMUL_BLAS_MIN_M && k % T::BLCK_SIZE == 0 {
         return matmul_blas((m, k, n), lhs, rhs_t, dst);
     }
+    // Confine writes to the requested m*n outputs. The decode loops below iterate
+    // `dst` directly, so a caller passing a longer backing buffer would otherwise
+    // spill past column n into entries the old row-sliced impl never touched.
+    let dst = &mut dst[..m * n];
 
     let prof = *MATMUL_PROFILE;
     let t_quant = if prof {

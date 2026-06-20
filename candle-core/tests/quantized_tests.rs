@@ -7,7 +7,6 @@ use candle_core::{
 };
 use quantized::{k_quants, GgmlType};
 use rand::prelude::*;
-use std::borrow::Cow;
 
 const GGML_TEST_SIZE: usize = 32 * 128;
 
