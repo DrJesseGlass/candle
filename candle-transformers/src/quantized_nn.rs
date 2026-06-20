@@ -61,6 +61,7 @@ pub struct QuantizedEmbedding {
     weight: std::sync::Arc<QTensor>,
     row_bytes: usize,
     hidden: usize,
+    vocab: usize,
     span: tracing::Span,
 }
 
@@ -78,6 +79,7 @@ impl QuantizedEmbedding {
             weight,
             row_bytes,
             hidden,
+            vocab,
             span,
         })
     }
@@ -98,7 +100,17 @@ impl Module for QuantizedEmbedding {
         let data = self.weight.data()?; // zero-copy borrow on CPU
         let mut rows = Vec::with_capacity(ids.len() * self.row_bytes);
         for &id in &ids {
-            let off = id as usize * self.row_bytes;
+            // Bounds-check before slicing: a direct `data[off..]` would panic on an
+            // out-of-range id (tokenizer/model mismatch, bad input), whereas the dense
+            // index_select path this replaces returned an error. Bail to match it.
+            let id = id as usize;
+            if id >= self.vocab {
+                candle::bail!(
+                    "embedding id {id} out of range for vocab size {}",
+                    self.vocab
+                );
+            }
+            let off = id * self.row_bytes;
             rows.extend_from_slice(&data[off..off + self.row_bytes]);
         }
         let storage = candle::quantized::QStorage::from_data(
