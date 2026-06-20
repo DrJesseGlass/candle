@@ -40,6 +40,9 @@ use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
+// Takes a borrow (not the Cow by value): the returned slice points into the
+// caller's buffer, and an owned Cow consumed here would be freed on return,
+// leaving the slice dangling.
 fn as_t_slice<T>(data: &[u8]) -> &[T] {
     let size = std::mem::size_of::<T>();
     assert_eq!(
@@ -88,7 +91,7 @@ pub enum QStorage {
 
 impl QStorage {
     pub fn from_data(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
-        let data: &[u8] = &data;
+        let data: &[u8] = data.as_ref();
         match device {
             Device::Cpu => Ok(Self::Cpu(dtype.from_data(Cow::Borrowed(data)))),
             Device::Metal(d) => match dtype {
@@ -359,7 +362,7 @@ impl GgmlDType {
     }
 
     pub fn from_data(&self, data: Cow<'_, [u8]>) -> Box<dyn QuantizedType> {
-        let data: &[u8] = &data;
+        let data: &[u8] = data.as_ref();
         match self {
             Self::F32 => Box::new(as_t_slice::<f32>(data).to_vec()),
             Self::F16 => Box::new(as_t_slice::<f16>(data).to_vec()),
@@ -501,6 +504,36 @@ impl QTensor {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
         Ok(Self { storage, shape })
+    }
+
+    /// Concatenate 2D quantized tensors along the output (row) dimension.
+    ///
+    /// Every ggml quantization format quantizes rows independently (blocks never span
+    /// rows), so this is a bit-exact byte-level concatenation: a matmul against the
+    /// result equals the concatenation of the per-tensor matmul outputs. All inputs
+    /// must share the same dtype and inner (k) dimension.
+    pub fn cat_rows(ts: &[&QTensor]) -> Result<Self> {
+        let first = match ts.first() {
+            Some(t) => t,
+            None => crate::bail!("cat_rows called with no tensors"),
+        };
+        let dtype = first.dtype();
+        let (_, k) = first.shape().dims2()?;
+        let mut rows = 0;
+        let mut data = Vec::with_capacity(ts.iter().map(|t| t.storage_size_in_bytes()).sum());
+        for t in ts {
+            let (r, kt) = t.shape().dims2()?;
+            if t.dtype() != dtype {
+                crate::bail!("cat_rows dtype mismatch: {:?} vs {:?}", t.dtype(), dtype)
+            }
+            if kt != k {
+                crate::bail!("cat_rows inner dim mismatch: {kt} vs {k}")
+            }
+            rows += r;
+            data.extend_from_slice(&t.data()?);
+        }
+        let storage = QStorage::from_data(Cow::Owned(data), &first.device(), dtype)?;
+        Self::new(storage, (rows, k))
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
