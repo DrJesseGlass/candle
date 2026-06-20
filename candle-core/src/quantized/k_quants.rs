@@ -2475,6 +2475,21 @@ pub fn matmul_profile_reset() {
     MATMUL_CALLS.store(0, Relaxed);
 }
 
+// Route plain Q4_K matmuls through the interleaved packed kernel by repacking the
+// weight on first use (`repack::matmul_q4k_packed`). RUNTIME repack - keeps BOTH the
+// Q4_K and repacked copies resident (+~250MB). SUPERSEDED by the baked Q4Kx8 format
+// (gguf-requant --pack): bake the packed layout offline -> single copy, same speed,
+// -160MB RAM, no repack-on-first-use. So DEFAULT OFF; set CANDLE_MATMUL_PACKED_Q4K=1
+// only to runtime-pack a plain Q4_K model (speed at the +250MB memory cost). Bit-exact.
+// Gated on `neon` to match its sole consumer (the packed matmul path below); without
+// it the static is dead code on non-aarch64 builds.
+#[cfg(target_feature = "neon")]
+static MATMUL_PACKED_Q4K: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_MATMUL_PACKED_Q4K")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
 // Serial GEMV fast-path for single-thread decode (default on; set
 // CANDLE_DECODE_SERIAL=0 to force the rayon path, for A/B benchmarking).
 static DECODE_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -2528,6 +2543,25 @@ pub fn matmul<T: GgmlType>(
     // `dst` directly, so a caller passing a longer backing buffer would otherwise
     // spill past column n into entries the old row-sliced impl never touched.
     let dst = &mut dst[..m * n];
+
+    // Interleaved packed Q4_K path (repack-on-first-use + SDOT GEMM/GEMV). T is
+    // BlockQ4K exactly when DTYPE matches, so the cast is sound; gated on shape
+    // divisibility and the env flag.
+    #[cfg(target_feature = "neon")]
+    if *MATMUL_PACKED_Q4K
+        && T::DTYPE == GgmlDType::Q4K
+        && super::repack::packed_q4k_applicable(k, n)
+    {
+        let rhs_q4k =
+            unsafe { std::slice::from_raw_parts(rhs_t.as_ptr() as *const BlockQ4K, rhs_t.len()) };
+        let pool = if m == 1 {
+            &*QMATMUL_DECODE_POOL
+        } else {
+            &*QMATMUL_PREFILL_POOL
+        };
+        super::repack::matmul_q4k_packed((m, k, n), lhs, rhs_q4k, dst, pool);
+        return Ok(());
+    }
 
     let prof = *MATMUL_PROFILE;
     let t_quant = if prof {

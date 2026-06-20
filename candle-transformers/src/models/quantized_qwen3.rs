@@ -25,6 +25,47 @@ pub struct Gguf<R: Read + Seek> {
     device: Device,
 }
 
+/// Parse a requant target dtype from an env var (decode is BW-bound; lower-bit
+/// weights stream fewer bytes/token). All targets have aarch64 NEON kernels.
+fn requant_dtype(env: &str) -> Option<candle::quantized::GgmlDType> {
+    use candle::quantized::GgmlDType;
+    match std::env::var(env).ok().as_deref() {
+        Some("q4k") | Some("q4_k") => Some(GgmlDType::Q4K),
+        Some("q5k") | Some("q5_k") => Some(GgmlDType::Q5K),
+        Some("q3k") | Some("q3_k") => Some(GgmlDType::Q3K),
+        Some("q4_0") => Some(GgmlDType::Q4_0),
+        _ => None,
+    }
+}
+
+/// Requantize a weight QTensor to `target` (dequant->quant). NOT bit-exact.
+fn requant_qt(
+    qt: std::sync::Arc<QTensor>,
+    device: &Device,
+    target: Option<candle::quantized::GgmlDType>,
+) -> Result<std::sync::Arc<QTensor>> {
+    // Pre-packed Q4_Kx8 weights are bake-only: dequantizing/requantizing them would
+    // discard the interleaved layout (and quantize-to is unsupported). Leave as-is.
+    if qt.dtype() == candle::quantized::GgmlDType::Q4Kx8 {
+        return Ok(qt);
+    }
+    match target {
+        Some(dt) if qt.dtype() != dt => {
+            let f = qt.dequantize(device)?;
+            Ok(std::sync::Arc::new(QTensor::quantize(&f, dt)?))
+        }
+        _ => Ok(qt),
+    }
+}
+
+/// lm_head requant target: its own knob, falling back to the whole-model knob.
+/// `CANDLE_REQUANT_LMHEAD` in {q4k,q5k,q3k,q4_0}, else `CANDLE_REQUANT_WEIGHTS`.
+fn requant_lmhead(qt: std::sync::Arc<QTensor>, device: &Device) -> Result<std::sync::Arc<QTensor>> {
+    let target =
+        requant_dtype("CANDLE_REQUANT_LMHEAD").or_else(|| requant_dtype("CANDLE_REQUANT_WEIGHTS"));
+    requant_qt(qt, device, target)
+}
+
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
         Self { ct, reader, device }
@@ -32,7 +73,13 @@ impl<R: Read + Seek> Gguf<R> {
 
     pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        QMatMul::from_weights(ws.into())
+        // Whole-model weight requant (CANDLE_REQUANT_WEIGHTS) - BW lever, not bit-exact.
+        let qt = requant_qt(
+            std::sync::Arc::new(ws),
+            &self.device,
+            requant_dtype("CANDLE_REQUANT_WEIGHTS"),
+        )?;
+        QMatMul::from_weights(qt)
     }
 
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
@@ -66,17 +113,19 @@ impl FusedPairProj {
         let t2 = gg.tensor(name2)?;
         let (n1, k1) = t1.shape().dims2()?;
         let (n2, k2) = t2.shape().dims2()?;
+        let rq = requant_dtype("CANDLE_REQUANT_WEIGHTS");
         if gg.device.is_cpu() && t1.dtype() == t2.dtype() && k1 == k2 {
             let fused = QTensor::cat_rows(&[&t1, &t2])?;
+            let fused = requant_qt(std::sync::Arc::new(fused), &gg.device, rq)?;
             Ok(Self::Fused {
-                proj: QMatMul::from_weights(fused.into())?,
+                proj: QMatMul::from_weights(fused)?,
                 n1,
                 n2,
             })
         } else {
             Ok(Self::Split(
-                QMatMul::from_weights(t1.into())?,
-                QMatMul::from_weights(t2.into())?,
+                QMatMul::from_weights(requant_qt(std::sync::Arc::new(t1), &gg.device, rq)?)?,
+                QMatMul::from_weights(requant_qt(std::sync::Arc::new(t2), &gg.device, rq)?)?,
             ))
         }
     }
@@ -602,7 +651,14 @@ impl ModelWeights {
         };
 
         let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
-        let embed_tokens = if device.is_cpu() {
+        // QuantizedEmbedding gathers individual rows, which the interleaved Q4Kx8
+        // layout (8-row groups, no per-row from_data) cannot serve - it would hit the
+        // bake-only `unreachable!()`. A Q4Kx8 token_embd (only producible by our
+        // gguf-requant --pack, which deliberately leaves embeddings unpacked) therefore
+        // falls back to the dense dequantized path instead of panicking.
+        let embed_quantizable =
+            device.is_cpu() && embed_tensor.dtype() != candle::quantized::GgmlDType::Q4Kx8;
+        let embed_tokens = if embed_quantizable {
             EmbedTokens::Quantized(QuantizedEmbedding::from_arc(embed_tensor.clone())?)
         } else {
             EmbedTokens::Full(Embedding::new(
@@ -636,9 +692,15 @@ impl ModelWeights {
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
         // Load output projection tensor, falling back to tied embeddings like gemma3;
         // the tied case shares the quantized bytes already held by embed_tokens.
+        // The lm_head is ~36% of the decode weight stream (Q6_K); decode is BW-bound,
+        // so CANDLE_REQUANT_LMHEAD=q4k|q5k|q3k|q4_0 requantizes it lower to cut that BW
+        // (NOT bit-exact - shifts logits slightly). The input-embedding copy stays as-is
+        // (a cheap lookup, no BW benefit to change).
         let lm_head = match gg.tensor("output.weight") {
-            Ok(tensor) => QMatMul::from_weights(tensor.into())?,
-            Err(_) => QMatMul::from_weights(embed_tensor.clone())?,
+            Ok(tensor) => {
+                QMatMul::from_weights(requant_lmhead(std::sync::Arc::new(tensor), device)?)?
+            }
+            Err(_) => QMatMul::from_weights(requant_lmhead(embed_tensor.clone(), device)?)?,
         };
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
