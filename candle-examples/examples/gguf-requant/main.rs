@@ -109,7 +109,6 @@ fn main() -> Result<()> {
     let mut owned: Vec<(String, QTensor)> = Vec::with_capacity(names.len() + 1);
     let (mut before, mut after) = (0usize, 0usize);
     let mut has_output = false;
-    let mut token_embd_q4k: Option<QTensor> = None;
 
     for name in &names {
         if name == "output.weight" {
@@ -127,16 +126,6 @@ fn main() -> Result<()> {
         } else {
             qt
         };
-
-        // Stash a Q4_K token_embd for the tied-lm_head emit (use the post-requant copy).
-        if args.pack && name == "token_embd.weight" && qt.dtype() == GgmlDType::Q4K {
-            if let Ok((n, _)) = qt.shape().dims2() {
-                if n % 8 == 0 {
-                    let de = qt.dequantize(&device)?;
-                    token_embd_q4k = Some(QTensor::quantize(&de, GgmlDType::Q4K)?);
-                }
-            }
-        }
 
         // Pack eligible matmul weights (keep token_embd as Q4_K for the lookup).
         let qt = if args.pack
@@ -164,10 +153,21 @@ fn main() -> Result<()> {
     }
 
     // Tied embeddings: no output.weight present. Emit a packed output.weight from the
-    // Q4_K token_embd so the lm_head gets a fast packed weight (token_embd stays Q4_K).
+    // token_embd. Pack its EXACT stored Q4_K bytes (no dequant/requant round-trip) so the
+    // tied lm_head stays bit-identical to the embedding it shares - re-quantizing here
+    // would shift the output logits for no reason.
     if args.pack && !has_output {
-        if let Some(te) = token_embd_q4k {
-            match pack_q4k_to_q4kx8(&te) {
+        let packed = match owned.iter().find(|(n, _)| n == "token_embd.weight") {
+            Some((_, te))
+                if te.dtype() == GgmlDType::Q4K
+                    && te.shape().dims2().map(|(n, _)| n % 8 == 0).unwrap_or(false) =>
+            {
+                Some(pack_q4k_to_q4kx8(te))
+            }
+            _ => None,
+        };
+        if let Some(result) = packed {
+            match result {
                 Ok(packed) => {
                     println!(
                         "  emit    output.weight (tied): {:?} -> {:?}",
