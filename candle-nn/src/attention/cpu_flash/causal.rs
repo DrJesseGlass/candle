@@ -444,49 +444,70 @@ pub fn causal_decode_f16kv_interleaved(
     // One task per kv head, computing all `rk` of its GQA query heads in a single
     // pass: the head-major cache makes the stream contiguous, and each K/V row is
     // read from memory once instead of once per query head.
-    FLASH_DECODE_POOL.install(|| {
-        out.par_chunks_mut(rk * d).enumerate().for_each_init(
-            || (vec![0f32; rk * d], vec![0f32; rk], vec![0f32; rk]),
-            |(acc, m, ssum), (kv_h, out_chunk)| {
-                let head_base = kv_h * head_stride;
+    let process = |kv_h: usize,
+                   out_chunk: &mut [f32],
+                   acc: &mut [f32],
+                   m: &mut [f32],
+                   ssum: &mut [f32]| {
+        let head_base = kv_h * head_stride;
 
-                acc.fill(0.0);
-                m.fill(f32::NEG_INFINITY);
-                ssum.fill(0.0);
+        acc.fill(0.0);
+        m.fill(f32::NEG_INFINITY);
+        ssum.fill(0.0);
 
-                for kv_pos in 0..kv_len {
-                    // K and V share a base pointer (adjacent in memory)
-                    let kv_base = head_base + kv_pos * 2 * d;
-                    let k_row = &kv_data[kv_base..kv_base + d];
-                    let v_row = &kv_data[kv_base + d..kv_base + 2 * d];
+        for kv_pos in 0..kv_len {
+            // K and V share a base pointer (adjacent in memory)
+            let kv_base = head_base + kv_pos * 2 * d;
+            let k_row = &kv_data[kv_base..kv_base + d];
+            let v_row = &kv_data[kv_base + d..kv_base + 2 * d];
 
-                    // One prefetch loads both next K and V
-                    if kv_pos + 1 < kv_len {
-                        prefetch_read(kv_data[kv_base + 2 * d..].as_ptr());
-                    }
+            // One prefetch loads both next K and V
+            if kv_pos + 1 < kv_len {
+                prefetch_read(kv_data[kv_base + 2 * d..].as_ptr());
+            }
 
-                    for r in 0..rk {
-                        let h_i = kv_h * rk + r;
-                        let q_row = &q_data[h_i * d..(h_i + 1) * d];
-                        let score = dot_f32_f16(q_row, k_row) * scale;
-                        let acc_r = &mut acc[r * d..(r + 1) * d];
-                        online_softmax_step(score, &mut m[r], &mut ssum[r], acc_r, |acc, w| {
-                            axpy_f16(acc, v_row, w);
-                        });
-                    }
-                }
+            for r in 0..rk {
+                let h_i = kv_h * rk + r;
+                let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                let score = dot_f32_f16(q_row, k_row) * scale;
+                let acc_r = &mut acc[r * d..(r + 1) * d];
+                online_softmax_step(score, &mut m[r], &mut ssum[r], acc_r, |acc, w| {
+                    axpy_f16(acc, v_row, w);
+                });
+            }
+        }
 
-                for r in 0..rk {
-                    let inv = if ssum[r] > 0.0 { 1.0 / ssum[r] } else { 0.0 };
-                    let acc_r = &acc[r * d..(r + 1) * d];
-                    let out_r = &mut out_chunk[r * d..(r + 1) * d];
-                    for t in 0..d {
-                        out_r[t] = acc_r[t] * inv;
-                    }
-                }
-            },
-        );
+        for r in 0..rk {
+            let inv = if ssum[r] > 0.0 { 1.0 / ssum[r] } else { 0.0 };
+            let acc_r = &acc[r * d..(r + 1) * d];
+            let out_r = &mut out_chunk[r * d..(r + 1) * d];
+            for t in 0..d {
+                out_r[t] = acc_r[t] * inv;
+            }
+        }
+    };
+
+    // Single-thread pool (the common Lambda 1-vCPU tier) has only ~h_kv tiny tasks,
+    // so the rayon split/join machinery is pure per-call overhead - run serially.
+    // Bit-identical to the parallel path; CANDLE_FLASH_SERIAL=0 forces rayon.
+    static FLASH_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("CANDLE_FLASH_SERIAL").map(|s| s != "0").unwrap_or(true)
     });
+    if *FLASH_SERIAL && FLASH_DECODE_POOL.current_num_threads() <= 1 {
+        let mut acc = vec![0f32; rk * d];
+        let mut m = vec![0f32; rk];
+        let mut ssum = vec![0f32; rk];
+        for (kv_h, out_chunk) in out.chunks_mut(rk * d).enumerate() {
+            process(kv_h, out_chunk, &mut acc, &mut m, &mut ssum);
+        }
+    } else {
+        FLASH_DECODE_POOL.install(|| {
+            out.par_chunks_mut(rk * d).enumerate().for_each_init(
+                || (vec![0f32; rk * d], vec![0f32; rk], vec![0f32; rk]),
+                |(acc, m, ssum), (kv_h, out_chunk)| process(kv_h, out_chunk, acc, m, ssum),
+            );
+        });
+    }
 
     Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
 }
