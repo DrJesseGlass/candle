@@ -44,9 +44,12 @@ fn requant_qt(
     device: &Device,
     target: Option<candle::quantized::GgmlDType>,
 ) -> Result<std::sync::Arc<QTensor>> {
-    // Pre-packed Q4_Kx8 weights are bake-only: dequantizing/requantizing them would
-    // discard the interleaved layout (and quantize-to is unsupported). Leave as-is.
-    if qt.dtype() == candle::quantized::GgmlDType::Q4Kx8 {
+    // Pre-packed Q4_Kx8/Q6_Kx8 weights are bake-only: dequantizing/requantizing them
+    // would discard the interleaved layout (and quantize-to is unsupported). Leave as-is.
+    if matches!(
+        qt.dtype(),
+        candle::quantized::GgmlDType::Q4Kx8 | candle::quantized::GgmlDType::Q6Kx8
+    ) {
         return Ok(qt);
     }
     match target {
@@ -651,13 +654,16 @@ impl ModelWeights {
         };
 
         let embed_tensor = Arc::new(gg.tensor("token_embd.weight")?);
-        // QuantizedEmbedding gathers individual rows, which the interleaved Q4Kx8
+        // QuantizedEmbedding gathers individual rows, which the interleaved Q4Kx8/Q6Kx8
         // layout (8-row groups, no per-row from_data) cannot serve - it would hit the
-        // bake-only `unreachable!()`. A Q4Kx8 token_embd (only producible by our
+        // bake-only `unreachable!()`. A packed token_embd (only producible by our
         // gguf-requant --pack, which deliberately leaves embeddings unpacked) therefore
         // falls back to the dense dequantized path instead of panicking.
-        let embed_quantizable =
-            device.is_cpu() && embed_tensor.dtype() != candle::quantized::GgmlDType::Q4Kx8;
+        let embed_quantizable = device.is_cpu()
+            && !matches!(
+                embed_tensor.dtype(),
+                candle::quantized::GgmlDType::Q4Kx8 | candle::quantized::GgmlDType::Q6Kx8
+            );
         let embed_tokens = if embed_quantizable {
             EmbedTokens::Quantized(QuantizedEmbedding::from_arc(embed_tensor.clone())?)
         } else {

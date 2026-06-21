@@ -13,7 +13,9 @@
 //! no output.weight additionally gets a packed output.weight emitted.
 use anyhow::Result;
 use candle::quantized::{
-    ggml_file, gguf_file, k_quants::BlockQ4K, repack, GgmlDType, GgmlType, QTensor,
+    ggml_file, gguf_file,
+    k_quants::{BlockQ4K, BlockQ6K},
+    repack, GgmlDType, GgmlType, QTensor,
 };
 use candle::Device;
 use clap::Parser;
@@ -95,6 +97,39 @@ fn pack_q4k_to_q4kx8(qt: &QTensor) -> Result<QTensor> {
     Ok(tensor)
 }
 
+/// Repack a Q6_K weight QTensor `[n, k]` into a pre-packed Q6_Kx8 QTensor. The
+/// Q6_K analogue of `pack_q4k_to_q4kx8` for the residual attn_v/ffn_down weights
+/// that Q4_K_M leaves at Q6_K.
+fn pack_q6k_to_q6kx8(qt: &QTensor) -> Result<QTensor> {
+    let (n, k) = qt.shape().dims2()?;
+    anyhow::ensure!(qt.dtype() == GgmlDType::Q6K, "pack expects Q6_K input");
+    anyhow::ensure!(n % 8 == 0 && k % 256 == 0, "pack needs n%8==0 && k%256==0");
+    let nb = k / 256;
+    let data = qt.data()?; // raw Q6_K block bytes, row-major (channel r at r*nb)
+    let bs = std::mem::size_of::<BlockQ6K>();
+    anyhow::ensure!(
+        data.len() == n * nb * bs,
+        "unexpected Q6_K byte count {} vs {}",
+        data.len(),
+        n * nb * bs
+    );
+    // SAFETY: bytes came straight from a Q6_K QTensor (POD #[repr(C)] BlockQ6K),
+    // length is an exact multiple of the block size; copy into an aligned Vec first.
+    let mut rows = vec![BlockQ6K::zeros(); n * nb];
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), rows.as_mut_ptr() as *mut u8, data.len());
+    }
+    let packed = repack::repack_q6k_weight(&rows, n, nb);
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            packed.as_ptr() as *const u8,
+            std::mem::size_of_val(packed.as_slice()),
+        )
+    };
+    let tensor = ggml_file::qtensor_from_ggml(GgmlDType::Q6Kx8, raw, vec![n, k], &Device::Cpu)?;
+    Ok(tensor)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let device = Device::Cpu;
@@ -127,22 +162,22 @@ fn main() -> Result<()> {
             qt
         };
 
-        // Pack eligible matmul weights (keep token_embd as Q4_K for the lookup).
-        let qt = if args.pack
-            && qt.dtype() == GgmlDType::Q4K
+        // Pack eligible matmul weights (keep token_embd as Q4_K/Q6_K for the lookup).
+        // Q4_K -> Q4Kx8, Q6_K -> Q6Kx8 (the residual attn_v/ffn_down weights).
+        let packable = args.pack
             && is_packable_matmul(name)
             && qt
                 .shape()
                 .dims2()
                 .map(|(n, k)| n % 8 == 0 && k % 256 == 0)
-                .unwrap_or(false)
-        {
+                .unwrap_or(false);
+        let qt = if packable && qt.dtype() == GgmlDType::Q4K {
             let packed = pack_q4k_to_q4kx8(&qt)?;
-            println!(
-                "  pack    {name}: {:?} -> {:?}",
-                qt.dtype(),
-                GgmlDType::Q4Kx8
-            );
+            println!("  pack    {name}: {:?} -> {:?}", qt.dtype(), GgmlDType::Q4Kx8);
+            packed
+        } else if packable && qt.dtype() == GgmlDType::Q6K {
+            let packed = pack_q6k_to_q6kx8(&qt)?;
+            println!("  pack    {name}: {:?} -> {:?}", qt.dtype(), GgmlDType::Q6Kx8);
             packed
         } else {
             qt
@@ -157,23 +192,21 @@ fn main() -> Result<()> {
     // tied lm_head stays bit-identical to the embedding it shares - re-quantizing here
     // would shift the output logits for no reason.
     if args.pack && !has_output {
-        let packed = match owned.iter().find(|(n, _)| n == "token_embd.weight") {
-            Some((_, te))
-                if te.dtype() == GgmlDType::Q4K
-                    && te.shape().dims2().map(|(n, _)| n % 8 == 0).unwrap_or(false) =>
-            {
-                Some(pack_q4k_to_q4kx8(te))
+        let te = owned.iter().find(|(n, _)| n == "token_embd.weight");
+        let n_ok = |te: &QTensor| te.shape().dims2().map(|(n, _)| n % 8 == 0).unwrap_or(false);
+        let packed = match te {
+            Some((_, te)) if te.dtype() == GgmlDType::Q4K && n_ok(te) => {
+                Some((GgmlDType::Q4K, GgmlDType::Q4Kx8, pack_q4k_to_q4kx8(te)))
+            }
+            Some((_, te)) if te.dtype() == GgmlDType::Q6K && n_ok(te) => {
+                Some((GgmlDType::Q6K, GgmlDType::Q6Kx8, pack_q6k_to_q6kx8(te)))
             }
             _ => None,
         };
-        if let Some(result) = packed {
+        if let Some((src, dst, result)) = packed {
             match result {
                 Ok(packed) => {
-                    println!(
-                        "  emit    output.weight (tied): {:?} -> {:?}",
-                        GgmlDType::Q4K,
-                        GgmlDType::Q4Kx8
-                    );
+                    println!("  emit    output.weight (tied): {src:?} -> {dst:?}");
                     after += packed.storage_size_in_bytes();
                     owned.push(("output.weight".to_string(), packed));
                 }

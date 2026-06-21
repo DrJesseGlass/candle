@@ -1381,6 +1381,63 @@ mod tests {
         }
     }
 
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn packed_q6kx8_from_bytes_matches_baseline() {
+        use crate::quantized::k_quants::matmul;
+        use crate::quantized::QuantizedType;
+
+        let k = 512usize; // 2 super-blocks
+        let n = 24usize; // 3 groups of 8
+        let nb = k / QK_K;
+        let mut st = 0x51c6_ba9d_2244_8821u64;
+
+        // Row-major Q6_K weight: channel r at r*nb.
+        let mut rhs_t = vec![BlockQ6K::zeros(); n * nb];
+        for r in 0..n {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            BlockQ6K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
+        }
+
+        // Offline bake: repack -> raw bytes -> PackedQ6Kx8 (owned, from bytes).
+        let packed = repack_q6k_weight(&rhs_t, n, nb);
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                packed.as_ptr() as *const u8,
+                std::mem::size_of_val(packed.as_slice()),
+            )
+        };
+        let pq = PackedQ6Kx8::from_bytes(raw, n);
+
+        for &m in &[1usize, 4usize] {
+            let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
+            let mut dst_base = vec![0f32; m * n];
+            let mut dst_pack = vec![0f32; m * n];
+            matmul::<BlockQ6K>((m, k, n), &lhs, &rhs_t, &mut dst_base).unwrap();
+            pq.matmul_t((m, k, n), &lhs, &mut dst_pack).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    dst_base[i].to_bits(),
+                    dst_pack[i].to_bits(),
+                    "m={m} idx {i}: base {} packed {}",
+                    dst_base[i],
+                    dst_pack[i]
+                );
+            }
+        }
+
+        // dequantize() must reproduce the original Q6_K dequant (same formula).
+        let mut want = vec![0f32; n * k];
+        BlockQ6K::to_float(&rhs_t, &mut want);
+        let got = match pq.dequantize(n * k).unwrap() {
+            crate::CpuStorage::F32(v) => v,
+            _ => panic!("expected f32"),
+        };
+        for i in 0..n * k {
+            assert_eq!(want[i].to_bits(), got[i].to_bits(), "dequant idx {i}");
+        }
+    }
+
     // Standalone microbench: baseline per-column matmul vs the packed 8-channel
     // SDOT GEMM, for decode (m=1) and prefill (m=512). Ignored by default; run with
     //   RUSTFLAGS="-C target-cpu=native" cargo test -p candle-core --release \
