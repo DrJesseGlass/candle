@@ -112,6 +112,7 @@ impl QStorage {
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
                 GgmlDType::Q4Kx8 => crate::bail!("Q4Kx8 is CPU-only"),
+                GgmlDType::Q6Kx8 => crate::bail!("Q6Kx8 is CPU-only"),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -130,6 +131,7 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
                 GgmlDType::Q4Kx8 => crate::bail!("Q4Kx8 is CPU-only"),
+                GgmlDType::Q6Kx8 => crate::bail!("Q6Kx8 is CPU-only"),
             },
         }
     }
@@ -299,6 +301,10 @@ pub enum GgmlDType {
     /// Candle-only: pre-packed interleaved Q4_K (8 channels per superblock,
     /// `repack::BlockQ4Kx8`). Baked offline; llama.cpp will not read it.
     Q4Kx8,
+    /// Candle-only: pre-packed interleaved Q6_K (8 channels per superblock,
+    /// `repack::BlockQ6Kx8`). The Q6_K analogue of `Q4Kx8` for the residual
+    /// attn_v/ffn_down weights. Baked offline; llama.cpp will not read it.
+    Q6Kx8,
 }
 
 impl GgmlDType {
@@ -322,6 +328,7 @@ impl GgmlDType {
             30 => Self::BF16,
             // Candle-only pre-packed Q4_K; chosen high to avoid colliding with ggml.
             1000 => Self::Q4Kx8,
+            1001 => Self::Q6Kx8,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -346,6 +353,7 @@ impl GgmlDType {
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
             Self::Q4Kx8 => 1000,
+            Self::Q6Kx8 => 1001,
         }
     }
 
@@ -370,6 +378,7 @@ impl GgmlDType {
             // Q4Kx8 is bake-only and needs `n` (not derivable here) to construct;
             // it is loaded via qtensor_from_ggml/qtensor_from_mmap, never zero-init.
             Self::Q4Kx8 => unreachable!("Q4Kx8 loaded via qtensor_from_ggml/mmap"),
+            Self::Q6Kx8 => unreachable!("Q6Kx8 loaded via qtensor_from_ggml/mmap"),
         }
     }
 
@@ -393,6 +402,7 @@ impl GgmlDType {
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
             // n is not available here; Q4Kx8 is built in qtensor_from_ggml/mmap.
             Self::Q4Kx8 => unreachable!("Q4Kx8 loaded via qtensor_from_ggml/mmap"),
+            Self::Q6Kx8 => unreachable!("Q6Kx8 loaded via qtensor_from_ggml/mmap"),
         }
     }
 
@@ -423,6 +433,11 @@ impl GgmlDType {
                 debug_assert_eq!(sz % repack::Q4KX8_ROWS, 0, "BlockQ4Kx8 size {sz} not /8");
                 sz / repack::Q4KX8_ROWS
             }
+            Self::Q6Kx8 => {
+                let sz = std::mem::size_of::<repack::BlockQ6Kx8>();
+                debug_assert_eq!(sz % repack::Q4KX8_ROWS, 0, "BlockQ6Kx8 size {sz} not /8");
+                sz / repack::Q4KX8_ROWS
+            }
         }
     }
 
@@ -439,7 +454,7 @@ impl GgmlDType {
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
             // 256 so check_shape passes for a [n,k] weight (k % 256 == 0).
-            Self::Q4Kx8 => k_quants::QK_K,
+            Self::Q4Kx8 | Self::Q6Kx8 => k_quants::QK_K,
         }
     }
 }
@@ -565,6 +580,14 @@ impl QTensor {
                 crate::bail!("Q4Kx8 cat_rows is CPU-only")
             }
             let packed = repack::PackedQ4Kx8::from_bytes(&data, rows);
+            let storage = QStorage::Cpu(Box::new(packed));
+            return Self::new(storage, (rows, k));
+        }
+        if dtype == GgmlDType::Q6Kx8 {
+            if !first.device().is_cpu() {
+                crate::bail!("Q6Kx8 cat_rows is CPU-only")
+            }
+            let packed = repack::PackedQ6Kx8::from_bytes(&data, rows);
             let storage = QStorage::Cpu(Box::new(packed));
             return Self::new(storage, (rows, k));
         }

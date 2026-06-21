@@ -476,6 +476,78 @@ pub(crate) fn matmul_q4kx8_prepacked(
     }
 }
 
+/// GEMM over an already-interleaved `BlockQ6Kx8` weight: `dst(m,n) = lhs(m,k) x W^T`.
+/// Mirrors `matmul_q4kx8_prepacked` (same Q8K activation quant, same group
+/// parallelism, same serial 1-vCPU fast-path), but the Q6 packed kernel only has
+/// the 8-channel form (`gemm_q6kx8_q8k<MR>`), so the tile strategy is simply MR=2
+/// for prefill with a 1-row remainder (no nc4 variant). Bit-exact to `vec_dot_q6k`.
+#[cfg(target_feature = "neon")]
+pub(crate) fn matmul_q6kx8_prepacked(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    packed: &[BlockQ6Kx8],
+    dst: &mut [f32],
+    pool: &rayon::ThreadPool,
+) {
+    use super::neon::gemm_q6kx8_q8k;
+    let nb = k / QK_K;
+    let groups = n / Q4KX8_ROWS;
+    let serial = pool.current_num_threads() <= 1;
+
+    let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
+    if serial {
+        for a in 0..m {
+            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut lhs_q[a * nb..(a + 1) * nb]);
+        }
+    } else {
+        pool.install(|| {
+            lhs_q
+                .par_chunks_mut(nb)
+                .enumerate()
+                .with_min_len(4)
+                .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
+        });
+    }
+
+    struct DstPtr(*mut f32);
+    unsafe impl Sync for DstPtr {}
+    let dptr = DstPtr(dst.as_mut_ptr());
+    let process = |g: usize| {
+        let w = &packed[g * nb..(g + 1) * nb];
+        let p = &dptr;
+        let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
+        let mut r = 0;
+        while r + 2 <= m {
+            let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
+            let mut tile = [0f32; Q4KX8_ROWS * 2];
+            gemm_q6kx8_q8k::<2>(w, &rows, &mut tile);
+            for c in 0..Q4KX8_ROWS {
+                for a in 0..2 {
+                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
+                }
+            }
+            r += 2;
+        }
+        while r < m {
+            let rows: [&[BlockQ8K]; 1] = [row(r)];
+            let mut tile = [0f32; Q4KX8_ROWS];
+            gemm_q6kx8_q8k::<1>(w, &rows, &mut tile);
+            for c in 0..Q4KX8_ROWS {
+                unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
+            }
+            r += 1;
+        }
+    };
+
+    if serial {
+        (0..groups).for_each(&process);
+    } else {
+        pool.install(|| {
+            (0..groups).into_par_iter().for_each(&process);
+        });
+    }
+}
+
 // ===========================================================================
 // Pre-packed Q4_Kx8 as a first-class quantized storage type (GgmlDType::Q4Kx8).
 //
@@ -710,6 +782,237 @@ impl super::QuantizedType for PackedQ4Kx8 {
 
     fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
         unreachable!("Q4Kx8 is bake-only; quantize-to is not supported")
+    }
+}
+
+// ===========================================================================
+// Pre-packed Q6_Kx8 as a first-class quantized storage type (GgmlDType::Q6Kx8).
+// The Q6_K analogue of PackedQ4Kx8: the residual attn_v/ffn_down weights that
+// Q4_K_M keeps at Q6_K, baked into the interleaved BlockQ6Kx8 layout so they ride
+// the same SDOT GEMM with no runtime repack. Same Owned/mmap backing story.
+// ===========================================================================
+
+/// Backing store for a `PackedQ6Kx8`: owned `Vec` or a zero-copy mmap view.
+enum PackedStoreQ6 {
+    Owned(Vec<BlockQ6Kx8>),
+    Mmap {
+        mmap: Arc<memmap2::Mmap>,
+        offset: usize,
+        count: usize,
+    },
+}
+
+// SAFETY: identical to PackedStore - the Mmap variant references an immutable,
+// file-backed region kept alive by the Arc; BlockQ6Kx8 is a #[repr(C)] POD.
+unsafe impl Send for PackedStoreQ6 {}
+unsafe impl Sync for PackedStoreQ6 {}
+
+/// A pre-packed Q6_K weight: `n` output channels (`n % 8 == 0`) stored as the
+/// interleaved `BlockQ6Kx8` groups, ready for the SDOT GEMM with no repack.
+pub struct PackedQ6Kx8 {
+    store: PackedStoreQ6,
+    n: usize,
+}
+
+impl PackedQ6Kx8 {
+    #[inline]
+    fn as_slice(&self) -> &[BlockQ6Kx8] {
+        match &self.store {
+            PackedStoreQ6::Owned(v) => v.as_slice(),
+            PackedStoreQ6::Mmap {
+                mmap,
+                offset,
+                count,
+            } => {
+                // SAFETY: offset/count/alignment checked in `from_mmap`; Arc keeps
+                // the mapping alive for the lifetime of the returned slice.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        mmap.as_ptr().add(*offset) as *const BlockQ6Kx8,
+                        *count,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Build an owned `PackedQ6Kx8` by copying raw interleaved bytes. `raw` length
+    /// must be a whole number of blocks.
+    pub fn from_bytes(raw: &[u8], n: usize) -> Self {
+        let bs = std::mem::size_of::<BlockQ6Kx8>();
+        assert_eq!(
+            raw.len() % bs,
+            0,
+            "PackedQ6Kx8::from_bytes: {} bytes not a multiple of block size {bs}",
+            raw.len()
+        );
+        let count = raw.len() / bs;
+        let mut v: Vec<BlockQ6Kx8> = Vec::with_capacity(count);
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), v.as_mut_ptr() as *mut u8, raw.len());
+            v.set_len(count);
+        }
+        Self {
+            store: PackedStoreQ6::Owned(v),
+            n,
+        }
+    }
+
+    /// Build a zero-copy `PackedQ6Kx8` viewing `byte_len` bytes at `offset` in an
+    /// mmap'd GGUF. Validates bounds and alignment.
+    pub fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
+        offset: usize,
+        byte_len: usize,
+        n: usize,
+    ) -> crate::Result<Self> {
+        let bs = std::mem::size_of::<BlockQ6Kx8>();
+        if offset + byte_len > mmap.len() {
+            crate::bail!(
+                "Q6Kx8 mmap region end {} exceeds map len {}",
+                offset + byte_len,
+                mmap.len()
+            );
+        }
+        if !byte_len.is_multiple_of(bs) {
+            crate::bail!("Q6Kx8 mmap byte_len {byte_len} not a multiple of block size {bs}");
+        }
+        let base = mmap.as_ptr() as usize + offset;
+        if !base.is_multiple_of(std::mem::align_of::<BlockQ6Kx8>()) {
+            crate::bail!(
+                "Q6Kx8 mmap tensor at offset {offset} not aligned to {}",
+                std::mem::align_of::<BlockQ6Kx8>()
+            );
+        }
+        Ok(Self {
+            store: PackedStoreQ6::Mmap {
+                mmap,
+                offset,
+                count: byte_len / bs,
+            },
+            n,
+        })
+    }
+
+    /// Dequantize the packed weight back to f32 of shape `[n, k]` (row-major).
+    /// Mirrors `BlockQ6K::to_float` per channel: the i8 sub-block scales and the
+    /// `ql`/`qh` quants come from the chunk-major, row-interleaved layout produced
+    /// by `repack_q6k_x8`. Correctness-only (not perf).
+    fn dequantize_to(&self, elem_count: usize, ys: &mut [f32]) {
+        const QLC: usize = QK_K / 4; // 64 ql bytes / 128-value chunk
+        const QHC: usize = QK_K / 8; // 32 qh bytes / chunk
+        const NSC: usize = QK_K / 16; // 16 i8 scales / row
+        let n = self.n;
+        let k = elem_count / n;
+        let nb = k / QK_K;
+        let blocks = self.as_slice();
+        debug_assert_eq!(blocks.len(), (n / Q4KX8_ROWS) * nb);
+        for g in 0..n / Q4KX8_ROWS {
+            for r in 0..Q4KX8_ROWS {
+                let out_row = g * Q4KX8_ROWS + r;
+                for i in 0..nb {
+                    let blk = &blocks[g * nb + i];
+                    let d = blk.d[r].to_f32();
+                    let base = out_row * k + i * QK_K;
+                    // Two 128-value chunks, exactly as BlockQ6K::to_float steps by 128.
+                    for idx in 0..2 {
+                        let sc = &blk.scales[r * NSC + 8 * idx..];
+                        let ql = &blk.ql[idx * (Q4KX8_ROWS * QLC) + r * QLC..];
+                        let qh = &blk.qh[idx * (Q4KX8_ROWS * QHC) + r * QHC..];
+                        let cbase = base + idx * 128;
+                        for l in 0..32 {
+                            let is = l / 16;
+                            let q1 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32;
+                            let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                            let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                            let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+                            ys[cbase + l] = d * sc[is] as f32 * q1 as f32;
+                            ys[cbase + l + 32] = d * sc[is + 2] as f32 * q2 as f32;
+                            ys[cbase + l + 64] = d * sc[is + 4] as f32 * q3 as f32;
+                            ys[cbase + l + 96] = d * sc[is + 6] as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl super::QuantizedType for PackedQ6Kx8 {
+    #[cfg(target_feature = "neon")]
+    fn matmul_t(
+        &self,
+        mkn: (usize, usize, usize),
+        lhs: &[f32],
+        dst: &mut [f32],
+    ) -> crate::Result<()> {
+        let (m, _k, _n) = mkn;
+        let pool = if m == 1 {
+            &*super::k_quants::QMATMUL_DECODE_POOL
+        } else {
+            &*super::k_quants::QMATMUL_PREFILL_POOL
+        };
+        matmul_q6kx8_prepacked(mkn, lhs, self.as_slice(), dst, pool);
+        Ok(())
+    }
+
+    #[cfg(not(target_feature = "neon"))]
+    fn matmul_t(
+        &self,
+        _mkn: (usize, usize, usize),
+        _lhs: &[f32],
+        _dst: &mut [f32],
+    ) -> crate::Result<()> {
+        crate::bail!("Q6Kx8 packed matmul requires the neon target feature")
+    }
+
+    fn matmul_t_f16(
+        &self,
+        mkn: (usize, usize, usize),
+        lhs: &[f16],
+        dst: &mut [f16],
+    ) -> crate::Result<()> {
+        let lhs_f: Vec<f32> = lhs.iter().map(|x| x.to_f32()).collect();
+        let mut dst_f = vec![0f32; dst.len()];
+        self.matmul_t(mkn, &lhs_f, &mut dst_f)?;
+        for (o, v) in dst.iter_mut().zip(dst_f.iter()) {
+            *o = f16::from_f32(*v);
+        }
+        Ok(())
+    }
+
+    fn dequantize(&self, elem_count: usize) -> crate::Result<super::CpuStorage> {
+        let mut ys = vec![0f32; elem_count];
+        self.dequantize_to(elem_count, &mut ys);
+        Ok(super::CpuStorage::F32(ys))
+    }
+
+    fn storage_size_in_bytes(&self) -> usize {
+        std::mem::size_of_val(self.as_slice())
+    }
+
+    fn size(&self) -> usize {
+        self.storage_size_in_bytes()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.as_slice().as_ptr() as *const u8
+    }
+
+    fn block_size(&self) -> usize {
+        QK_K
+    }
+
+    fn dtype(&self) -> super::GgmlDType {
+        super::GgmlDType::Q6Kx8
+    }
+
+    fn from_float(&mut self, _xs: &[f32]) {
+        unreachable!("Q6Kx8 is bake-only; quantize-to is not supported")
+    }
+
+    fn from_float_imatrix(&mut self, _xs: &[f32], _imatrix_weights: &[f32], _n_per_row: usize) {
+        unreachable!("Q6Kx8 is bake-only; quantize-to is not supported")
     }
 }
 

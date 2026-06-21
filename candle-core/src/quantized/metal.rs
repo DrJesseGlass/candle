@@ -120,6 +120,11 @@ impl QMetalStorage {
                     "Q4Kx8 is a CPU-only packed dtype and cannot be read from a Metal buffer"
                 )
             }
+            GgmlDType::Q6Kx8 => {
+                crate::bail!(
+                    "Q6Kx8 is a CPU-only packed dtype and cannot be read from a Metal buffer"
+                )
+            }
         }
 
         let buffer = self
@@ -446,6 +451,9 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
             GgmlDType::Q4Kx8 => {
                 panic!("Q4Kx8 is a CPU-only packed dtype with no Metal kernel equivalent")
+            }
+            GgmlDType::Q6Kx8 => {
+                panic!("Q6Kx8 is a CPU-only packed dtype with no Metal kernel equivalent")
             }
         }
     }
