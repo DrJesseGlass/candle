@@ -18,7 +18,7 @@
 // a range loop is clearer here than zipped iterators.
 #![allow(clippy::needless_range_loop)]
 
-use super::k_quants::{BlockQ4K, QK_K};
+use super::k_quants::{BlockQ4K, BlockQ6K, QK_K};
 // The packed GEMM kernels (and the trait helpers / rayon they pull in) are
 // aarch64/neon-only; the imports they need would be unused on other targets.
 #[cfg(target_feature = "neon")]
@@ -238,6 +238,77 @@ static PACKED_CACHE: LazyLock<Mutex<HashMap<usize, Arc<Vec<BlockQ4Kx8>>>>> =
 /// Drop all cached repacked weights (e.g. between unrelated models in a process).
 pub fn clear_packed_cache() {
     PACKED_CACHE.lock().unwrap().clear();
+}
+
+/// Eight output channels' worth of one Q6_K super-block, interleaved for SDOT.
+/// Mirrors `BlockQ4Kx8` but for Q6_K: `scales` are i8 (already byte-sized - no
+/// 6-bit unpack needed, unlike Q4_K), and the quants split into `ql` (low 4 bits)
+/// + `qh` (high 2 bits), each reorganized to `[chunk][row][bytes]` so the kernel
+/// streams all 8 rows of a 128-value chunk from one contiguous run.
+#[repr(C)]
+#[derive(Clone)]
+pub struct BlockQ6Kx8 {
+    pub(crate) d: [f16; Q4KX8_ROWS],
+    pub(crate) scales: [i8; Q4KX8_ROWS * (QK_K / 16)], // 128
+    pub(crate) ql: [u8; Q4KX8_ROWS * (QK_K / 2)],      // 1024: [chunk(2)][row(8)][64]
+    pub(crate) qh: [u8; Q4KX8_ROWS * (QK_K / 4)],      // 512:  [chunk(2)][row(8)][32]
+}
+
+impl BlockQ6Kx8 {
+    fn zeroed() -> Self {
+        Self {
+            d: [f16::ZERO; Q4KX8_ROWS],
+            scales: [0; Q4KX8_ROWS * (QK_K / 16)],
+            ql: [0; Q4KX8_ROWS * (QK_K / 2)],
+            qh: [0; Q4KX8_ROWS * (QK_K / 4)],
+        }
+    }
+}
+
+/// Repack `Q4KX8_ROWS` Q6_K weight rows (each `nb` super-blocks) into `nb`
+/// interleaved `BlockQ6Kx8`. Scalar (load-time, not perf-critical); the i8 scales
+/// copy directly and the 128B `ql`/64B `qh` split into two 64B/32B chunks.
+pub(crate) fn repack_q6k_x8(rows: &[&[BlockQ6K]; Q4KX8_ROWS]) -> Vec<BlockQ6Kx8> {
+    let nb = rows[0].len();
+    debug_assert!(
+        rows.iter().all(|r| r.len() == nb),
+        "ragged rows in repack_q6k_x8"
+    );
+    const QLC: usize = QK_K / 4; // 64 ql bytes / 128-value chunk
+    const QHC: usize = QK_K / 8; // 32 qh bytes / chunk
+    let mut out = Vec::with_capacity(nb);
+    for i in 0..nb {
+        let mut blk = BlockQ6Kx8::zeroed();
+        for r in 0..Q4KX8_ROWS {
+            let src = &rows[r][i];
+            blk.d[r] = src.d;
+            for s in 0..(QK_K / 16) {
+                blk.scales[r * (QK_K / 16) + s] = src.scales[s];
+            }
+            for j in 0..2 {
+                let qld = j * (Q4KX8_ROWS * QLC) + r * QLC;
+                blk.ql[qld..qld + QLC].copy_from_slice(&src.ql[j * QLC..j * QLC + QLC]);
+                let qhd = j * (Q4KX8_ROWS * QHC) + r * QHC;
+                blk.qh[qhd..qhd + QHC].copy_from_slice(&src.qh[j * QHC..j * QHC + QHC]);
+            }
+        }
+        out.push(blk);
+    }
+    out
+}
+
+/// Repack a full row-major Q6_K weight matrix into the interleaved `BlockQ6Kx8`
+/// layout for all `n/8` channel groups. Mirror of `repack_q4k_weight`.
+pub fn repack_q6k_weight(rows: &[BlockQ6K], n: usize, nb: usize) -> Vec<BlockQ6Kx8> {
+    debug_assert_eq!(n % Q4KX8_ROWS, 0, "repack_q6k_weight: n {n} not /8");
+    debug_assert_eq!(rows.len(), n * nb, "repack_q6k_weight: rows len mismatch");
+    let mut packed = Vec::with_capacity((n / 8) * nb);
+    for g in 0..n / 8 {
+        let grp: [&[BlockQ6K]; Q4KX8_ROWS] =
+            std::array::from_fn(|r| &rows[(g * 8 + r) * nb..(g * 8 + r + 1) * nb]);
+        packed.extend(repack_q6k_x8(&grp));
+    }
+    packed
 }
 
 /// Repack a full row-major Q4_K weight matrix (`n` output channels, each `nb`
@@ -652,6 +723,44 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         2.0 * ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    // gemm_q6kx8_q8k (packed Q6_K GEMV) must be BIT-IDENTICAL to the scalar
+    // vec_dot_q6k_q8k applied per row - it mirrors the same integer ops/order.
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn gemm_q6kx8_matches_vec_dot() {
+        use crate::quantized::k_quants::{BlockQ6K, BlockQ8K};
+        use crate::quantized::neon::{gemm_q6kx8_q8k, vec_dot_q6k_q8k};
+
+        let nb = 4usize;
+        let k = nb * QK_K;
+        let mut st = 0x1357_9bdf_2468_ace0u64;
+        let mut rows_q: Vec<Vec<BlockQ6K>> = Vec::new();
+        for _ in 0..Q4KX8_ROWS {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let mut q = vec![BlockQ6K::zeros(); nb];
+            BlockQ6K::from_float(&f, &mut q);
+            rows_q.push(q);
+        }
+        let af: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+        let mut q8 = vec![BlockQ8K::zeros(); nb];
+        BlockQ8K::from_float(&af, &mut q8);
+
+        let reference: [f32; 8] = std::array::from_fn(|r| vec_dot_q6k_q8k(k, &rows_q[r], &q8));
+        let refs: [&[BlockQ6K]; Q4KX8_ROWS] = std::array::from_fn(|r| rows_q[r].as_slice());
+        let packed = repack_q6k_x8(&refs);
+        let mut dst = [0f32; 8];
+        gemm_q6kx8_q8k::<1>(&packed, &[q8.as_slice()], &mut dst);
+        for c in 0..8 {
+            assert_eq!(
+                dst[c].to_bits(),
+                reference[c].to_bits(),
+                "channel {c}: packed {} vs ref {}",
+                dst[c],
+                reference[c]
+            );
+        }
     }
 
     // The repack must preserve the raw integer payload exactly: per (row,
