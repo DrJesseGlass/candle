@@ -326,67 +326,83 @@ pub(crate) fn matmul_q4kx8_prepacked(
 ) {
     use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
     let nb = k / QK_K;
+    let groups = n / Q4KX8_ROWS;
+    let use_nc4 = *PACKED_PREFILL_NC4;
+    // Single-thread decode (the Lambda 1-vCPU tier): pool.install + into_par_iter is
+    // pure crossbeam split/join overhead with no parallelism to gain (~3% of decode),
+    // so run serially - mirrors the m==1 serial GEMV fast-path in k_quants::matmul.
+    let serial = pool.current_num_threads() <= 1;
 
     let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
-    pool.install(|| {
-        lhs_q
-            .par_chunks_mut(nb)
-            .enumerate()
-            .with_min_len(4)
-            .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
-    });
+    if serial {
+        for a in 0..m {
+            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut lhs_q[a * nb..(a + 1) * nb]);
+        }
+    } else {
+        pool.install(|| {
+            lhs_q
+                .par_chunks_mut(nb)
+                .enumerate()
+                .with_min_len(4)
+                .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
+        });
+    }
 
     struct DstPtr(*mut f32);
     unsafe impl Sync for DstPtr {}
     let dptr = DstPtr(dst.as_mut_ptr());
-    let groups = n / Q4KX8_ROWS;
-    let use_nc4 = *PACKED_PREFILL_NC4;
-    pool.install(|| {
-        (0..groups).into_par_iter().for_each(|g| {
-            let w = &packed[g * nb..(g + 1) * nb];
-            let p = &dptr;
-            let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
-            let mut r = 0;
-            if use_nc4 {
-                // nc4mr4: 4 rows x {channels 0..4, 4..8} per call.
-                while r + 4 <= m {
-                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
-                    for half in 0..2 {
-                        let c0 = half * 4;
-                        let mut tile = [0f32; 4 * 4];
-                        gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut tile);
-                        for c in 0..4 {
-                            for a in 0..4 {
-                                unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = tile[c * 4 + a] };
-                            }
+    let process = |g: usize| {
+        let w = &packed[g * nb..(g + 1) * nb];
+        let p = &dptr;
+        let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
+        let mut r = 0;
+        if use_nc4 {
+            // nc4mr4: 4 rows x {channels 0..4, 4..8} per call.
+            while r + 4 <= m {
+                let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                for half in 0..2 {
+                    let c0 = half * 4;
+                    let mut tile = [0f32; 4 * 4];
+                    gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut tile);
+                    for c in 0..4 {
+                        for a in 0..4 {
+                            unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = tile[c * 4 + a] };
                         }
                     }
-                    r += 4;
+                }
+                r += 4;
+            }
+        }
+        // nc8mr2 main (default), or the 2/3-row remainder of the nc4 path.
+        while r + 2 <= m {
+            let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
+            let mut tile = [0f32; Q4KX8_ROWS * 2];
+            gemm_q4kx8_q8k::<2>(w, &rows, &mut tile);
+            for c in 0..Q4KX8_ROWS {
+                for a in 0..2 {
+                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
                 }
             }
-            // nc8mr2 main (default), or the 2/3-row remainder of the nc4 path.
-            while r + 2 <= m {
-                let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
-                let mut tile = [0f32; Q4KX8_ROWS * 2];
-                gemm_q4kx8_q8k::<2>(w, &rows, &mut tile);
-                for c in 0..Q4KX8_ROWS {
-                    for a in 0..2 {
-                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
-                    }
-                }
-                r += 2;
+            r += 2;
+        }
+        while r < m {
+            let rows: [&[BlockQ8K]; 1] = [row(r)];
+            let mut tile = [0f32; Q4KX8_ROWS];
+            gemm_q4kx8_q8k::<1>(w, &rows, &mut tile);
+            for c in 0..Q4KX8_ROWS {
+                unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
             }
-            while r < m {
-                let rows: [&[BlockQ8K]; 1] = [row(r)];
-                let mut tile = [0f32; Q4KX8_ROWS];
-                gemm_q4kx8_q8k::<1>(w, &rows, &mut tile);
-                for c in 0..Q4KX8_ROWS {
-                    unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
-                }
-                r += 1;
-            }
+            r += 1;
+        }
+    };
+
+    if serial {
+        (0..groups).for_each(&process);
+    } else {
+        pool.install(|| {
+            (0..groups).into_par_iter().for_each(&process);
         });
-    });
+    }
 }
 
 // ===========================================================================
