@@ -360,12 +360,12 @@ pub(crate) fn packed_q4k_applicable(k: usize, n: usize) -> bool {
 /// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot -
 /// MR=4 spills) with a 1-row remainder. Bit-identical to baseline `matmul`.
 /// Prefill tile strategy for the packed GEMM, the m>=2 compute-bound path.
-/// `nc8mr4` (DEFAULT): one 8-channel x 4-row call (32 acc) - the widest reuse that
-/// fits aarch64's 32 NEON regs, mirroring llama's `8x4` SDOT GEMM. Both axes wide:
-/// one weight load feeds 4 activation rows AND one activation load feeds 8 channels,
-/// halving the per-MAC load/unpack overhead vs the 16-acc tiles. `nc4mr4`: two
-/// 4-channel x 4-row calls (16 acc, the old default - less channel reuse). `nc8mr2`:
-/// one 8-channel x 2-row call (16 acc). Override with `CANDLE_PACKED_PREFILL=...`.
+/// `nc4mr4` (DEFAULT): two 4-channel x 4-row calls (16 acc each) - measured BEST on
+/// Neoverse-N1. `nc8mr2`: one 8-channel x 2-row call (16 acc). `nc8mr4`: one
+/// 8-channel x 4-row call (32 acc) - wider reuse but REGRESSES ~20% on N1 (32 acc
+/// spills the 32 NEON regs once weights/activations are added; N1's narrower core is
+/// hurt more than M1's wide OoO). Kept selectable for other cores only. Override
+/// with `CANDLE_PACKED_PREFILL={nc4mr4,nc8mr2,nc8mr4}`.
 #[derive(Clone, Copy, PartialEq)]
 enum PrefillTile {
     Nc8mr4,
@@ -378,9 +378,9 @@ static PACKED_PREFILL_TILE: LazyLock<PrefillTile> = LazyLock::new(|| {
         .to_ascii_lowercase()
         .as_str()
     {
-        "nc4mr4" => PrefillTile::Nc4mr4,
+        "nc8mr4" => PrefillTile::Nc8mr4,
         "nc8mr2" => PrefillTile::Nc8mr2,
-        _ => PrefillTile::Nc8mr4,
+        _ => PrefillTile::Nc4mr4,
     }
 });
 
