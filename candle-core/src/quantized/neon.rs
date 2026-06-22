@@ -935,37 +935,45 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                     continue;
                 }
 
-                // Prefill (m >= 2): load each channel's 32 nibble-bytes ONCE (was loaded twice -
-                // once per lo/hi pass); lo and hi are derived from the held `q4`, reused across
-                // the MR rows. `from_fn` builds the arrays in place, avoiding the dead zero-init
-                // (`movi`) the old `[vdupq_n_s8(0); NC]` emitted.
-                let q4: [uint8x16x2_t; NC] =
-                    core::array::from_fn(|c| unsafe { vld1q_u8_x2(qsb.add(wbase + c * 32)) });
+                // Prefill (m >= 2). LOW-REGISTER-PRESSURE two-pass: each pass holds only this
+                // pass's NC weight pairs (NC*2 regs) + the NC*MR accumulators, NOT a held `q4`
+                // array on top. The held-`q4` single-load variant won on M1's wide core but on
+                // N1 (32 NEON regs, narrower) the extra NC*2 live regs spilled and ate the gain -
+                // its prefill matmul instr count was identical to the unoptimized kernel. Here the
+                // hi pass RE-loads q4, but it is L1-resident (just read in the lo pass) and the
+                // address is the hoisted `qsb + const`, so it is cheap - while pressure stays low.
+                // `from_fn` still builds each pass's pair array in place (no dead `movi` zero-init).
                 let slo: [i32; NC] =
                     core::array::from_fn(|c| unsafe { *sc_ptr.add(c * 8 + sc_lo) as i32 });
                 let shi: [i32; NC] =
                     core::array::from_fn(|c| unsafe { *sc_ptr.add(c * 8 + sc_hi) as i32 });
 
-                let lo0: [int8x16_t; NC] =
-                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vandq_u8(q4[c].0, m4b)) });
-                let lo1: [int8x16_t; NC] =
-                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vandq_u8(q4[c].1, m4b)) });
+                let lo: [(int8x16_t, int8x16_t); NC] = core::array::from_fn(|c| unsafe {
+                    let q = vld1q_u8_x2(qsb.add(wbase + c * 32));
+                    (
+                        vreinterpretq_s8_u8(vandq_u8(q.0, m4b)),
+                        vreinterpretq_s8_u8(vandq_u8(q.1, m4b)),
+                    )
+                });
                 for a in 0..MR {
                     let q8 = vld1q_s8_x2(rq[a].add(sc_lo * 32));
                     for c in 0..NC {
-                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0[c], q8.0), lo1[c], q8.1);
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo[c].0, q8.0), lo[c].1, q8.1);
                         acc[c][a] = vmlaq_n_s32(acc[c][a], p, slo[c]);
                     }
                 }
 
-                let hi0: [int8x16_t; NC] =
-                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vshrq_n_u8(q4[c].0, 4)) });
-                let hi1: [int8x16_t; NC] =
-                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vshrq_n_u8(q4[c].1, 4)) });
+                let hi: [(int8x16_t, int8x16_t); NC] = core::array::from_fn(|c| unsafe {
+                    let q = vld1q_u8_x2(qsb.add(wbase + c * 32));
+                    (
+                        vreinterpretq_s8_u8(vshrq_n_u8(q.0, 4)),
+                        vreinterpretq_s8_u8(vshrq_n_u8(q.1, 4)),
+                    )
+                });
                 for a in 0..MR {
                     let q8 = vld1q_s8_x2(rq[a].add(sc_hi * 32));
                     for c in 0..NC {
-                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0[c], q8.0), hi1[c], q8.1);
+                        let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi[c].0, q8.0), hi[c].1, q8.1);
                         acc[c][a] = vmlaq_n_s32(acc[c][a], p, shi[c]);
                     }
                 }
