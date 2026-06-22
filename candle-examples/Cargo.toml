@@ -65,6 +65,11 @@ hf-hub = { workspace = true, features = ["tokio"] }
 
 [features]
 default = []
+# Forward candle-nn's f16-attn-dot (native fmla.8h attention dot on aarch64). Lets the
+# quantized-qwen3 / -bench examples build the "best candle" deploy config, since the
+# decomposed candle-nn defaults this OFF (upstream bit-exactness) while the deploy turns
+# it on. Non-bit-exact ~1e-3 vs f32 attention; ~4.5% N1 decode.
+f16-attn-dot = ["candle-nn/f16-attn-dot"]
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",

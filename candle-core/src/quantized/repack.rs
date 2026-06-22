@@ -359,14 +359,29 @@ pub(crate) fn packed_q4k_applicable(k: usize, n: usize) -> bool {
 /// repacked once and cached. Parallelized over 8-channel groups on `pool`. Decode
 /// (m=1) uses the MR=1 kernel; prefill tiles rows by MR=2 (the N1 sweet spot -
 /// MR=4 spills) with a 1-row remainder. Bit-identical to baseline `matmul`.
-/// Prefill tile strategy for the packed GEMM. `nc4mr4` (DEFAULT): two 4-channel x
-/// 4-row calls per group (16 acc each, most activation reuse without spilling -
-/// measured best on N1). `nc8mr2`: one 8-channel x 2-row call (16 acc). Override
-/// with `CANDLE_PACKED_PREFILL=nc8mr2`.
-static PACKED_PREFILL_NC4: LazyLock<bool> = LazyLock::new(|| {
-    !std::env::var("CANDLE_PACKED_PREFILL")
-        .map(|s| s.eq_ignore_ascii_case("nc8mr2"))
-        .unwrap_or(false)
+/// Prefill tile strategy for the packed GEMM, the m>=2 compute-bound path.
+/// `nc8mr4` (DEFAULT): one 8-channel x 4-row call (32 acc) - the widest reuse that
+/// fits aarch64's 32 NEON regs, mirroring llama's `8x4` SDOT GEMM. Both axes wide:
+/// one weight load feeds 4 activation rows AND one activation load feeds 8 channels,
+/// halving the per-MAC load/unpack overhead vs the 16-acc tiles. `nc4mr4`: two
+/// 4-channel x 4-row calls (16 acc, the old default - less channel reuse). `nc8mr2`:
+/// one 8-channel x 2-row call (16 acc). Override with `CANDLE_PACKED_PREFILL=...`.
+#[derive(Clone, Copy, PartialEq)]
+enum PrefillTile {
+    Nc8mr4,
+    Nc4mr4,
+    Nc8mr2,
+}
+static PACKED_PREFILL_TILE: LazyLock<PrefillTile> = LazyLock::new(|| {
+    match std::env::var("CANDLE_PACKED_PREFILL")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "nc4mr4" => PrefillTile::Nc4mr4,
+        "nc8mr2" => PrefillTile::Nc8mr2,
+        _ => PrefillTile::Nc8mr4,
+    }
 });
 
 #[cfg(target_feature = "neon")]
@@ -398,7 +413,7 @@ pub(crate) fn matmul_q4kx8_prepacked(
     use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
     let nb = k / QK_K;
     let groups = n / Q4KX8_ROWS;
-    let use_nc4 = *PACKED_PREFILL_NC4;
+    let tile = *PACKED_PREFILL_TILE;
     // Single-thread decode (the Lambda 1-vCPU tier): pool.install + into_par_iter is
     // pure crossbeam split/join overhead with no parallelism to gain (~3% of decode),
     // so run serially - mirrors the m==1 serial GEMV fast-path in k_quants::matmul.
@@ -427,24 +442,41 @@ pub(crate) fn matmul_q4kx8_prepacked(
         let p = &dptr;
         let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
         let mut r = 0;
-        if use_nc4 {
-            // nc4mr4: 4 rows x {channels 0..4, 4..8} per call.
-            while r + 4 <= m {
-                let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
-                for half in 0..2 {
-                    let c0 = half * 4;
-                    let mut tile = [0f32; 4 * 4];
-                    gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut tile);
-                    for c in 0..4 {
+        match tile {
+            PrefillTile::Nc8mr4 => {
+                // 8 channels x 4 rows per call (32 acc) - widest reuse, the default.
+                while r + 4 <= m {
+                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                    let mut t = [0f32; Q4KX8_ROWS * 4];
+                    gemm_q4kx8_q8k::<4>(w, &rows, &mut t);
+                    for c in 0..Q4KX8_ROWS {
                         for a in 0..4 {
-                            unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = tile[c * 4 + a] };
+                            unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
                         }
                     }
+                    r += 4;
                 }
-                r += 4;
             }
+            PrefillTile::Nc4mr4 => {
+                // 4 rows x {channels 0..4, 4..8} per call (16 acc).
+                while r + 4 <= m {
+                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                    for half in 0..2 {
+                        let c0 = half * 4;
+                        let mut t = [0f32; 4 * 4];
+                        gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut t);
+                        for c in 0..4 {
+                            for a in 0..4 {
+                                unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = t[c * 4 + a] };
+                            }
+                        }
+                    }
+                    r += 4;
+                }
+            }
+            PrefillTile::Nc8mr2 => {}
         }
-        // nc8mr2 main (default), or the 2/3-row remainder of the nc4 path.
+        // nc8mr2 main (for the Nc8mr2 tile), or the 2/3-row remainder of the wide paths.
         while r + 2 <= m {
             let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
             let mut tile = [0f32; Q4KX8_ROWS * 2];
@@ -492,6 +524,9 @@ pub(crate) fn matmul_q6kx8_prepacked(
     use super::neon::gemm_q6kx8_q8k;
     let nb = k / QK_K;
     let groups = n / Q4KX8_ROWS;
+    // Q6 has only the 8-channel kernel; widen the prefill tile to MR=4 (the nc8mr4
+    // default) for the same channel+row reuse win, else MR=2.
+    let mr4 = *PACKED_PREFILL_TILE == PrefillTile::Nc8mr4;
     let serial = pool.current_num_threads() <= 1;
 
     let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
@@ -517,23 +552,36 @@ pub(crate) fn matmul_q6kx8_prepacked(
         let p = &dptr;
         let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
         let mut r = 0;
+        if mr4 {
+            while r + 4 <= m {
+                let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                let mut t = [0f32; Q4KX8_ROWS * 4];
+                gemm_q6kx8_q8k::<4>(w, &rows, &mut t);
+                for c in 0..Q4KX8_ROWS {
+                    for a in 0..4 {
+                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
+                    }
+                }
+                r += 4;
+            }
+        }
         while r + 2 <= m {
             let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
-            let mut tile = [0f32; Q4KX8_ROWS * 2];
-            gemm_q6kx8_q8k::<2>(w, &rows, &mut tile);
+            let mut t = [0f32; Q4KX8_ROWS * 2];
+            gemm_q6kx8_q8k::<2>(w, &rows, &mut t);
             for c in 0..Q4KX8_ROWS {
                 for a in 0..2 {
-                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
+                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 2 + a] };
                 }
             }
             r += 2;
         }
         while r < m {
             let rows: [&[BlockQ8K]; 1] = [row(r)];
-            let mut tile = [0f32; Q4KX8_ROWS];
-            gemm_q6kx8_q8k::<1>(w, &rows, &mut tile);
+            let mut t = [0f32; Q4KX8_ROWS];
+            gemm_q6kx8_q8k::<1>(w, &rows, &mut t);
             for c in 0..Q4KX8_ROWS {
-                unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
+                unsafe { *p.0.add(r * n + g * 8 + c) = t[c] };
             }
             r += 1;
         }
@@ -1560,6 +1608,8 @@ mod tests {
             } else {
                 bench_packed!(2);
                 bench_packed!(4);
+                bench_packed!(6);
+                bench_packed!(8);
             }
         }
     }
