@@ -1016,6 +1016,18 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
         let mone = vdupq_n_u8(3);
         for i in 0..nb {
             let blk = &packed[i];
+            // Hoist base pointers once per block (same address-arithmetic win as the Q4 kernel):
+            // inner addresses become `base + const` instead of re-walking `blk.*.as_ptr().add(..)`
+            // and re-indexing `rows[a][i]` every chunk.
+            let qh_ptr = blk.qh.as_ptr();
+            let ql_ptr = blk.ql.as_ptr();
+            let sc_ptr = blk.scales.as_ptr();
+            let mut rq = [core::ptr::null::<i8>(); MR];
+            let mut rd = [0f32; MR];
+            for a in 0..MR {
+                rq[a] = rows[a][i].qs.as_ptr();
+                rd[a] = rows[a][i].d;
+            }
             // Bias: isum_mins[c][a] = sum_s scales[c][s] * bsums[a][s] (16 sub-blocks).
             let mut bsums = [(vdupq_n_s16(0), vdupq_n_s16(0)); MR];
             for a in 0..MR {
@@ -1024,7 +1036,7 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
             }
             let mut isum_mins = [[0i32; MR]; NC];
             for c in 0..NC {
-                let sc8 = vld1q_s8(blk.scales.as_ptr().add(c * NSC));
+                let sc8 = vld1q_s8(sc_ptr.add(c * NSC));
                 let s_lo = vmovl_s8(vget_low_s8(sc8));
                 let s_hi = vmovl_s8(vget_high_s8(sc8));
                 for a in 0..MR {
@@ -1047,9 +1059,9 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
                 let ql_base = j * (NC * QLC);
                 let qh_base = j * (NC * QHC);
                 for c in 0..NC {
-                    let qhbits = vld1q_u8_x2(blk.qh.as_ptr().add(qh_base + c * QHC));
-                    let q6bits = vld1q_u8_x4(blk.ql.as_ptr().add(ql_base + c * QLC));
-                    let sc = blk.scales.as_ptr().add(c * NSC + j * 8);
+                    let qhbits = vld1q_u8_x2(qh_ptr.add(qh_base + c * QHC));
+                    let q6bits = vld1q_u8_x4(ql_ptr.add(ql_base + c * QLC));
+                    let sc = sc_ptr.add(c * NSC + j * 8);
                     // First half: low nibbles + low two-bit highs.
                     let q6h_0 = vshlq_n_u8(vandq_u8(mone, qhbits.0), 4);
                     let q6h_1 = vshlq_n_u8(vandq_u8(mone, qhbits.1), 4);
@@ -1060,7 +1072,7 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
                     let b2 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q6bits.2, m4b), q6h_2));
                     let b3 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q6bits.3, m4b), q6h_3));
                     for a in 0..MR {
-                        let q8 = vld1q_s8_x4(rows[a][i].qs.as_ptr().add(j * 128));
+                        let q8 = vld1q_s8_x4(rq[a].add(j * 128));
                         let p0 = vdotq_s32(b0, q8.0);
                         let p1 = vdotq_s32(b1, q8.1);
                         isum[c][a] +=
@@ -1080,7 +1092,7 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
                     let b2 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q6bits.2, 4), q6h_2));
                     let b3 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(q6bits.3, 4), q6h_3));
                     for a in 0..MR {
-                        let q8 = vld1q_s8_x4(rows[a][i].qs.as_ptr().add(j * 128 + 64));
+                        let q8 = vld1q_s8_x4(rq[a].add(j * 128 + 64));
                         let p0 = vdotq_s32(b0, q8.0);
                         let p1 = vdotq_s32(b1, q8.1);
                         isum[c][a] += vaddvq_s32(p0) * (*sc.add(4) as i32)
@@ -1095,7 +1107,7 @@ pub(crate) fn gemm_q6kx8_q8k<const MR: usize>(
             for c in 0..NC {
                 let dc = blk.d[c].to_f32();
                 for a in 0..MR {
-                    sumf[c][a] += dc * rows[a][i].d * ((isum[c][a] - 32 * isum_mins[c][a]) as f32);
+                    sumf[c][a] += dc * rd[a] * ((isum[c][a] - 32 * isum_mins[c][a]) as f32);
                 }
             }
         }

@@ -31,6 +31,88 @@ fn prefetch_read<T>(ptr: *const T) {
     }
 }
 
+// Opt-in (CANDLE_VEC_SOFTMAX_EXP=1) NEON polynomial exp for the flash-attention softmax.
+// The N1 instruction breakdown showed `expf` (libm, scalar) as the kernel's `transcendental`
+// cost; this replaces it with FMA (~1e-6 accurate, normalized out by softmax). Default OFF so
+// the default path stays bit-reproducible; flip on once validated on N1.
+#[cfg(target_arch = "aarch64")]
+static VEC_SOFTMAX_EXP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("CANDLE_VEC_SOFTMAX_EXP").is_ok());
+
+// exp(x) via range-reduction x = n*ln2 + r, exp(x) = 2^n * poly(r). Scalar form so the
+// vector body and the <4 tail use the SAME approximation (consistent softmax values).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn poly_exp_scalar(x: f32) -> f32 {
+    let x = x.clamp(-87.0, 88.0);
+    let n = (x * std::f32::consts::LOG2_E).round();
+    let r = x - n * std::f32::consts::LN_2;
+    let mut p = 1.0 / 720.0;
+    p = p * r + 1.0 / 120.0;
+    p = p * r + 1.0 / 24.0;
+    p = p * r + 1.0 / 6.0;
+    p = p * r + 0.5;
+    p = p * r + 1.0;
+    p = p * r + 1.0;
+    p * f32::from_bits((((n as i32) + 127) << 23) as u32)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vec_exp_sub_sum_neon(s: &mut [f32], mr: f32) -> f32 {
+    use std::arch::aarch64::*;
+    #[inline(always)]
+    unsafe fn vexpq(x: float32x4_t) -> float32x4_t {
+        let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0)), vdupq_n_f32(88.0));
+        let n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+        let r = vfmsq_f32(x, n, vdupq_n_f32(std::f32::consts::LN_2));
+        let mut p = vdupq_n_f32(1.0 / 720.0);
+        p = vfmaq_f32(vdupq_n_f32(1.0 / 120.0), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), p, r);
+        p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+        let bits = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23);
+        vmulq_f32(p, vreinterpretq_f32_s32(bits))
+    }
+    let vmr = vdupq_n_f32(mr);
+    let mut vsum = vdupq_n_f32(0.0);
+    let n = s.len();
+    let p = s.as_mut_ptr();
+    let mut i = 0;
+    while i + 4 <= n {
+        let e = vexpq(vsubq_f32(vld1q_f32(p.add(i)), vmr));
+        vst1q_f32(p.add(i), e);
+        vsum = vaddq_f32(vsum, e);
+        i += 4;
+    }
+    let mut sum = vaddvq_f32(vsum);
+    while i < n {
+        let e = poly_exp_scalar(*p.add(i) - mr);
+        *p.add(i) = e;
+        sum += e;
+        i += 1;
+    }
+    sum
+}
+
+/// For each `x` in `s`, set `x = exp(x - mr)` and return the sum. The softmax inner loop.
+#[inline(always)]
+fn exp_sub_sum(s: &mut [f32], mr: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    if *VEC_SOFTMAX_EXP {
+        return unsafe { vec_exp_sub_sum_neon(s, mr) };
+    }
+    let mut sum = 0.0f32;
+    for x in s.iter_mut() {
+        let e = (*x - mr).exp();
+        *x = e;
+        sum += e;
+    }
+    sum
+}
+
 /// Causal attention with loop-bound masking, **B=1 only**.
 ///
 /// Squeezes batch dim, extracts contiguous slices, dispatches to
@@ -583,13 +665,7 @@ pub fn causal_prefill_f16kv_headmajor(
                                 m[r] = bmax;
                             }
                             let mr = m[r];
-                            let mut bsum = 0.0f32;
-                            for x in s.iter_mut() {
-                                let e = (*x - mr).exp();
-                                *x = e;
-                                bsum += e;
-                            }
-                            ssum[r] += bsum;
+                            ssum[r] += exp_sub_sum(s, mr);
                         }
 
                         // Pass 2: PV, each V row loaded once for all rk heads.
