@@ -866,11 +866,25 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
     let mut sumf = [[0f32; MR]; NC];
     unsafe {
         let m4b = vdupq_n_u8(0xF);
+        let mzero = vdupq_n_s32(0); // sdot-chain seed + acc init, hoisted out of the block loop
         for i in 0..nb {
             let blk = &packed[i];
-            // d / dmin for the NC channels at c_off; y.d per row.
+            // Hoist every base pointer ONCE per block. The per-(chunk,channel,row) addresses
+            // are then `base + const` adds instead of re-walking `blk.qs.as_ptr().add(...)` and
+            // re-indexing `rows[a][i]` each iteration - which the N1 perf annotate showed was
+            // the kernel's single biggest cost (`add` ~16% of cycles). `c_off` is folded into
+            // the weight/scale/min bases so the inner index drops the `(c_off + c)` term.
+            let qsb = blk.qs.as_ptr().add(c_off * 32); // channel c at qsb + wbase + c*32
+            let sc_ptr = blk.scales.as_ptr().add(c_off * 8); // channel c sub s at sc_ptr + c*8 + s
+            let mins_ptr = blk.mins.as_ptr().add(c_off * 8);
+            let mut rq = [core::ptr::null::<i8>(); MR]; // per-row Q8 quant base
+            let mut rd = [0f32; MR]; // per-row Q8 scale
             let mut cd = [0f32; NC];
             let mut cdmin = [0f32; NC];
+            for a in 0..MR {
+                rq[a] = rows[a][i].qs.as_ptr();
+                rd[a] = rows[a][i].d;
+            }
             for c in 0..NC {
                 cd[c] = blk.d[c_off + c].to_f32();
                 cdmin[c] = blk.dmin[c_off + c].to_f32();
@@ -884,61 +898,60 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                 q8sums[a] = vpaddq_s16(vld1q_s16(b), vld1q_s16(b.add(8)));
             }
             for c in 0..NC {
-                let mb = blk.mins.as_ptr().add((c_off + c) * 8);
-                let mins = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mb)));
+                let mins = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins_ptr.add(c * 8))));
                 for a in 0..MR {
                     let prod = vaddq_s32(
                         vmull_s16(vget_low_s16(q8sums[a]), vget_low_s16(mins)),
                         vmull_s16(vget_high_s16(q8sums[a]), vget_high_s16(mins)),
                     );
-                    sumf[c][a] -= rows[a][i].d * cdmin[c] * vaddvq_s32(prod) as f32;
+                    sumf[c][a] -= rd[a] * cdmin[c] * vaddvq_s32(prod) as f32;
                 }
             }
 
-            let mut acc = [[vdupq_n_s32(0); MR]; NC];
-            let mzero = vdupq_n_s32(0); // sdot chain seed (hoisted)
+            let mut acc = [[mzero; MR]; NC];
             for j in 0..QK_K / 64 {
-                // chunk j is always a row-interleaved 8x32-byte run; channel c_off+c
-                // lives at qs[j*256 + (c_off+c)*32].
+                // chunk j is a row-interleaved 8x32-byte run; channel c at qsb + j*256 + c*32.
                 let wbase = j * (PACK_ROWS * 32);
                 let sc_lo = 2 * j;
                 let sc_hi = 2 * j + 1;
 
-                let mut lo0 = [vdupq_n_s8(0); NC];
-                let mut lo1 = [vdupq_n_s8(0); NC];
-                for c in 0..NC {
-                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + (c_off + c) * 32));
-                    lo0[c] = vreinterpretq_s8_u8(vandq_u8(q4b.0, m4b));
-                    lo1[c] = vreinterpretq_s8_u8(vandq_u8(q4b.1, m4b));
-                }
+                // Load each channel's 32 nibble-bytes ONCE (was loaded twice - once per lo/hi
+                // pass); lo and hi are derived from the held `q4`. `from_fn` builds the arrays
+                // in place, avoiding the dead zero-init (`movi`) the old `[vdupq_n_s8(0); NC]` emitted.
+                let q4: [uint8x16x2_t; NC] =
+                    core::array::from_fn(|c| unsafe { vld1q_u8_x2(qsb.add(wbase + c * 32)) });
+                let slo: [i32; NC] =
+                    core::array::from_fn(|c| unsafe { *sc_ptr.add(c * 8 + sc_lo) as i32 });
+                let shi: [i32; NC] =
+                    core::array::from_fn(|c| unsafe { *sc_ptr.add(c * 8 + sc_hi) as i32 });
+
+                let lo0: [int8x16_t; NC] =
+                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vandq_u8(q4[c].0, m4b)) });
+                let lo1: [int8x16_t; NC] =
+                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vandq_u8(q4[c].1, m4b)) });
                 for a in 0..MR {
-                    let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_lo * 32));
+                    let q8 = vld1q_s8_x2(rq[a].add(sc_lo * 32));
                     for c in 0..NC {
                         let p = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0[c], q8.0), lo1[c], q8.1);
-                        acc[c][a] =
-                            vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_lo] as i32);
+                        acc[c][a] = vmlaq_n_s32(acc[c][a], p, slo[c]);
                     }
                 }
 
-                let mut hi0 = [vdupq_n_s8(0); NC];
-                let mut hi1 = [vdupq_n_s8(0); NC];
-                for c in 0..NC {
-                    let q4b = vld1q_u8_x2(blk.qs.as_ptr().add(wbase + (c_off + c) * 32));
-                    hi0[c] = vreinterpretq_s8_u8(vshrq_n_u8(q4b.0, 4));
-                    hi1[c] = vreinterpretq_s8_u8(vshrq_n_u8(q4b.1, 4));
-                }
+                let hi0: [int8x16_t; NC] =
+                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vshrq_n_u8(q4[c].0, 4)) });
+                let hi1: [int8x16_t; NC] =
+                    core::array::from_fn(|c| unsafe { vreinterpretq_s8_u8(vshrq_n_u8(q4[c].1, 4)) });
                 for a in 0..MR {
-                    let q8 = vld1q_s8_x2(rows[a][i].qs.as_ptr().add(sc_hi * 32));
+                    let q8 = vld1q_s8_x2(rq[a].add(sc_hi * 32));
                     for c in 0..NC {
                         let p = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0[c], q8.0), hi1[c], q8.1);
-                        acc[c][a] =
-                            vmlaq_n_s32(acc[c][a], p, blk.scales[(c_off + c) * 8 + sc_hi] as i32);
+                        acc[c][a] = vmlaq_n_s32(acc[c][a], p, shi[c]);
                     }
                 }
             }
             for c in 0..NC {
                 for a in 0..MR {
-                    sumf[c][a] += rows[a][i].d * cd[c] * vaddvq_s32(acc[c][a]) as f32;
+                    sumf[c][a] += rd[a] * cd[c] * vaddvq_s32(acc[c][a]) as f32;
                 }
             }
         }
