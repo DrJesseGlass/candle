@@ -915,9 +915,30 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                 let sc_lo = 2 * j;
                 let sc_hi = 2 * j + 1;
 
-                // Load each channel's 32 nibble-bytes ONCE (was loaded twice - once per lo/hi
-                // pass); lo and hi are derived from the held `q4`. `from_fn` builds the arrays
-                // in place, avoiding the dead zero-init (`movi`) the old `[vdupq_n_s8(0); NC]` emitted.
+                if MR == 1 {
+                    // Decode (GEMV): no row reuse, so streaming per channel keeps register
+                    // pressure tiny (no NC-wide weight arrays to spill - which regressed the
+                    // memory-bound m=1 path). Still loads each q4 ONCE (vs the old twice).
+                    let q8l = vld1q_s8_x2(rq[0].add(sc_lo * 32));
+                    let q8h = vld1q_s8_x2(rq[0].add(sc_hi * 32));
+                    for c in 0..NC {
+                        let q4 = vld1q_u8_x2(qsb.add(wbase + c * 32));
+                        let lo0 = vreinterpretq_s8_u8(vandq_u8(q4.0, m4b));
+                        let lo1 = vreinterpretq_s8_u8(vandq_u8(q4.1, m4b));
+                        let pl = vdotq_s32_acc(vdotq_s32_acc(mzero, lo0, q8l.0), lo1, q8l.1);
+                        acc[c][0] = vmlaq_n_s32(acc[c][0], pl, *sc_ptr.add(c * 8 + sc_lo) as i32);
+                        let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4.0, 4));
+                        let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4.1, 4));
+                        let ph = vdotq_s32_acc(vdotq_s32_acc(mzero, hi0, q8h.0), hi1, q8h.1);
+                        acc[c][0] = vmlaq_n_s32(acc[c][0], ph, *sc_ptr.add(c * 8 + sc_hi) as i32);
+                    }
+                    continue;
+                }
+
+                // Prefill (m >= 2): load each channel's 32 nibble-bytes ONCE (was loaded twice -
+                // once per lo/hi pass); lo and hi are derived from the held `q4`, reused across
+                // the MR rows. `from_fn` builds the arrays in place, avoiding the dead zero-init
+                // (`movi`) the old `[vdupq_n_s8(0); NC]` emitted.
                 let q4: [uint8x16x2_t; NC] =
                     core::array::from_fn(|c| unsafe { vld1q_u8_x2(qsb.add(wbase + c * 32)) });
                 let slo: [i32; NC] =
