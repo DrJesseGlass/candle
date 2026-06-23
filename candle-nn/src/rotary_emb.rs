@@ -1,7 +1,6 @@
 //! Rotary Embeddings
 //!
 use candle::{CpuStorage, Layout, Result, Shape, Tensor, D};
-use rayon::prelude::*;
 
 /// Interleaved variant of rotary embeddings.
 /// The x0 and x1 value are interleaved on the n_embd (= head_dim) dimension.
@@ -49,22 +48,19 @@ impl candle::CustomOp3 for RotaryEmbI {
             let unbatched_rope = l_cos.dims().len() == 3 && l_sin.dims().len() == 3;
             let el_count = b * h * t * d;
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(t * d)
-                .zip(dst.par_chunks_mut(t * d))
-                .enumerate()
-                .for_each(|(bh_i, (src, dst))| {
-                    for i_over_2 in 0..t * d / 2 {
-                        let i = 2 * i_over_2;
-                        let rope_i = if unbatched_rope {
-                            let b_i = bh_i / h;
-                            i_over_2 + b_i * t * d / 2
-                        } else {
-                            i_over_2
-                        };
-                        dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                        dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
-                    }
-                });
+            candle::utils::par_zip_chunks(src, &mut dst, t * d, |bh_i, src, dst| {
+                for i_over_2 in 0..t * d / 2 {
+                    let i = 2 * i_over_2;
+                    let rope_i = if unbatched_rope {
+                        let b_i = bh_i / h;
+                        i_over_2 + b_i * t * d / 2
+                    } else {
+                        i_over_2
+                    };
+                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, h, t, d).into()))
         }
@@ -332,26 +328,23 @@ impl candle::CustomOp3 for RotaryEmb {
             let unbatched_rope = l_cos.dims().len() == 3 && l_sin.dims().len() == 3;
             let el_count = b * h * t * d;
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(t * d)
-                .zip(dst.par_chunks_mut(t * d))
-                .enumerate()
-                .for_each(|(bh_i, (src, dst))| {
-                    for i_t in 0..t {
-                        for i_d in 0..d / 2 {
-                            let i1 = i_t * d + i_d;
-                            let i2 = i1 + d / 2;
-                            let i_cs = i_t * (d / 2) + i_d;
-                            let i_cs = if unbatched_rope {
-                                let b_i = bh_i / h;
-                                i_cs + b_i * t * d / 2
-                            } else {
-                                i_cs
-                            };
-                            dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                            dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                        }
+            candle::utils::par_zip_chunks(src, &mut dst, t * d, |bh_i, src, dst| {
+                for i_t in 0..t {
+                    for i_d in 0..d / 2 {
+                        let i1 = i_t * d + i_d;
+                        let i2 = i1 + d / 2;
+                        let i_cs = i_t * (d / 2) + i_d;
+                        let i_cs = if unbatched_rope {
+                            let b_i = bh_i / h;
+                            i_cs + b_i * t * d / 2
+                        } else {
+                            i_cs
+                        };
+                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                     }
-                });
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, h, t, d).into()))
         }
@@ -605,27 +598,24 @@ impl candle::CustomOp3 for RotaryEmbThd {
             let unbatched_rope = l_cos.dims().len() == 3 && l_sin.dims().len() == 3;
             let el_count = b * h * t * d;
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(t * h * d)
-                .zip(dst.par_chunks_mut(t * h * d))
-                .enumerate()
-                .for_each(|(b_i, (src, dst))| {
-                    for i_t in 0..t {
-                        for i_d in 0..d / 2 {
-                            let i_cs = i_t * (d / 2) + i_d;
-                            let i_cs = if unbatched_rope {
-                                i_cs + b_i * t * d / 2
-                            } else {
-                                i_cs
-                            };
-                            for i_h in 0..h {
-                                let i1 = i_t * h * d + i_h * d + i_d;
-                                let i2 = i1 + d / 2;
-                                dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                                dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                            }
+            candle::utils::par_zip_chunks(src, &mut dst, t * h * d, |b_i, src, dst| {
+                for i_t in 0..t {
+                    for i_d in 0..d / 2 {
+                        let i_cs = i_t * (d / 2) + i_d;
+                        let i_cs = if unbatched_rope {
+                            i_cs + b_i * t * d / 2
+                        } else {
+                            i_cs
+                        };
+                        for i_h in 0..h {
+                            let i1 = i_t * h * d + i_h * d + i_d;
+                            let i2 = i1 + d / 2;
+                            dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                            dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                         }
                     }
-                });
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, (b, t, h, d).into()))
         }

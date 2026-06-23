@@ -307,6 +307,65 @@ pub fn barrier_pool() -> &'static BarrierPool {
     BARRIER_POOL.get_or_init(|| BarrierPool::new(get_num_threads().saturating_sub(1)))
 }
 
+/// Map `f(chunk_idx, &src_chunk, &mut dst_chunk)` over matching `chunk`-sized chunks of
+/// `src`/`dst`, in parallel on the barrier pool with a CONTIGUOUS per-thread partition.
+/// The rayon-free replacement for
+/// `src.par_chunks(c).zip(dst.par_chunks_mut(c)).enumerate().for_each(...)` - contiguous
+/// partitioning keeps each core's working set local (no shared-cache thrash). `dst.len()`
+/// must be a multiple of `chunk`. `execute` with a 0-worker pool runs inline (no overhead
+/// at 1 vCPU). SAFETY: each thread writes a disjoint contiguous chunk range, no overlap.
+pub fn par_zip_chunks<T: Sync, U>(
+    src: &[T],
+    dst: &mut [U],
+    chunk: usize,
+    f: impl Fn(usize, &[T], &mut [U]) + Sync,
+) {
+    let n = dst.len() / chunk;
+    struct DstP<U>(*mut U);
+    unsafe impl<U> Sync for DstP<U> {}
+    let dp = DstP(dst.as_mut_ptr());
+    let pool = barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let cpt = n.div_ceil(n_total);
+    pool.execute(|tid| {
+        let p = &dp;
+        let start = tid * cpt;
+        if start < n {
+            let end = n.min((tid + 1) * cpt);
+            for ci in start..end {
+                let s = &src[ci * chunk..(ci + 1) * chunk];
+                let d = unsafe { std::slice::from_raw_parts_mut(p.0.add(ci * chunk), chunk) };
+                f(ci, s, d);
+            }
+        }
+    });
+}
+
+/// `par_zip_chunks` without a `src`: map `f(chunk_idx, &mut dst_chunk)` over `chunk`-sized
+/// chunks of `dst` in parallel on the barrier pool, contiguous per-thread partition. For
+/// kernels that index their inputs by `chunk_idx` rather than taking a paired src chunk.
+/// `dst.len()` must be a multiple of `chunk`.
+pub fn par_chunks_mut<U>(dst: &mut [U], chunk: usize, f: impl Fn(usize, &mut [U]) + Sync) {
+    let n = dst.len() / chunk;
+    struct DstP<U>(*mut U);
+    unsafe impl<U> Sync for DstP<U> {}
+    let dp = DstP(dst.as_mut_ptr());
+    let pool = barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let cpt = n.div_ceil(n_total);
+    pool.execute(|tid| {
+        let p = &dp;
+        let start = tid * cpt;
+        if start < n {
+            let end = n.min((tid + 1) * cpt);
+            for ci in start..end {
+                let d = unsafe { std::slice::from_raw_parts_mut(p.0.add(ci * chunk), chunk) };
+                f(ci, d);
+            }
+        }
+    });
+}
+
 pub fn with_threadpool<F: FnOnce() -> R + Send, R: Send>(f: F) -> R {
     candle_pool().install(f)
 }

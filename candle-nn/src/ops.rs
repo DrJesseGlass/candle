@@ -2,7 +2,6 @@
 //!
 
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
-use rayon::prelude::*;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
@@ -302,20 +301,18 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             let dims = layout.shape().dims();
             let dim_m1 = dims[dims.len() - 1];
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(src, dst)| {
-                    let mut max = T::neg_infinity();
-                    unsafe { T::vec_reduce_max(src.as_ptr(), &mut max, dim_m1) };
-                    for (s, d) in src.iter().zip(dst.iter_mut()) {
-                        *d = (*s - max).exp();
-                    }
-                    let mut sum_exp = T::zero();
-                    unsafe { T::vec_reduce_sum(dst.as_ptr(), &mut sum_exp, dim_m1) };
-                    for d in dst.iter_mut() {
-                        *d /= sum_exp
-                    }
-                });
+            candle::utils::par_zip_chunks(src, &mut dst, dim_m1, |_, src, dst| {
+                let mut max = T::neg_infinity();
+                unsafe { T::vec_reduce_max(src.as_ptr(), &mut max, dim_m1) };
+                for (s, d) in src.iter().zip(dst.iter_mut()) {
+                    *d = (*s - max).exp();
+                }
+                let mut sum_exp = T::zero();
+                unsafe { T::vec_reduce_sum(dst.as_ptr(), &mut sum_exp, dim_m1) };
+                for d in dst.iter_mut() {
+                    *d /= sum_exp
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
@@ -482,22 +479,20 @@ impl candle::CustomOp2 for RmsNorm {
             let dims = layout.shape().dims();
             let dim_m1 = dims[dims.len() - 1];
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(src, dst)| {
-                    let sum2 = src
-                        .iter()
-                        .map(|&v| {
-                            let v = v.as_();
-                            v * v
-                        })
-                        .sum::<f32>();
-                    let m = (sum2 / dim_m1 as f32 + eps).sqrt();
-                    let m = T::from_f32(m).unwrap_or_else(T::nan);
-                    for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
-                        *d = *s / m * *alpha
-                    }
-                });
+            candle::utils::par_zip_chunks(src, &mut dst, dim_m1, |_, src, dst| {
+                let sum2 = src
+                    .iter()
+                    .map(|&v| {
+                        let v = v.as_();
+                        v * v
+                    })
+                    .sum::<f32>();
+                let m = (sum2 / dim_m1 as f32 + eps).sqrt();
+                let m = T::from_f32(m).unwrap_or_else(T::nan);
+                for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
+                    *d = *s / m * *alpha
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
@@ -709,28 +704,26 @@ impl candle::CustomOp3 for LayerNorm {
             let dims = layout.shape().dims();
             let dim_m1 = dims[dims.len() - 1];
             let mut dst = vec![T::zero(); el_count];
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(src, dst)| {
-                    let mut sum = 0f32;
-                    let mut sum2 = 0f32;
-                    for v in src {
-                        let v = v.as_();
-                        sum += v;
-                        sum2 += v * v;
-                    }
-                    let mean = sum / dim_m1 as f32;
-                    let var = sum2 / dim_m1 as f32 - mean * mean;
-                    let inv_std = (var + eps).sqrt().recip();
-                    for ((d, s), (alpha, beta)) in
-                        dst.iter_mut().zip(src.iter()).zip(alpha.iter().zip(beta))
-                    {
-                        let alpha = alpha.as_();
-                        let beta = beta.as_();
-                        let d_ = (s.as_() - mean) * inv_std * alpha + beta;
-                        *d = T::from_f32(d_).unwrap_or_else(T::nan);
-                    }
-                });
+            candle::utils::par_zip_chunks(src, &mut dst, dim_m1, |_, src, dst| {
+                let mut sum = 0f32;
+                let mut sum2 = 0f32;
+                for v in src {
+                    let v = v.as_();
+                    sum += v;
+                    sum2 += v * v;
+                }
+                let mean = sum / dim_m1 as f32;
+                let var = sum2 / dim_m1 as f32 - mean * mean;
+                let inv_std = (var + eps).sqrt().recip();
+                for ((d, s), (alpha, beta)) in
+                    dst.iter_mut().zip(src.iter()).zip(alpha.iter().zip(beta))
+                {
+                    let alpha = alpha.as_();
+                    let beta = beta.as_();
+                    let d_ = (s.as_() - mean) * inv_std * alpha + beta;
+                    *d = T::from_f32(d_).unwrap_or_else(T::nan);
+                }
+            });
             let storage = candle::WithDType::to_cpu_storage_owned(dst);
             Ok((storage, Shape::from_dims(dims)))
         }
