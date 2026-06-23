@@ -25,8 +25,6 @@ use super::k_quants::{BlockQ4K, BlockQ6K, QK_K};
 use super::k_quants::{BlockQ8K, GgmlType};
 use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
-#[cfg(target_feature = "neon")]
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -390,11 +388,10 @@ pub(crate) fn matmul_q4k_packed(
     lhs: &[f32],
     rhs_q4k: &[BlockQ4K],
     dst: &mut [f32],
-    pool: &rayon::ThreadPool,
 ) {
     let nb = k / QK_K;
     let packed = packed_cache_get(rhs_q4k, n, nb);
-    matmul_q4kx8_prepacked((m, k, n), lhs, &packed, dst, pool);
+    matmul_q4kx8_prepacked((m, k, n), lhs, &packed, dst);
 }
 
 /// GEMM over an already-interleaved `BlockQ4Kx8` weight (no repack/cache step):
@@ -408,104 +405,109 @@ pub(crate) fn matmul_q4kx8_prepacked(
     lhs: &[f32],
     packed: &[BlockQ4Kx8],
     dst: &mut [f32],
-    pool: &rayon::ThreadPool,
 ) {
     use super::neon::{gemm_q4kx8_q8k, gemm_q4kx_q8k};
     let nb = k / QK_K;
     let groups = n / Q4KX8_ROWS;
     let tile = *PACKED_PREFILL_TILE;
-    // Single-thread decode (the Lambda 1-vCPU tier): pool.install + into_par_iter is
-    // pure crossbeam split/join overhead with no parallelism to gain (~3% of decode),
-    // so run serially - mirrors the m==1 serial GEMV fast-path in k_quants::matmul.
-    let serial = pool.current_num_threads() <= 1;
 
-    let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
-    if serial {
-        for a in 0..m {
-            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut lhs_q[a * nb..(a + 1) * nb]);
-        }
-    } else {
-        pool.install(|| {
-            lhs_q
-                .par_chunks_mut(nb)
-                .enumerate()
-                .with_min_len(4)
-                .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
-        });
+    // Activation -> Q8K into a thread-local scratch (matmul is called many times per token;
+    // this avoids a per-call Vec alloc). Cheap vs the matmul, kept serial.
+    thread_local! {
+        static LHS_Q: std::cell::RefCell<Vec<BlockQ8K>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
+    LHS_Q.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < m * nb {
+            scratch.resize(m * nb, BlockQ8K::zeros());
+        }
+        for a in 0..m {
+            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut scratch[a * nb..(a + 1) * nb]);
+        }
+        let lhs_q: &[BlockQ8K] = &scratch;
 
-    struct DstPtr(*mut f32);
-    unsafe impl Sync for DstPtr {}
-    let dptr = DstPtr(dst.as_mut_ptr());
-    let process = |g: usize| {
-        let w = &packed[g * nb..(g + 1) * nb];
-        let p = &dptr;
-        let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
-        let mut r = 0;
-        match tile {
-            PrefillTile::Nc8mr4 => {
-                // 8 channels x 4 rows per call (32 acc) - widest reuse, the default.
-                while r + 4 <= m {
-                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
-                    let mut t = [0f32; Q4KX8_ROWS * 4];
-                    gemm_q4kx8_q8k::<4>(w, &rows, &mut t);
-                    for c in 0..Q4KX8_ROWS {
-                        for a in 0..4 {
-                            unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
-                        }
-                    }
-                    r += 4;
-                }
-            }
-            PrefillTile::Nc4mr4 => {
-                // 4 rows x {channels 0..4, 4..8} per call (16 acc).
-                while r + 4 <= m {
-                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
-                    for half in 0..2 {
-                        let c0 = half * 4;
-                        let mut t = [0f32; 4 * 4];
-                        gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut t);
-                        for c in 0..4 {
+        struct DstPtr(*mut f32);
+        unsafe impl Sync for DstPtr {}
+        let dptr = DstPtr(dst.as_mut_ptr());
+        let process = |g: usize| {
+            let w = &packed[g * nb..(g + 1) * nb];
+            let p = &dptr;
+            let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
+            let mut r = 0;
+            match tile {
+                PrefillTile::Nc8mr4 => {
+                    while r + 4 <= m {
+                        let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                        let mut t = [0f32; Q4KX8_ROWS * 4];
+                        gemm_q4kx8_q8k::<4>(w, &rows, &mut t);
+                        for c in 0..Q4KX8_ROWS {
                             for a in 0..4 {
-                                unsafe { *p.0.add((r + a) * n + g * 8 + c0 + c) = t[c * 4 + a] };
+                                unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
                             }
                         }
+                        r += 4;
                     }
-                    r += 4;
                 }
-            }
-            PrefillTile::Nc8mr2 => {}
-        }
-        // nc8mr2 main (for the Nc8mr2 tile), or the 2/3-row remainder of the wide paths.
-        while r + 2 <= m {
-            let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
-            let mut tile = [0f32; Q4KX8_ROWS * 2];
-            gemm_q4kx8_q8k::<2>(w, &rows, &mut tile);
-            for c in 0..Q4KX8_ROWS {
-                for a in 0..2 {
-                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = tile[c * 2 + a] };
+                PrefillTile::Nc4mr4 => {
+                    while r + 4 <= m {
+                        let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                        for half in 0..2 {
+                            let c0 = half * 4;
+                            let mut t = [0f32; 4 * 4];
+                            gemm_q4kx_q8k::<4, 4>(w, c0, &rows, &mut t);
+                            for c in 0..4 {
+                                for a in 0..4 {
+                                    unsafe {
+                                        *p.0.add((r + a) * n + g * 8 + c0 + c) = t[c * 4 + a]
+                                    };
+                                }
+                            }
+                        }
+                        r += 4;
+                    }
                 }
+                PrefillTile::Nc8mr2 => {}
             }
-            r += 2;
-        }
-        while r < m {
-            let rows: [&[BlockQ8K]; 1] = [row(r)];
-            let mut tile = [0f32; Q4KX8_ROWS];
-            gemm_q4kx8_q8k::<1>(w, &rows, &mut tile);
-            for c in 0..Q4KX8_ROWS {
-                unsafe { *p.0.add(r * n + g * 8 + c) = tile[c] };
+            while r + 2 <= m {
+                let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
+                let mut t = [0f32; Q4KX8_ROWS * 2];
+                gemm_q4kx8_q8k::<2>(w, &rows, &mut t);
+                for c in 0..Q4KX8_ROWS {
+                    for a in 0..2 {
+                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 2 + a] };
+                    }
+                }
+                r += 2;
             }
-            r += 1;
-        }
-    };
+            while r < m {
+                let rows: [&[BlockQ8K]; 1] = [row(r)];
+                let mut t = [0f32; Q4KX8_ROWS];
+                gemm_q4kx8_q8k::<1>(w, &rows, &mut t);
+                for c in 0..Q4KX8_ROWS {
+                    unsafe { *p.0.add(r * n + g * 8 + c) = t[c] };
+                }
+                r += 1;
+            }
+        };
 
-    if serial {
-        (0..groups).for_each(&process);
-    } else {
-        pool.install(|| {
-            (0..groups).into_par_iter().for_each(&process);
+        // CONTIGUOUS per-thread group partition on the barrier pool (replaces rayon's
+        // fine-grained par_iter, whose work-stealing thrashed the shared cache on N1 and
+        // collapsed multi-thread decode scaling - see bench/perf_bytes.sh). `execute` with a
+        // 0-worker pool just runs f(0) inline, so the 1-vCPU path has zero pool overhead.
+        let pool = crate::utils::barrier_pool();
+        let n_total = pool.n_workers() + 1;
+        let gpt = groups.div_ceil(n_total);
+        pool.execute(|tid| {
+            let start = tid * gpt;
+            if start < groups {
+                let end = groups.min((tid + 1) * gpt);
+                for g in start..end {
+                    process(g);
+                }
+            }
         });
-    }
+    });
 }
 
 /// GEMM over an already-interleaved `BlockQ6Kx8` weight: `dst(m,n) = lhs(m,k) x W^T`.
@@ -519,7 +521,6 @@ pub(crate) fn matmul_q6kx8_prepacked(
     lhs: &[f32],
     packed: &[BlockQ6Kx8],
     dst: &mut [f32],
-    pool: &rayon::ThreadPool,
 ) {
     use super::neon::gemm_q6kx8_q8k;
     let nb = k / QK_K;
@@ -527,73 +528,77 @@ pub(crate) fn matmul_q6kx8_prepacked(
     // Q6 has only the 8-channel kernel; widen the prefill tile to MR=4 (the nc8mr4
     // default) for the same channel+row reuse win, else MR=2.
     let mr4 = *PACKED_PREFILL_TILE == PrefillTile::Nc8mr4;
-    let serial = pool.current_num_threads() <= 1;
 
-    let mut lhs_q = vec![BlockQ8K::zeros(); m * nb];
-    if serial {
-        for a in 0..m {
-            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut lhs_q[a * nb..(a + 1) * nb]);
-        }
-    } else {
-        pool.install(|| {
-            lhs_q
-                .par_chunks_mut(nb)
-                .enumerate()
-                .with_min_len(4)
-                .for_each(|(a, row)| BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], row));
-        });
+    thread_local! {
+        static LHS_Q: std::cell::RefCell<Vec<BlockQ8K>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
+    LHS_Q.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < m * nb {
+            scratch.resize(m * nb, BlockQ8K::zeros());
+        }
+        for a in 0..m {
+            BlockQ8K::from_float(&lhs[a * k..(a + 1) * k], &mut scratch[a * nb..(a + 1) * nb]);
+        }
+        let lhs_q: &[BlockQ8K] = &scratch;
 
-    struct DstPtr(*mut f32);
-    unsafe impl Sync for DstPtr {}
-    let dptr = DstPtr(dst.as_mut_ptr());
-    let process = |g: usize| {
-        let w = &packed[g * nb..(g + 1) * nb];
-        let p = &dptr;
-        let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
-        let mut r = 0;
-        if mr4 {
-            while r + 4 <= m {
-                let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
-                let mut t = [0f32; Q4KX8_ROWS * 4];
-                gemm_q6kx8_q8k::<4>(w, &rows, &mut t);
+        struct DstPtr(*mut f32);
+        unsafe impl Sync for DstPtr {}
+        let dptr = DstPtr(dst.as_mut_ptr());
+        let process = |g: usize| {
+            let w = &packed[g * nb..(g + 1) * nb];
+            let p = &dptr;
+            let row = |r: usize| -> &[BlockQ8K] { &lhs_q[r * nb..(r + 1) * nb] };
+            let mut r = 0;
+            if mr4 {
+                while r + 4 <= m {
+                    let rows: [&[BlockQ8K]; 4] = std::array::from_fn(|a| row(r + a));
+                    let mut t = [0f32; Q4KX8_ROWS * 4];
+                    gemm_q6kx8_q8k::<4>(w, &rows, &mut t);
+                    for c in 0..Q4KX8_ROWS {
+                        for a in 0..4 {
+                            unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
+                        }
+                    }
+                    r += 4;
+                }
+            }
+            while r + 2 <= m {
+                let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
+                let mut t = [0f32; Q4KX8_ROWS * 2];
+                gemm_q6kx8_q8k::<2>(w, &rows, &mut t);
                 for c in 0..Q4KX8_ROWS {
-                    for a in 0..4 {
-                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 4 + a] };
+                    for a in 0..2 {
+                        unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 2 + a] };
                     }
                 }
-                r += 4;
+                r += 2;
             }
-        }
-        while r + 2 <= m {
-            let rows: [&[BlockQ8K]; 2] = std::array::from_fn(|a| row(r + a));
-            let mut t = [0f32; Q4KX8_ROWS * 2];
-            gemm_q6kx8_q8k::<2>(w, &rows, &mut t);
-            for c in 0..Q4KX8_ROWS {
-                for a in 0..2 {
-                    unsafe { *p.0.add((r + a) * n + g * 8 + c) = t[c * 2 + a] };
+            while r < m {
+                let rows: [&[BlockQ8K]; 1] = [row(r)];
+                let mut t = [0f32; Q4KX8_ROWS];
+                gemm_q6kx8_q8k::<1>(w, &rows, &mut t);
+                for c in 0..Q4KX8_ROWS {
+                    unsafe { *p.0.add(r * n + g * 8 + c) = t[c] };
+                }
+                r += 1;
+            }
+        };
+
+        let pool = crate::utils::barrier_pool();
+        let n_total = pool.n_workers() + 1;
+        let gpt = groups.div_ceil(n_total);
+        pool.execute(|tid| {
+            let start = tid * gpt;
+            if start < groups {
+                let end = groups.min((tid + 1) * gpt);
+                for g in start..end {
+                    process(g);
                 }
             }
-            r += 2;
-        }
-        while r < m {
-            let rows: [&[BlockQ8K]; 1] = [row(r)];
-            let mut t = [0f32; Q4KX8_ROWS];
-            gemm_q6kx8_q8k::<1>(w, &rows, &mut t);
-            for c in 0..Q4KX8_ROWS {
-                unsafe { *p.0.add(r * n + g * 8 + c) = t[c] };
-            }
-            r += 1;
-        }
-    };
-
-    if serial {
-        (0..groups).for_each(&process);
-    } else {
-        pool.install(|| {
-            (0..groups).into_par_iter().for_each(&process);
         });
-    }
+    });
 }
 
 // ===========================================================================
@@ -762,13 +767,7 @@ impl super::QuantizedType for PackedQ4Kx8 {
         lhs: &[f32],
         dst: &mut [f32],
     ) -> crate::Result<()> {
-        let (m, _k, _n) = mkn;
-        let pool = if m == 1 {
-            &*super::k_quants::QMATMUL_DECODE_POOL
-        } else {
-            &*super::k_quants::QMATMUL_PREFILL_POOL
-        };
-        matmul_q4kx8_prepacked(mkn, lhs, self.as_slice(), dst, pool);
+        matmul_q4kx8_prepacked(mkn, lhs, self.as_slice(), dst);
         Ok(())
     }
 
@@ -994,13 +993,7 @@ impl super::QuantizedType for PackedQ6Kx8 {
         lhs: &[f32],
         dst: &mut [f32],
     ) -> crate::Result<()> {
-        let (m, _k, _n) = mkn;
-        let pool = if m == 1 {
-            &*super::k_quants::QMATMUL_DECODE_POOL
-        } else {
-            &*super::k_quants::QMATMUL_PREFILL_POOL
-        };
-        matmul_q6kx8_prepacked(mkn, lhs, self.as_slice(), dst, pool);
+        matmul_q6kx8_prepacked(mkn, lhs, self.as_slice(), dst);
         Ok(())
     }
 
@@ -1339,10 +1332,6 @@ mod tests {
             BlockQ4K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
         }
         let rhs_q4k: &[BlockQ4K] = &rhs_t;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
 
         for &m in &[1usize, 5usize, 16usize] {
             let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
@@ -1350,7 +1339,7 @@ mod tests {
             let mut dst_pack = vec![0f32; m * n];
             matmul::<BlockQ4K>((m, k, n), &lhs, &rhs_t, &mut dst_base).unwrap();
             clear_packed_cache();
-            matmul_q4k_packed((m, k, n), &lhs, rhs_q4k, &mut dst_pack, &pool);
+            matmul_q4k_packed((m, k, n), &lhs, rhs_q4k, &mut dst_pack);
             for i in 0..m * n {
                 assert_eq!(
                     dst_base[i].to_bits(),

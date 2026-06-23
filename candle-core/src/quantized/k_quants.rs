@@ -2554,12 +2554,7 @@ pub fn matmul<T: GgmlType>(
     {
         let rhs_q4k =
             unsafe { std::slice::from_raw_parts(rhs_t.as_ptr() as *const BlockQ4K, rhs_t.len()) };
-        let pool = if m == 1 {
-            &*QMATMUL_DECODE_POOL
-        } else {
-            &*QMATMUL_PREFILL_POOL
-        };
-        super::repack::matmul_q4k_packed((m, k, n), lhs, rhs_q4k, dst, pool);
+        super::repack::matmul_q4k_packed((m, k, n), lhs, rhs_q4k, dst);
         return Ok(());
     }
 

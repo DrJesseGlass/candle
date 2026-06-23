@@ -11,7 +11,7 @@ use super::dot_f16_f16;
 #[cfg(not(feature = "f16-attn-dot"))]
 use super::dot_f32_f16;
 use super::online_softmax::online_softmax_step;
-use super::standard::{FLASH_ATTN_POOL, FLASH_DECODE_POOL};
+use super::standard::FLASH_ATTN_POOL;
 use super::{axpy_f16, dot_f32};
 
 /// Prefetch a cache line for read.
@@ -532,29 +532,31 @@ pub fn causal_decode_f16kv_interleaved(
             }
         };
 
-    // Single-thread pool (the common Lambda 1-vCPU tier) has only ~h_kv tiny tasks,
-    // so the rayon split/join machinery is pure per-call overhead - run serially.
-    // Bit-identical to the parallel path; CANDLE_FLASH_SERIAL=0 forces rayon.
-    static FLASH_SERIAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("CANDLE_FLASH_SERIAL")
-            .map(|s| s != "0")
-            .unwrap_or(true)
-    });
-    if *FLASH_SERIAL && FLASH_DECODE_POOL.current_num_threads() <= 1 {
-        let mut acc = vec![0f32; rk * d];
-        let mut m = vec![0f32; rk];
-        let mut ssum = vec![0f32; rk];
-        for (kv_h, out_chunk) in out.chunks_mut(rk * d).enumerate() {
-            process(kv_h, out_chunk, &mut acc, &mut m, &mut ssum);
+    // CONTIGUOUS per-thread partition of the h_kv kv-heads on the barrier pool (replaces
+    // rayon's fine-grained par_chunks, which thrashed the shared cache and limited decode
+    // scaling on N1). `execute` with a 0-worker pool runs f(0) inline - zero overhead at 1 vCPU.
+    struct OutPtr(*mut f32);
+    unsafe impl Sync for OutPtr {}
+    let optr = OutPtr(out.as_mut_ptr());
+    let pool = candle::utils::barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let hpt = h_kv.div_ceil(n_total);
+    pool.execute(|tid| {
+        let p = &optr; // capture the whole OutPtr (Sync), not the raw `.0` field
+        let start = tid * hpt;
+        if start < h_kv {
+            let end = h_kv.min((tid + 1) * hpt);
+            let mut acc = vec![0f32; rk * d];
+            let mut m = vec![0f32; rk];
+            let mut ssum = vec![0f32; rk];
+            for kv_h in start..end {
+                let out_chunk = unsafe {
+                    std::slice::from_raw_parts_mut(p.0.add(kv_h * rk * d), rk * d)
+                };
+                process(kv_h, out_chunk, &mut acc, &mut m, &mut ssum);
+            }
         }
-    } else {
-        FLASH_DECODE_POOL.install(|| {
-            out.par_chunks_mut(rk * d).enumerate().for_each_init(
-                || (vec![0f32; rk * d], vec![0f32; rk], vec![0f32; rk]),
-                |(acc, m, ssum), (kv_h, out_chunk)| process(kv_h, out_chunk, acc, m, ssum),
-            );
-        });
-    }
+    });
 
     Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
 }
@@ -592,17 +594,23 @@ pub fn causal_prefill_f16kv_headmajor(
     unsafe impl Sync for OutPtr {}
     let out_ptr = OutPtr(out.as_mut_ptr());
 
-    FLASH_ATTN_POOL.install(|| {
-        (0..h_kv * n_qblocks).into_par_iter().for_each_init(
-            || {
-                (
-                    vec![0f32; rk * d],          // accumulators
-                    vec![0f32; rk * KB],         // weights (scores in pass 1)
-                    vec![f32::NEG_INFINITY; rk], // running max
-                    vec![0f32; rk],              // running sum
-                )
-            },
-            |(acc, w, m, ssum), task| {
+    // CONTIGUOUS per-thread partition of the (kv-head, q-block) tasks on the barrier pool
+    // (replaces rayon's fine-grained into_par_iter). execute(0 workers) runs f(0) inline.
+    let n_tasks = h_kv * n_qblocks;
+    let pool = candle::utils::barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let tpt = n_tasks.div_ceil(n_total);
+    pool.execute(|tid| {
+        let t_start = tid * tpt;
+        if t_start >= n_tasks {
+            return;
+        }
+        let t_end = n_tasks.min((tid + 1) * tpt);
+        let mut acc = vec![0f32; rk * d];
+        let mut w = vec![0f32; rk * KB];
+        let mut m = vec![f32::NEG_INFINITY; rk];
+        let mut ssum = vec![0f32; rk];
+        for task in t_start..t_end {
                 let kv_h = task / n_qblocks;
                 let q0 = (task % n_qblocks) * QB;
                 let q1 = (q0 + QB).min(s_q);
@@ -702,8 +710,7 @@ pub fn causal_prefill_f16kv_headmajor(
                         }
                     }
                 }
-            },
-        );
+        }
     });
 
     Tensor::from_vec(out, (h_q, s_q, d), &Device::Cpu)
