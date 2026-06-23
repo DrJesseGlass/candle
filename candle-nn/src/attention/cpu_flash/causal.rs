@@ -447,6 +447,12 @@ fn causal_prefill<const LEAN: bool, T: WithDType>(
 // KV layout is contiguous (S, H_kv, 2*D) with K=[..,:D] and V=[..,D:2D],
 // so one base pointer per position and one prefetch covers both.
 
+// Tiled decode softmax was tried (CANDLE_TILED_DECODE_ATTN) and DROPPED: it amortized the
+// online acc-rescale over a kv tile, but the rescales were not the bottleneck (the running max
+// stabilizes fast), and the tile's score-buffer store/load + separate max-pass cost MORE - it
+// raised decode attention 4.64->5.70B instr and ran slower. Decode is memory-bound (38.7%
+// backend stall), so this kind of compute restructuring can't help. The online step stays.
+
 /// Decode with interleaved KV cache. No ALiBi, no softcap.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_decode_f16kv_interleaved(
