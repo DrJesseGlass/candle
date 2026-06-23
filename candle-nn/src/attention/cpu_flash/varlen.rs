@@ -9,11 +9,9 @@
 
 use candle::{DType, Device, Result, Storage, Tensor};
 use half::f16;
-use rayon::prelude::*;
 
 use super::dot_f32;
 use super::online_softmax::online_softmax_step;
-use super::standard::FLASH_ATTN_POOL;
 
 /// Fused variable-length flash attention on CPU.
 ///
@@ -203,10 +201,10 @@ pub fn flash_attn_varlen_cpu(
 
             let mut out = vec![0f32; total_q * hq * d];
 
-            FLASH_ATTN_POOL.install(|| {
-                out.par_chunks_mut(d).enumerate().for_each_init(
-                    || vec![0f32; d],
-                    |acc, (row, out_row)| {
+            candle::utils::par_chunks_mut(&mut out, d, |row, out_row| {
+                let mut acc_buf = vec![0f32; d];
+                let acc = acc_buf.as_mut_slice();
+                {
                         let q_idx = row / hq;
                         let h = row % hq;
 
@@ -269,8 +267,7 @@ pub fn flash_attn_varlen_cpu(
                         for t in 0..d {
                             out_row[t] = acc[t] * inv;
                         }
-                    },
-                );
+                }
             });
 
             Tensor::from_vec(out, (total_q, hq, d), &Device::Cpu)
@@ -297,10 +294,10 @@ pub fn flash_attn_varlen_cpu(
 
             let mut out = vec![f16::from_f32(0.0); total_q * hq * d];
 
-            FLASH_ATTN_POOL.install(|| {
-                out.par_chunks_mut(d).enumerate().for_each_init(
-                    || vec![0f32; d],
-                    |acc, (row, out_row)| {
+            candle::utils::par_chunks_mut(&mut out, d, |row, out_row| {
+                let mut acc_buf = vec![0f32; d];
+                let acc = acc_buf.as_mut_slice();
+                {
                         let q_idx = row / hq;
                         let h = row % hq;
 
@@ -362,8 +359,7 @@ pub fn flash_attn_varlen_cpu(
                         for t in 0..d {
                             out_row[t] = f16::from_f32(acc[t] * inv);
                         }
-                    },
-                );
+                }
             });
 
             Tensor::from_vec(out, (total_q, hq, d), &Device::Cpu)

@@ -4,14 +4,12 @@
 // Single-batch (B=1) causal attention using loop-bound masking.
 
 use candle::{Device, Result, Storage, Tensor, WithDType};
-use rayon::prelude::*;
 
 #[cfg(feature = "f16-attn-dot")]
 use super::dot_f16_f16;
 #[cfg(not(feature = "f16-attn-dot"))]
 use super::dot_f32_f16;
 use super::online_softmax::online_softmax_step;
-use super::standard::FLASH_ATTN_POOL;
 use super::{axpy_f16, dot_f32};
 
 /// Prefetch a cache line for read.
@@ -267,10 +265,10 @@ fn causal_decode<const LEAN: bool, T: WithDType>(
 
     let mut out = vec![0f32; h_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(d).enumerate().for_each_init(
-            || vec![0f32; d],
-            |acc, (h_i, out_chunk)| {
+    candle::utils::par_chunks_mut(&mut out, d, |h_i, out_chunk| {
+        let mut acc_v = vec![0f32; d];
+        let acc = acc_v.as_mut_slice();
+        {
                 let slope = if !LEAN && max_bias > 0.0 {
                     2.0f32.powf(-max_bias * ((h_i + 1) as f32) / n2 as f32)
                 } else {
@@ -325,8 +323,7 @@ fn causal_decode<const LEAN: bool, T: WithDType>(
                 for t in 0..d {
                     out_chunk[t] = acc[t] * inv;
                 }
-            },
-        );
+        }
     });
 
     Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
@@ -367,13 +364,10 @@ fn causal_prefill<const LEAN: bool, T: WithDType>(
 
     let mut out = vec![0f32; h_q * s_q * d];
 
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(d)
-            .with_min_len(64)
-            .enumerate()
-            .for_each_init(
-                || vec![0f32; d],
-                |acc, (row_idx, out_chunk)| {
+    candle::utils::par_chunks_mut(&mut out, d, |row_idx, out_chunk| {
+        let mut acc_v = vec![0f32; d];
+        let acc = acc_v.as_mut_slice();
+        {
                     let h_i = row_idx / s_q;
                     let q_pos = row_idx % s_q;
 
@@ -436,8 +430,7 @@ fn causal_prefill<const LEAN: bool, T: WithDType>(
                     for t in 0..d {
                         out_chunk[t] = acc[t] * inv;
                     }
-                },
-            );
+        }
     });
 
     Tensor::from_vec(out, (h_q, s_q, d), &Device::Cpu)

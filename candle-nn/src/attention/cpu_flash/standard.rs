@@ -4,52 +4,9 @@
 
 use candle::{Device, Result, Storage, Tensor, WithDType};
 use std::f32;
-use std::sync::LazyLock;
-
-use rayon::prelude::*;
-use rayon::ThreadPool;
 
 use super::dot_f32;
 use super::online_softmax::online_softmax_step;
-
-#[cfg(target_os = "macos")]
-unsafe fn set_thread_affinity() {
-    use libc::{pthread_set_qos_class_self_np, qos_class_t::QOS_CLASS_USER_INTERACTIVE};
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-}
-
-#[cfg(not(target_os = "macos"))]
-#[inline(always)]
-unsafe fn set_thread_affinity() {}
-
-pub(crate) static FLASH_ATTN_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .start_handler(|_| unsafe {
-            set_thread_affinity();
-        })
-        .build()
-        .expect("Failed to build flash-attention thread pool")
-});
-
-// Decode (q_len=1) flash attention saturates well below the logical core count and the
-// E-cores on Apple Silicon drag it down; default to the performance cores (~cores/2).
-pub(crate) static FLASH_DECODE_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let n = std::env::var("CANDLE_FLASH_DECODE_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or((cores / 2).max(1));
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .start_handler(|_| unsafe {
-            set_thread_affinity();
-        })
-        .build()
-        .expect("Failed to build flash-attention decode pool")
-});
 
 /// Fused softmax(qk^T*scale)v on CPU, B=1 only. Output shape (1, H, S, Dv).
 pub fn run_flash_attn_cpu<T>(
@@ -224,10 +181,10 @@ fn flash_attn_decode<const LEAN: bool, T: WithDType>(
 
     let mut out = vec![0f32; h * dv];
 
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(dv).enumerate().for_each_init(
-            || vec![0f32; dv],
-            |acc, (h_i, out_chunk)| {
+    candle::utils::par_chunks_mut(&mut out, dv, |h_i, out_chunk| {
+        let mut acc_buf = vec![0f32; dv];
+        let acc = acc_buf.as_mut_slice();
+        {
                 let slope = if !LEAN && max_bias > 0.0 {
                     2.0f32.powf(-max_bias * ((h_i + 1) as f32) / n2 as f32)
                 } else {
@@ -289,8 +246,7 @@ fn flash_attn_decode<const LEAN: bool, T: WithDType>(
                 for (out_v, acc_v) in out_chunk.iter_mut().zip(acc.iter()) {
                     *out_v = *acc_v * inv_s;
                 }
-            },
-        );
+        }
     });
 
     Tensor::from_vec(out, (1usize, h, 1usize, dv), &Device::Cpu)
@@ -332,13 +288,10 @@ fn flash_attn_prefill<const LEAN: bool, T: WithDType>(
 
     let mut out = vec![0f32; h * q_len * dv];
 
-    FLASH_ATTN_POOL.install(|| {
-        out.par_chunks_mut(dv)
-            .with_min_len(64)
-            .enumerate()
-            .for_each_init(
-                || vec![0f32; dv],
-                |acc, (row_idx, out_chunk)| {
+    candle::utils::par_chunks_mut(&mut out, dv, |row_idx, out_chunk| {
+        let mut acc_buf = vec![0f32; dv];
+        let acc = acc_buf.as_mut_slice();
+        {
                     let h_i = row_idx / q_len;
                     let q_pos = row_idx % q_len;
 
@@ -404,8 +357,7 @@ fn flash_attn_prefill<const LEAN: bool, T: WithDType>(
                     for (out_v, acc_v) in out_chunk.iter_mut().zip(acc.iter()) {
                         *out_v = *acc_v * inv_s;
                     }
-                },
-            );
+        }
     });
 
     Tensor::from_vec(out, (1usize, h, q_len, dv), &Device::Cpu)
