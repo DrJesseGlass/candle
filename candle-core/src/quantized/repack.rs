@@ -309,6 +309,7 @@ static PACKED_CACHE: LazyLock<Mutex<HashMap<usize, Arc<Vec<BlockQ4Kx8>>>>> =
 /// Drop all cached repacked weights (e.g. between unrelated models in a process).
 pub fn clear_packed_cache() {
     PACKED_CACHE.lock().unwrap().clear();
+    LANEQ_CACHE.lock().unwrap().clear();
 }
 
 /// Eight output channels' worth of one Q6_K super-block, interleaved for SDOT.
@@ -463,9 +464,32 @@ pub(crate) fn matmul_q4k_packed(
     dst: &mut [f32],
 ) {
     let nb = k / QK_K;
+    // Prefill (m>=4) on i8mm hardware: route to the SMMLA GEMM, which does ~4 SDOTs
+    // of work per instruction (the large-M prefill lever). Only compiled when the
+    // binary is built with `+i8mm` (else the real `smmla` is absent); decode (m<4)
+    // and non-i8mm builds keep the SDOT path. Separate laneq weight cache (the SMMLA
+    // layout differs from the SDOT `BlockQ4Kx8`), so an i8mm host holds both copies -
+    // acceptable for now; a baked laneq format / laneq GEMV decode is a later step.
+    #[cfg(target_feature = "i8mm")]
+    {
+        if m >= 4 && *PREFILL_I8MM {
+            let packed = packed_laneq_cache_get(rhs_q4k, n, nb);
+            matmul_q4kx8l_prepacked_i8mm((m, k, n), lhs, &packed, dst);
+            return;
+        }
+    }
     let packed = packed_cache_get(rhs_q4k, n, nb);
     matmul_q4kx8_prepacked((m, k, n), lhs, &packed, dst);
 }
+
+// A/B switch for the i8mm prefill path (default ON when compiled with `+i8mm`).
+// Set CANDLE_PREFILL_I8MM=0 to force the SDOT path for same-binary benchmarking.
+#[cfg(target_feature = "i8mm")]
+static PREFILL_I8MM: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("CANDLE_PREFILL_I8MM")
+        .map(|s| s != "0")
+        .unwrap_or(true)
+});
 
 /// GEMM over an already-interleaved `BlockQ4Kx8` weight (no repack/cache step):
 /// `dst(m,n) = lhs(m,k) x W^T`, `packed` holding the `n/8` channel groups
@@ -580,6 +604,117 @@ pub(crate) fn matmul_q4kx8_prepacked(
                 }
             }
         });
+    });
+}
+
+/// Repack a Q4_K weight (`n` channels x `nb` blocks, row-major) into the laneq
+/// `BlockQ4Kx8L` groups the i8mm GEMM consumes. Mirrors `repack_q4k_weight` but
+/// emits the SMMLA layout (`repack_q4kx8_laneq` per 8-channel group).
+#[allow(dead_code)] // used only by the i8mm dispatch (`+i8mm` builds)
+pub(crate) fn repack_q4k_weight_laneq(rows: &[BlockQ4K], n: usize, nb: usize) -> Vec<BlockQ4Kx8L> {
+    debug_assert_eq!(n % Q4KX8_ROWS, 0, "repack_q4k_weight_laneq: n {n} not /8");
+    debug_assert_eq!(rows.len(), n * nb, "repack_q4k_weight_laneq: rows len mismatch");
+    let mut packed = Vec::with_capacity((n / 8) * nb);
+    for g in 0..n / 8 {
+        let grp: [&[BlockQ4K]; Q4KX8_ROWS] =
+            std::array::from_fn(|r| &rows[(g * 8 + r) * nb..(g * 8 + r + 1) * nb]);
+        packed.extend(repack_q4kx8_laneq(&grp));
+    }
+    packed
+}
+
+/// Laneq-layout repack cache, keyed on the source Q4_K pointer (parallel to
+/// `PACKED_CACHE`). Populated on first i8mm prefill of each weight.
+#[allow(dead_code)]
+static LANEQ_CACHE: LazyLock<Mutex<HashMap<usize, Arc<Vec<BlockQ4Kx8L>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[allow(dead_code)]
+fn packed_laneq_cache_get(rhs: &[BlockQ4K], n: usize, nb: usize) -> Arc<Vec<BlockQ4Kx8L>> {
+    let key = rhs.as_ptr() as usize;
+    {
+        if let Some(p) = LANEQ_CACHE.lock().unwrap().get(&key) {
+            return p.clone();
+        }
+    }
+    let mut map = LANEQ_CACHE.lock().unwrap();
+    if let Some(p) = map.get(&key) {
+        return p.clone();
+    }
+    let arc = Arc::new(repack_q4k_weight_laneq(rhs, n, nb));
+    map.insert(key, arc.clone());
+    arc
+}
+
+/// i8mm prefill GEMM driver: `dst(m,n) = lhs(m,k) x W^T` over laneq-packed weights.
+/// Activations are packed to `BlockQ8Kx4` in 4-row tiles (last tile zero-padded),
+/// then each 8-channel weight group x 4-row tile is an SMMLA `gemm_q4kx8_q8k_i8mm`
+/// call writing a 4x8 sub-tile. Parallelized over channel groups on the barrier
+/// pool, exactly like the SDOT driver. Compiles on any neon host (the SMMLA op
+/// falls back to its scalar twin), so the tiling/scatter is testable without i8mm.
+#[cfg(target_feature = "neon")]
+#[allow(dead_code)] // taken only by the i8mm dispatch (`+i8mm` builds) + tests
+pub(crate) fn matmul_q4kx8l_prepacked_i8mm(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    packed: &[BlockQ4Kx8L],
+    dst: &mut [f32],
+) {
+    use super::neon::gemm_q4kx8_q8k_i8mm;
+    let nb = k / QK_K;
+    let groups = n / Q4KX8_ROWS;
+    let row_tiles = m.div_ceil(4);
+
+    // Pack activations once (reused across all weight groups). The last tile's
+    // missing rows are zero - they contribute 0 and are not scattered to `dst`.
+    let zeros = vec![0f32; k];
+    let mut q8: Vec<BlockQ8Kx4> = Vec::with_capacity(row_tiles * nb);
+    for rt in 0..row_tiles {
+        let rows: [&[f32]; 4] = std::array::from_fn(|a| {
+            let r = rt * 4 + a;
+            if r < m {
+                &lhs[r * k..(r + 1) * k]
+            } else {
+                zeros.as_slice()
+            }
+        });
+        q8.extend(quantize_mat_q8_k_4x8(&rows, nb));
+    }
+
+    struct DstPtr(*mut f32);
+    unsafe impl Sync for DstPtr {}
+    let dptr = DstPtr(dst.as_mut_ptr());
+
+    let process = |g: usize| {
+        let w = &packed[g * nb..(g + 1) * nb];
+        let p = &dptr;
+        for rt in 0..row_tiles {
+            let q8t = &q8[rt * nb..(rt + 1) * nb];
+            let mut t = [0f32; 32];
+            gemm_q4kx8_q8k_i8mm(w, q8t, &mut t);
+            for a in 0..4 {
+                let r = rt * 4 + a;
+                if r >= m {
+                    break;
+                }
+                for c in 0..Q4KX8_ROWS {
+                    unsafe { *p.0.add(r * n + g * 8 + c) = t[a * 8 + c] };
+                }
+            }
+        }
+    };
+
+    let pool = crate::utils::barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let gpt = groups.div_ceil(n_total);
+    pool.execute(|tid| {
+        let start = tid * gpt;
+        if start < groups {
+            let end = groups.min((tid + 1) * gpt);
+            for g in start..end {
+                process(g);
+            }
+        }
     });
 }
 
@@ -1452,6 +1587,12 @@ mod tests {
     fn matmul_q4k_packed_matches_baseline() {
         use crate::quantized::k_quants::matmul;
 
+        // This test asserts BIT-exactness of the SDOT packed path. On a `+i8mm`
+        // build, m>=4 would otherwise dispatch to the (correct but not bit-exact)
+        // i8mm path, so force SDOT here. Safe: this is the only test that reaches
+        // the i8mm dispatch gate, so nothing else has initialized it yet.
+        std::env::set_var("CANDLE_PREFILL_I8MM", "0");
+
         let k = 512usize; // 2 super-blocks
         let n = 24usize; // 3 groups of 8
         let nb = k / QK_K;
@@ -1480,6 +1621,50 @@ mod tests {
                     dst_pack[i]
                 );
             }
+        }
+    }
+
+    // The i8mm prefill driver (laneq weights + q8_Kx4 activations + SMMLA) must
+    // match the baseline Q4_K matmul. NOT bit-exact: the i8mm path quantizes
+    // activations with llama's signed-max convention vs the baseline's abs-max
+    // BlockQ8K, so results differ by q8 rounding noise - a relative tolerance
+    // catches layout/tiling bugs (which blow up >100%) while allowing that. Covers
+    // m not a multiple of 4 (zero-padded remainder tile). Runs on a non-i8mm host
+    // via the scalar SMMLA twin (bit-identical to hardware), so it is a real check.
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn matmul_q4kx8l_i8mm_matches_baseline() {
+        use crate::quantized::k_quants::matmul;
+
+        let k = 512usize; // 2 super-blocks
+        let n = 24usize; // 3 groups of 8
+        let nb = k / QK_K;
+        let mut st = 0x0bad_f00d_dead_beefu64;
+
+        let mut rhs_t = vec![BlockQ4K::zeros(); n * nb];
+        for r in 0..n {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            BlockQ4K::from_float(&f, &mut rhs_t[r * nb..(r + 1) * nb]);
+        }
+        let laneq = repack_q4k_weight_laneq(&rhs_t, n, nb);
+
+        for &m in &[4usize, 7usize, 16usize] {
+            let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
+            let mut dst_base = vec![0f32; m * n];
+            let mut dst_i8mm = vec![0f32; m * n];
+            matmul::<BlockQ4K>((m, k, n), &lhs, &rhs_t, &mut dst_base).unwrap();
+            matmul_q4kx8l_prepacked_i8mm((m, k, n), &lhs, &laneq, &mut dst_i8mm);
+            // Relative L2 error over the whole output: robust to q8 noise on small
+            // individual entries, while a layout/tiling bug blows it past 1.0.
+            let mut err = 0f64;
+            let mut sig = 0f64;
+            for i in 0..m * n {
+                let d = dst_i8mm[i] as f64 - dst_base[i] as f64;
+                err += d * d;
+                sig += (dst_base[i] as f64) * (dst_base[i] as f64);
+            }
+            let rel = (err / sig.max(1e-12)).sqrt();
+            assert!(rel < 2e-2, "m={m}: relative L2 error {rel} too high");
         }
     }
 
