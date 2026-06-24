@@ -225,6 +225,79 @@ pub(crate) fn repack_q4kx8_laneq(cols: &[&[BlockQ4K]; 8]) -> Vec<BlockQ4Kx8L> {
     (0..nb).map(|i| make_q4kx8_laneq(cols, i)).collect()
 }
 
+// ===========================================================================
+// Activation side of the i8mm (SMMLA) GEMM: 4 Q8_K rows interleaved into the
+// `block_q8_Kx4` layout that llama's `ggml_gemm_q4_K_8x8_q8_K` consumes. The
+// SMMLA kernel reads 2 rows at a time as a 2x8 int8 operand, so the 4 rows are
+// laid out interleaved (rows 01 then 23) in 8-byte groups. Byte-for-byte port of
+// llama's `ggml_quantize_mat_q8_k_4x8` so the matching kernel is a faithful port.
+// ===========================================================================
+
+/// Four Q8_K activation rows interleaved for the SMMLA GEMM. Mirrors llama's
+/// `block_q8_Kx4` field layout (`d[4]`, interleaved `qs`, grouped `bsums`).
+// dead_code until the i8mm GEMM is wired into the prefill dispatcher (step 2).
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone)]
+pub(crate) struct BlockQ8Kx4 {
+    pub(crate) d: [f32; 4],
+    pub(crate) qs: [i8; QK_K * 4],
+    pub(crate) bsums: [i16; QK_K / 4],
+}
+
+impl BlockQ8Kx4 {
+    fn zeroed() -> Self {
+        Self {
+            d: [0.0; 4],
+            qs: [0; QK_K * 4],
+            bsums: [0; QK_K / 4],
+        }
+    }
+}
+
+/// Quantize and interleave 4 activation rows (each `nb * QK_K` f32) into `nb`
+/// `BlockQ8Kx4`. Pure scalar (runs identically on any host), so the local build
+/// produces the exact bytes the i8mm hardware kernel will consume. Port of
+/// llama's `ggml_quantize_mat_q8_k_4x8_generic` (`blck_size_interleave = 8`).
+#[allow(dead_code)] // until wired into the prefill dispatcher (step 2)
+pub(crate) fn quantize_mat_q8_k_4x8(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ8Kx4> {
+    const BSI: usize = 8; // blck_size_interleave
+    let mut out = Vec::with_capacity(nb);
+    for i in 0..nb {
+        let mut blk = BlockQ8Kx4::zeroed();
+        let mut srcv = [[0f32; QK_K]; 4];
+        let mut iscale = [0f32; 4];
+        for (row, &r) in rows.iter().enumerate() {
+            let mut amax = 0f32;
+            let mut max = 0f32;
+            for j in 0..QK_K {
+                let v = r[i * QK_K + j];
+                srcv[row][j] = v;
+                if amax < v.abs() {
+                    amax = v.abs();
+                    max = v;
+                }
+            }
+            iscale[row] = if amax != 0.0 { -127.0 / max } else { 0.0 };
+            blk.d[row] = if amax != 0.0 { 1.0 / iscale[row] } else { 0.0 };
+        }
+        // Quants are interleaved in 8-byte runs across the 4 rows; bsums are
+        // grouped 4-at-a-time per source super-block (the kernel's bias term).
+        for j in 0..QK_K * 4 {
+            let mut src_offset = (j / (4 * BSI)) * BSI;
+            let src_id = (j % (4 * BSI)) / BSI;
+            src_offset += j % BSI;
+            let index = (((j & 31) >> 3) << 2) + ((j >> 8) << 4) + ((j >> 6) & 3);
+            let x0 = srcv[src_id][src_offset] * iscale[src_id];
+            let q = x0.round() as i8;
+            blk.qs[j] = q;
+            blk.bsums[index] += q as i16;
+        }
+        out.push(blk);
+    }
+    out
+}
+
 /// Process-global cache of repacked Q4_K weights, keyed by the source block
 /// slice's base pointer. Model weights live for the whole run, so this repacks
 /// each weight matrix once on first use. Benchmark-grade: keyed on pointer, so it
@@ -1310,6 +1383,64 @@ mod tests {
                     wq[c][i].dmin.to_bits(),
                     "dmin c{c} i{i}"
                 );
+            }
+        }
+    }
+
+    // The i8mm/SMMLA 4x8 GEMM tile must match the f32 ground truth (dequant Q4_K
+    // weight . dequant Q8 activation). Validates the laneq weight layout, the
+    // q8_Kx4 activation pack, the 6-bit scale unpack, and the SMMLA tiling/reorder
+    // end to end. The SMMLA op runs via the scalar twin on a non-i8mm host, which
+    // is bit-identical to the hardware instruction - so this is the i8mm result.
+    #[cfg(target_feature = "neon")]
+    #[test]
+    fn gemm_q4kx8_i8mm_matches_reference() {
+        use crate::quantized::neon::gemm_q4kx8_q8k_i8mm;
+
+        let nb = 3usize;
+        let k = nb * QK_K;
+        let mut st = 0x1234_5678_9abc_def0u64;
+
+        // 8 weight columns; keep the dequantized f32 for the reference.
+        let mut wq: Vec<Vec<BlockQ4K>> = Vec::new();
+        let mut wf: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..8 {
+            let f: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let mut q = vec![BlockQ4K::zeros(); nb];
+            BlockQ4K::from_float(&f, &mut q);
+            let mut deq = vec![0f32; k];
+            BlockQ4K::to_float(&q, &mut deq);
+            wq.push(q);
+            wf.push(deq);
+        }
+        let cols: [&[BlockQ4K]; 8] = std::array::from_fn(|c| wq[c].as_slice());
+        let packed = repack_q4kx8_laneq(&cols);
+
+        // 4 activation rows.
+        let af: Vec<Vec<f32>> = (0..4).map(|_| (0..k).map(|_| lcg(&mut st)).collect()).collect();
+        let arows: [&[f32]; 4] = std::array::from_fn(|r| af[r].as_slice());
+        let q8 = quantize_mat_q8_k_4x8(&arows, nb);
+
+        let mut dst = [0f32; 32];
+        gemm_q4kx8_q8k_i8mm(&packed, &q8, &mut dst);
+
+        // Reference: dequant weight . dequant activation, same products the kernel
+        // forms (only the f32 accumulation order differs). Reconstruct each row's
+        // q8 from the interleaved pack: element e of row r lives at qs[j].
+        for r in 0..4 {
+            for col in 0..8 {
+                let mut sum = 0f64;
+                for blk in 0..nb {
+                    let qb = &q8[blk];
+                    for e in 0..QK_K {
+                        let j = (e / 8) * 32 + r * 8 + (e % 8);
+                        let actd = qb.d[r] as f64 * qb.qs[j] as f64;
+                        sum += wf[col][blk * QK_K + e] as f64 * actd;
+                    }
+                }
+                let got = dst[r * 8 + col] as f64;
+                let rel = (got - sum).abs() / sum.abs().max(1e-6);
+                assert!(rel < 1e-2, "r{r} col{col}: got {got} ref {sum} rel {rel}");
             }
         }
     }

@@ -1,7 +1,7 @@
 use super::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0, QK8_0, QK_K,
 };
-use super::repack::{BlockQ4Kx8, BlockQ6Kx8};
+use super::repack::{BlockQ4Kx8, BlockQ4Kx8L, BlockQ6Kx8, BlockQ8Kx4};
 use byteorder::{ByteOrder, LittleEndian};
 
 #[allow(unused_imports)]
@@ -1000,6 +1000,241 @@ pub(crate) fn gemm_q4kx8_q8k<const MR: usize>(
     dst: &mut [f32],
 ) {
     gemm_q4kx_q8k::<8, MR>(packed, 0, rows, dst)
+}
+
+// ===========================================================================
+// i8mm (SMMLA) packed Q4_K prefill GEMM. Computes a 4-row x 8-col output tile
+// per call (one BlockQ8Kx4 activation series x one BlockQ4Kx8L weight series).
+// SMMLA does a 2x2 int8 outer-product-accumulate in one instruction (~4 SDOTs of
+// work), the lever for large-M prefill on i8mm hardware (Graviton3/4, not N1).
+//
+// Faithful port of llama's `ggml_gemm_q4_K_8x8_q8_K` NEON i8mm branch, against
+// the byte-identical `BlockQ4Kx8L`/`BlockQ8Kx4` layouts. The SMMLA itself is
+// gated on `target_feature = "i8mm"`; without it (e.g. the M1 dev host) a SCALAR
+// emulation runs that is bit-identical to the hardware instruction (exact integer
+// arithmetic), so a local build validates the exact result i8mm hardware yields.
+// ===========================================================================
+
+/// SMMLA: `acc + a(2x8) * b(2x8)^T`, a 2x2 int32 result. Lane r*2+c holds the dot
+/// of `a` row r with `b` row c - matching the ARM `smmla` destination layout, so
+/// the kernel's output reorder (ported verbatim) is correct on both paths.
+// dead_code until the i8mm GEMM is wired into the prefill dispatcher (step 2).
+#[allow(dead_code)]
+#[cfg(all(target_arch = "aarch64", target_feature = "i8mm"))]
+#[inline(always)]
+unsafe fn smmla(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    // The `vmmlaq_s32` std intrinsic is unstable (stdarch_neon_i8mm), so emit the
+    // SMMLA instruction directly. Safe on stable because `i8mm` is a target feature.
+    core::arch::asm!(
+        "smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    acc
+}
+
+#[allow(dead_code)]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "i8mm")))]
+#[inline(always)]
+unsafe fn smmla(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    // Scalar twin of `smmla`. Integer arithmetic is exact, so this returns the
+    // identical int32 result the hardware instruction would - the whole point of
+    // step 1: validate layout + scale logic on a host without i8mm.
+    let mut av = [0i8; 16];
+    let mut bv = [0i8; 16];
+    let mut o = [0i32; 4];
+    vst1q_s8(av.as_mut_ptr(), a);
+    vst1q_s8(bv.as_mut_ptr(), b);
+    vst1q_s32(o.as_mut_ptr(), acc);
+    for r in 0..2 {
+        for c in 0..2 {
+            let mut s = 0i32;
+            for k in 0..8 {
+                s += av[r * 8 + k] as i32 * bv[c * 8 + k] as i32;
+            }
+            o[r * 2 + c] += s;
+        }
+    }
+    vld1q_s32(o.as_ptr())
+}
+
+/// Unpack one sub-block-pair's 6-bit scales/mins from the laneq 12-byte group into
+/// 8 i8 scales + an int16x8 of mins. Port of llama's `decode_q_Kx8_6bit_scales`.
+#[allow(dead_code)] // until wired into the prefill dispatcher (step 2)
+#[inline(always)]
+unsafe fn decode_q_kx8_6bit_scales(
+    scales_in: &[u8],
+    out_mins: &mut int16x8_t,
+    out_scales: &mut [i8; 8],
+) {
+    const KMASK1: u32 = 0x3f3f_3f3f;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    const KMASK3: u32 = 0x0303_0303;
+    let sm = [
+        u32::from_le_bytes([scales_in[0], scales_in[1], scales_in[2], scales_in[3]]),
+        u32::from_le_bytes([scales_in[4], scales_in[5], scales_in[6], scales_in[7]]),
+        u32::from_le_bytes([scales_in[8], scales_in[9], scales_in[10], scales_in[11]]),
+    ];
+    let mins_0_3 = sm[1] & KMASK1;
+    let mins_4_7 = ((sm[2] >> 4) & KMASK2) | (((sm[1] >> 6) & KMASK3) << 4);
+    let mins_u32 = [mins_0_3, mins_4_7];
+    let mins_u8 = vreinterpret_u8_u32(vld1_u32(mins_u32.as_ptr()));
+    *out_mins = vreinterpretq_s16_u16(vmovl_u8(mins_u8));
+    let s0 = (sm[0] & KMASK1).to_le_bytes();
+    let s1 = ((sm[2] & KMASK2) | (((sm[0] >> 6) & KMASK3) << 4)).to_le_bytes();
+    for l in 0..4 {
+        out_scales[l] = s0[l] as i8;
+        out_scales[4 + l] = s1[l] as i8;
+    }
+}
+
+/// Packed Q4_K i8mm GEMM: 4 activation rows x 8 weight columns, over `nb`
+/// super-blocks. Writes a row-major 4x8 tile: `dst[row * 8 + col]`. `q4`/`q8`
+/// must have the same length `nb`. Bit-exact (mod f32 accumulation order) to the
+/// scalar Q4_K dot. See module note for the i8mm gating / scalar-emulation story.
+#[allow(dead_code)] // until wired into the prefill dispatcher (step 2)
+pub(crate) fn gemm_q4kx8_q8k_i8mm(q4: &[BlockQ4Kx8L], q8: &[BlockQ8Kx4], dst: &mut [f32]) {
+    let nb = q4.len();
+    debug_assert!(q8.len() == nb && dst.len() == 32);
+    unsafe {
+        let m4b = vdupq_n_u8(0x0f);
+        let mut acc_f32 = [vdupq_n_f32(0.0); 8];
+        for b in 0..nb {
+            let q4b = &q4[b];
+            let q8b = &q8[b];
+            // Per q8 row: pairwise-add the 16 bsums into 8 sub-block sums.
+            let mut bsums_arr = [[0i16; 8]; 4];
+            for r in 0..4 {
+                let p = q8b.bsums.as_ptr().add(16 * r);
+                let v = vpaddq_s16(vld1q_s16(p), vld1q_s16(p.add(8)));
+                vst1q_s16(bsums_arr[r].as_mut_ptr(), v);
+            }
+
+            let mut acc = [vdupq_n_s32(0); 8]; // raw i8mm sums (rows 01 in 0..4, 23 in 4..8)
+            let mut bias_acc = [vdupq_n_s32(0); 8]; // interleaved mins*bsum bias
+
+            for sb in 0..QK_K / 64 {
+                // Scales/mins for the lo (i=0) and hi (i=1) nibble sub-blocks.
+                let mut q4sb_scales = [[0i8; 8]; 2];
+                let mut q4sb_mins = [vdupq_n_s16(0); 2];
+                for i in 0..2 {
+                    let offset = sb * 24 + i * 12;
+                    decode_q_kx8_6bit_scales(
+                        &q4b.scales[offset..],
+                        &mut q4sb_mins[i],
+                        &mut q4sb_scales[i],
+                    );
+                }
+
+                // Q8: 8 interleaved (row01 | row23) 16-byte runs for this sub-block.
+                let q8_base = q8b.qs.as_ptr().add(sb * 256);
+                let mut q8_01 = [vdupq_n_s8(0); 8];
+                let mut q8_23 = [vdupq_n_s8(0); 8];
+                for i in 0..8 {
+                    let off = i * 32;
+                    q8_01[i] = vld1q_s8(q8_base.add(off));
+                    q8_23[i] = vld1q_s8(q8_base.add(off + 16));
+                }
+                let q8s = [q8_01, q8_23];
+
+                // Weight columns iterated in pairs (01, 23, 45, 67).
+                for cp in 0..4 {
+                    let mut sb_acc = [vdupq_n_s32(0); 4];
+                    let base = q4b.qs.as_ptr().add(sb * QK_K + 16 * cp);
+                    let q0 = vld1q_u8(base);
+                    let q1 = vld1q_u8(base.add(64));
+                    let q2 = vld1q_u8(base.add(128));
+                    let q3 = vld1q_u8(base.add(192));
+                    let q4n = [
+                        [
+                            vreinterpretq_s8_u8(vandq_u8(q0, m4b)),
+                            vreinterpretq_s8_u8(vandq_u8(q1, m4b)),
+                            vreinterpretq_s8_u8(vandq_u8(q2, m4b)),
+                            vreinterpretq_s8_u8(vandq_u8(q3, m4b)),
+                        ],
+                        [
+                            vreinterpretq_s8_u8(vshrq_n_u8(q0, 4)),
+                            vreinterpretq_s8_u8(vshrq_n_u8(q1, 4)),
+                            vreinterpretq_s8_u8(vshrq_n_u8(q2, 4)),
+                            vreinterpretq_s8_u8(vshrq_n_u8(q3, 4)),
+                        ],
+                    ];
+                    for rp in 0..2 {
+                        for blk in 0..2 {
+                            let q8r = &q8s[rp][4 * blk..];
+                            let mut a = sb_acc[2 * rp + blk];
+                            for o in 0..4 {
+                                a = smmla(a, q4n[blk][o], q8r[o]);
+                            }
+                            sb_acc[2 * rp + blk] = a;
+                        }
+                    }
+                    let so = cp * 2;
+                    let bscale0 = vcombine_s32(
+                        vdup_n_s32(q4sb_scales[0][so] as i32),
+                        vdup_n_s32(q4sb_scales[0][so + 1] as i32),
+                    );
+                    let bscale1 = vcombine_s32(
+                        vdup_n_s32(q4sb_scales[1][so] as i32),
+                        vdup_n_s32(q4sb_scales[1][so + 1] as i32),
+                    );
+                    acc[cp] = vmlaq_s32(acc[cp], sb_acc[0], bscale0);
+                    acc[cp + 4] = vmlaq_s32(acc[cp + 4], sb_acc[2], bscale0);
+                    acc[cp] = vmlaq_s32(acc[cp], sb_acc[1], bscale1);
+                    acc[cp + 4] = vmlaq_s32(acc[cp + 4], sb_acc[3], bscale1);
+                }
+
+                // Bias: mins . bsums, accumulated per (row, lo/hi col half).
+                for r in 0..4 {
+                    let blo = vdup_n_s16(bsums_arr[sb][r * 2]);
+                    let bhi = vdup_n_s16(bsums_arr[sb][r * 2 + 1]);
+                    bias_acc[2 * r] = vmlal_s16(bias_acc[2 * r], blo, vget_low_s16(q4sb_mins[0]));
+                    bias_acc[2 * r] = vmlal_s16(bias_acc[2 * r], bhi, vget_low_s16(q4sb_mins[1]));
+                    bias_acc[2 * r + 1] =
+                        vmlal_s16(bias_acc[2 * r + 1], blo, vget_high_s16(q4sb_mins[0]));
+                    bias_acc[2 * r + 1] =
+                        vmlal_s16(bias_acc[2 * r + 1], bhi, vget_high_s16(q4sb_mins[1]));
+                }
+            }
+
+            // SMMLA leaves each acc as a 2x2 row-interleaved tile; deinterleave it
+            // back to (row, col-quad) order before the f32 scale/bias combine.
+            for i in 0..8 {
+                let aux = vzip_s32(vget_low_s32(acc[i]), vget_high_s32(acc[i]));
+                acc[i] = vcombine_s32(aux.0, aux.1);
+            }
+            let reorder_acc = [
+                vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1])),
+                vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3])),
+                vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1])),
+                vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3])),
+                vcombine_s32(vget_low_s32(acc[4]), vget_low_s32(acc[5])),
+                vcombine_s32(vget_low_s32(acc[6]), vget_low_s32(acc[7])),
+                vcombine_s32(vget_high_s32(acc[4]), vget_high_s32(acc[5])),
+                vcombine_s32(vget_high_s32(acc[6]), vget_high_s32(acc[7])),
+            ];
+            for i in 0..4 {
+                for j in 0..2 {
+                    let q8_d = vdupq_n_f32(q8b.d[i]);
+                    let q4_dmin_arr: [f32; 4] = core::array::from_fn(|l| q4b.dmin[j * 4 + l].to_f32());
+                    let q4_d_arr: [f32; 4] = core::array::from_fn(|l| q4b.d[j * 4 + l].to_f32());
+                    let dmins = vmulq_f32(vld1q_f32(q4_dmin_arr.as_ptr()), q8_d);
+                    let scale = vmulq_f32(vld1q_f32(q4_d_arr.as_ptr()), q8_d);
+                    acc_f32[2 * i + j] =
+                        vmlsq_f32(acc_f32[2 * i + j], vcvtq_f32_s32(bias_acc[2 * i + j]), dmins);
+                    acc_f32[2 * i + j] =
+                        vmlaq_f32(acc_f32[2 * i + j], vcvtq_f32_s32(reorder_acc[2 * i + j]), scale);
+                }
+            }
+        }
+        for i in 0..4 {
+            for j in 0..2 {
+                vst1q_f32(dst.as_mut_ptr().add(i * 8 + j * 4), acc_f32[2 * i + j]);
+            }
+        }
+    }
 }
 
 /// Packed Q6_K GEMV/GEMM: 8 output channels (one `BlockQ6Kx8`) x MR activation
