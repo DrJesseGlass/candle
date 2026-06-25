@@ -267,16 +267,17 @@ impl BlockQ8Kx4 {
     }
 }
 
-/// Quantize and interleave 4 activation rows (each `nb * QK_K` f32) into `nb`
-/// `BlockQ8Kx4`. Pure scalar (runs identically on any host), so the local build
-/// produces the exact bytes the i8mm hardware kernel will consume. Port of
-/// llama's `ggml_quantize_mat_q8_k_4x8_generic` (`blck_size_interleave = 8`).
-#[allow(dead_code)] // until wired into the prefill dispatcher (step 2)
-pub(crate) fn quantize_mat_q8_k_4x8(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ8Kx4> {
+/// Quantize and interleave 4 activation rows (each `nb * QK_K` f32) into the `nb`
+/// `BlockQ8Kx4` of `out` (`out.len() == nb`). Pure scalar (runs identically on any
+/// host), so the local build produces the exact bytes the i8mm hardware kernel will
+/// consume. Each super-block `i` is independent, so this is safe to call on disjoint
+/// `out` slices from different threads (the parallel-quant path). Port of llama's
+/// `ggml_quantize_mat_q8_k_4x8_generic` (`blck_size_interleave = 8`).
+#[allow(dead_code)]
+pub(crate) fn quantize_mat_q8_k_4x8_into(rows: &[&[f32]; 4], out: &mut [BlockQ8Kx4]) {
     const BSI: usize = 8; // blck_size_interleave
-    let mut out = Vec::with_capacity(nb);
-    for i in 0..nb {
-        let mut blk = BlockQ8Kx4::zeroed();
+    for (i, blk) in out.iter_mut().enumerate() {
+        *blk = BlockQ8Kx4::zeroed();
         let mut srcv = [[0f32; QK_K]; 4];
         let mut iscale = [0f32; 4];
         for (row, &r) in rows.iter().enumerate() {
@@ -305,23 +306,29 @@ pub(crate) fn quantize_mat_q8_k_4x8(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ
             blk.qs[j] = q;
             blk.bsums[index] += q as i16;
         }
-        out.push(blk);
     }
+}
+
+/// Vec-returning convenience wrapper over `quantize_mat_q8_k_4x8_into`.
+#[allow(dead_code)]
+pub(crate) fn quantize_mat_q8_k_4x8(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ8Kx4> {
+    let mut out = vec![BlockQ8Kx4::zeroed(); nb];
+    quantize_mat_q8_k_4x8_into(rows, &mut out);
     out
 }
 
-/// Quantize and interleave 4 activation rows into `nb` `BlockQ8Kx4` with
-/// `blck_size_interleave = 4` - the layout llama's DOTPROD `ggml_gemm_q4_K_8x4`
-/// consumes, where the SDOT lane index selects the ROW (4 bytes/row per 16-byte
-/// group). Distinct from `quantize_mat_q8_k_4x8` (interleave 8, for the i8mm/SMMLA
-/// kernel) only in the interleave stride and the bsums index. Port of llama's
-/// `ggml_quantize_mat_q8_K_4x4_generic`.
-#[allow(dead_code)] // taken by the lane=row prefill kernel
-pub(crate) fn quantize_mat_q8_k_4x4(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ8Kx4> {
+/// Quantize and interleave 4 activation rows into the `nb` `BlockQ8Kx4` of `out`
+/// (`out.len() == nb`) with `blck_size_interleave = 4` - the layout llama's DOTPROD
+/// `ggml_gemm_q4_K_8x4` consumes, where the SDOT lane index selects the ROW (4
+/// bytes/row per 16-byte group). Distinct from `quantize_mat_q8_k_4x8_into`
+/// (interleave 8, for the i8mm/SMMLA kernel) only in the interleave stride and the
+/// bsums index. Each super-block is independent (safe on disjoint `out` slices from
+/// different threads). Port of llama's `ggml_quantize_mat_q8_K_4x4_generic`.
+#[allow(dead_code)]
+pub(crate) fn quantize_mat_q8_k_4x4_into(rows: &[&[f32]; 4], out: &mut [BlockQ8Kx4]) {
     const BSI: usize = 4; // blck_size_interleave
-    let mut out = Vec::with_capacity(nb);
-    for i in 0..nb {
-        let mut blk = BlockQ8Kx4::zeroed();
+    for (i, blk) in out.iter_mut().enumerate() {
+        *blk = BlockQ8Kx4::zeroed();
         let mut srcv = [[0f32; QK_K]; 4];
         let mut iscale = [0f32; 4];
         for (row, &r) in rows.iter().enumerate() {
@@ -350,8 +357,14 @@ pub(crate) fn quantize_mat_q8_k_4x4(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ
             blk.qs[j] = q;
             blk.bsums[index] += q as i16;
         }
-        out.push(blk);
     }
+}
+
+/// Vec-returning convenience wrapper over `quantize_mat_q8_k_4x4_into`.
+#[allow(dead_code)]
+pub(crate) fn quantize_mat_q8_k_4x4(rows: &[&[f32]; 4], nb: usize) -> Vec<BlockQ8Kx4> {
+    let mut out = vec![BlockQ8Kx4::zeroed(); nb];
+    quantize_mat_q8_k_4x4_into(rows, &mut out);
     out
 }
 
@@ -573,6 +586,19 @@ static PREFILL_LANEROW: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(true)
 });
 
+// A/B switch for parallelizing the prefill activation quantization across the
+// barrier pool (default ON). The lane=row / i8mm drivers quantize all m rows to Q8
+// before the parallel GEMM; doing it serially is an Amdahl ceiling on multi-thread
+// prefill scaling. Set CANDLE_PREFILL_PARQUANT=0 to force the serial quant for
+// same-binary A/B on N1. Result is bit-identical either way (per-tile independent).
+#[cfg(target_feature = "neon")]
+#[allow(dead_code)]
+static PREFILL_PARQUANT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("CANDLE_PREFILL_PARQUANT")
+        .map(|s| s != "0")
+        .unwrap_or(true)
+});
+
 /// GEMM over an already-interleaved `BlockQ4Kx8` weight (no repack/cache step):
 /// `dst(m,n) = lhs(m,k) x W^T`, `packed` holding the `n/8` channel groups
 /// (`nb = k/256` blocks each, group g at `g*nb`). Activations are quantized to Q8K
@@ -749,18 +775,29 @@ pub(crate) fn matmul_q4kx8l_prepacked_i8mm(
 
     // Pack activations once (reused across all weight groups). The last tile's
     // missing rows are zero - they contribute 0 and are not scattered to `dst`.
+    // Parallelized over row-tiles on the barrier pool (each tile independent), so
+    // the quant doesn't serialize multi-thread prefill; CANDLE_PREFILL_PARQUANT=0
+    // forces serial. Identical bytes either way.
     let zeros = vec![0f32; k];
-    let mut q8: Vec<BlockQ8Kx4> = Vec::with_capacity(row_tiles * nb);
-    for rt in 0..row_tiles {
-        let rows: [&[f32]; 4] = std::array::from_fn(|a| {
+    let mut q8: Vec<BlockQ8Kx4> = vec![BlockQ8Kx4::zeroed(); row_tiles * nb];
+    let tile_rows = |rt: usize| -> [&[f32]; 4] {
+        std::array::from_fn(|a| {
             let r = rt * 4 + a;
             if r < m {
                 &lhs[r * k..(r + 1) * k]
             } else {
                 zeros.as_slice()
             }
+        })
+    };
+    if *PREFILL_PARQUANT {
+        crate::utils::par_chunks_mut(&mut q8, nb, |rt, chunk| {
+            quantize_mat_q8_k_4x8_into(&tile_rows(rt), chunk);
         });
-        q8.extend(quantize_mat_q8_k_4x8(&rows, nb));
+    } else {
+        for rt in 0..row_tiles {
+            quantize_mat_q8_k_4x8_into(&tile_rows(rt), &mut q8[rt * nb..(rt + 1) * nb]);
+        }
     }
 
     struct DstPtr(*mut f32);
@@ -856,18 +893,30 @@ pub(crate) fn matmul_q4kx8l_lanerow(
     let groups = n / Q4KX8_ROWS;
     let row_tiles = m.div_ceil(4);
 
+    // Quantize all m activation rows to Q8 (4x4 interleave) into 4-row tiles, the
+    // last zero-padded. Parallelized over row-tiles on the barrier pool (each tile
+    // is independent), so it does not serialize multi-thread prefill; identical
+    // bytes to the serial path. CANDLE_PREFILL_PARQUANT=0 forces serial for A/B.
     let zeros = vec![0f32; k];
-    let mut q8: Vec<BlockQ8Kx4> = Vec::with_capacity(row_tiles * nb);
-    for rt in 0..row_tiles {
-        let rows: [&[f32]; 4] = std::array::from_fn(|a| {
+    let mut q8: Vec<BlockQ8Kx4> = vec![BlockQ8Kx4::zeroed(); row_tiles * nb];
+    let tile_rows = |rt: usize| -> [&[f32]; 4] {
+        std::array::from_fn(|a| {
             let r = rt * 4 + a;
             if r < m {
                 &lhs[r * k..(r + 1) * k]
             } else {
                 zeros.as_slice()
             }
+        })
+    };
+    if *PREFILL_PARQUANT {
+        crate::utils::par_chunks_mut(&mut q8, nb, |rt, chunk| {
+            quantize_mat_q8_k_4x4_into(&tile_rows(rt), chunk);
         });
-        q8.extend(quantize_mat_q8_k_4x4(&rows, nb));
+    } else {
+        for rt in 0..row_tiles {
+            quantize_mat_q8_k_4x4_into(&tile_rows(rt), &mut q8[rt * nb..(rt + 1) * nb]);
+        }
     }
 
     struct DstPtr(*mut f32);
@@ -1950,6 +1999,58 @@ mod tests {
             }
             let rel = (err / sig.max(1e-12)).sqrt();
             assert!(rel < 2e-2, "m={m}: relative L2 error {rel} too high");
+        }
+    }
+
+    // The parallel activation-quant (par_chunks_mut over row-tiles) must produce
+    // BYTE-IDENTICAL Q8 to the serial loop - each tile is independent, so this is
+    // structural, but assert it so a future refactor can't silently break the
+    // CANDLE_PREFILL_PARQUANT=0/1 equivalence the bench A/B relies on.
+    #[test]
+    fn parquant_matches_serial() {
+        let nb = 4usize;
+        let k = nb * QK_K;
+        let m = 13usize; // not a multiple of 4 -> exercises the zero-pad tile
+        let row_tiles = m.div_ceil(4);
+        let mut st = 0x3141_5926_5358_9793u64;
+        let lhs: Vec<f32> = (0..m * k).map(|_| lcg(&mut st)).collect();
+        let zeros = vec![0f32; k];
+        let tile_rows = |rt: usize| -> [&[f32]; 4] {
+            std::array::from_fn(|a| {
+                let r = rt * 4 + a;
+                if r < m {
+                    &lhs[r * k..(r + 1) * k]
+                } else {
+                    zeros.as_slice()
+                }
+            })
+        };
+        for use_4x8 in [false, true] {
+            let mut serial = vec![BlockQ8Kx4::zeroed(); row_tiles * nb];
+            for rt in 0..row_tiles {
+                let dst = &mut serial[rt * nb..(rt + 1) * nb];
+                if use_4x8 {
+                    quantize_mat_q8_k_4x8_into(&tile_rows(rt), dst);
+                } else {
+                    quantize_mat_q8_k_4x4_into(&tile_rows(rt), dst);
+                }
+            }
+            let mut par = vec![BlockQ8Kx4::zeroed(); row_tiles * nb];
+            crate::utils::par_chunks_mut(&mut par, nb, |rt, chunk| {
+                if use_4x8 {
+                    quantize_mat_q8_k_4x8_into(&tile_rows(rt), chunk);
+                } else {
+                    quantize_mat_q8_k_4x4_into(&tile_rows(rt), chunk);
+                }
+            });
+            for t in 0..row_tiles * nb {
+                assert_eq!(serial[t].d, par[t].d, "d mismatch tile {t} 4x8={use_4x8}");
+                assert_eq!(serial[t].qs, par[t].qs, "qs mismatch tile {t} 4x8={use_4x8}");
+                assert_eq!(
+                    serial[t].bsums, par[t].bsums,
+                    "bsums mismatch tile {t} 4x8={use_4x8}"
+                );
+            }
         }
     }
 
