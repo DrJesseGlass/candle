@@ -64,6 +64,33 @@ unsafe fn vdotq_s32_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t
     vaddq_s32(acc, vdotq_s32(a, b))
 }
 
+// Software prefetch for the decode (m=1 GEMV) weight stream, `dist` bytes ahead.
+// DEFAULT OFF (0): measured on Neoverse-N1, SW prefetch HURTS ~10% at 1-2 vCPU and
+// only helps ~10% at 4 vCPU. The weight access is perfectly linear (`+32B`/step),
+// which N1's HARDWARE prefetcher already hides at low thread counts - so the extra
+// prfm is pure load-port/L1 overhead there. It only pays once 4 cores contend for
+// the shared memory system and overwhelm the HW prefetcher. So leave OFF for the
+// 1-2 vCPU tiers; set CANDLE_DECODE_PREFETCH=512 only on 4+ vCPU hosts. prfm is a
+// fault-safe HINT, so prefetching past the buffer end is sound.
+static DECODE_PREFETCH_DIST: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CANDLE_DECODE_PREFETCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+});
+
+/// Emit `prfm pldl1keep, [addr]` - hint to pull `addr`'s line into L1 for a load.
+/// No `nomem` option so the compiler keeps it (it models a memory side effect).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l1(addr: *const u8) {
+    core::arch::asm!(
+        "prfm pldl1keep, [{addr}]",
+        addr = in(reg) addr,
+        options(nostack, preserves_flags),
+    );
+}
+
 /// Merge two per-lane (abs_max, signed_val) accumulator pairs.
 /// Each output lane holds the signed value with the larger absolute value.
 #[inline(always)]
@@ -864,6 +891,10 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
     // per super-block - the SAME two-op float sequence as `vec_dot`/`_xr`, so the
     // result is bit-identical. Written to `dst` once at the end.
     let mut sumf = [[0f32; MR]; NC];
+    // Decode-only weight prefetch distance (bytes); 0 = off. Hoisted out of the
+    // hot loop. Only the MR==1 (GEMV) path uses it - prefill (MR>=2) reuses weights
+    // and is compute-bound, so prefetch is not its lever.
+    let pf_dist = if MR == 1 { *DECODE_PREFETCH_DIST } else { 0 };
     unsafe {
         let m4b = vdupq_n_u8(0xF);
         let mzero = vdupq_n_s32(0); // sdot-chain seed + acc init, hoisted out of the block loop
@@ -922,6 +953,12 @@ pub(crate) fn gemm_q4kx_q8k<const NC: usize, const MR: usize>(
                     let q8l = vld1q_s8_x2(rq[0].add(sc_lo * 32));
                     let q8h = vld1q_s8_x2(rq[0].add(sc_hi * 32));
                     for c in 0..NC {
+                        // Pull the weight line `pf_dist` bytes ahead into L1 while this
+                        // channel computes. Address via usize arithmetic (prefetch may
+                        // target past the block; prfm is fault-safe, no provenance UB).
+                        if pf_dist != 0 {
+                            prefetch_l1((qsb as usize + wbase + c * 32 + pf_dist) as *const u8);
+                        }
                         let q4 = vld1q_u8_x2(qsb.add(wbase + c * 32));
                         let lo0 = vreinterpretq_s8_u8(vandq_u8(q4.0, m4b));
                         let lo1 = vreinterpretq_s8_u8(vandq_u8(q4.1, m4b));
