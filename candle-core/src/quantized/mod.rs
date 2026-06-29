@@ -736,6 +736,73 @@ impl QTensor {
         }
     }
 
+    // Build-once cached BlockQ4Kx8 (decode) repack of a Q4_K weight with n output
+    // rows. Later calls return it without reading storage, so the original can be
+    // freed once it exists.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    fn repacked_qs_for(&self, n: usize) -> &Option<Vec<u8>> {
+        use zerocopy::IntoBytes;
+        self.repacked_qs.get_or_init(|| {
+            let s = match &self.storage {
+                QStorage::Cpu(s) => s,
+                _ => return None,
+            };
+            let total_blocks = s.storage_size_in_bytes() / std::mem::size_of::<BlockQ4K>();
+            if total_blocks == 0 {
+                return None;
+            }
+            let blocks =
+                unsafe { std::slice::from_raw_parts(s.as_ptr() as *const BlockQ4K, total_blocks) };
+            Some(k_quants::pack_to_q4kx8(blocks, n).as_bytes().to_vec())
+        })
+    }
+
+    // Build-once cached lane=row BlockQ4Kx8L (prefill GEMM) repack, same caching.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    fn repacked_laneq_for(&self, n: usize) -> &Option<Vec<u8>> {
+        use zerocopy::IntoBytes;
+        self.repacked_laneq.get_or_init(|| {
+            let s = match &self.storage {
+                QStorage::Cpu(s) => s,
+                _ => return None,
+            };
+            let total_blocks = s.storage_size_in_bytes() / std::mem::size_of::<BlockQ4K>();
+            if total_blocks == 0 {
+                return None;
+            }
+            let blocks =
+                unsafe { std::slice::from_raw_parts(s.as_ptr() as *const BlockQ4K, total_blocks) };
+            Some(
+                repack::repack_q4k_weight_laneq4(blocks, n, total_blocks / n)
+                    .as_bytes()
+                    .to_vec(),
+            )
+        })
+    }
+
+    // Build the aarch64 Q4_K matmul repacks and free the original blocks; the
+    // matmuls then run from the cached repacks alone. No-op off aarch64/Q4_K.
+    // Private: only from_arc calls it, on a uniquely-owned tensor that has ruled
+    // out dequant. Builds both decode and (when enabled) prefill repacks first so
+    // neither path needs the source afterward.
+    fn drop_source_after_repack(&mut self) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        if let Ok((n, _k)) = self.shape.dims2() {
+            let dtype = self.storage.dtype();
+            if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
+                let qs_ok = self.repacked_qs_for(n).is_some();
+                let laneq_ok =
+                    !repack::prefill_lanerow_enabled() || self.repacked_laneq_for(n).is_some();
+                if qs_ok && laneq_ok {
+                    let device = self.storage.device();
+                    if let Ok(empty) = device.qzeros(0, dtype) {
+                        self.storage = empty;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         let (rows, hidden) = self.shape.dims2()?;
         if !hidden.is_multiple_of(self.dtype().block_size()) {
@@ -873,6 +940,14 @@ impl QMatMul {
             let tensor = qtensor.dequantize_f16(&qtensor.device())?;
             Self::TensorF16(tensor)
         } else {
+            // Staying quantized (dequantization ruled out above): on aarch64 build
+            // the Q4_K repacks and free the original blocks. Only when we uniquely
+            // own the tensor -- a shared one (e.g. a tied lm_head reusing the
+            // embedding) keeps its blocks for embedding/dequantize.
+            let mut qtensor = qtensor;
+            if let Some(qt) = std::sync::Arc::get_mut(&mut qtensor) {
+                qt.drop_source_after_repack();
+            }
             Self::QTensor(qtensor)
         };
         Ok(t)
@@ -961,31 +1036,19 @@ impl crate::CustomOp1 for QTensor {
                     &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
                 let mut dst_storage = vec![0f32; dst_shape.elem_count()];
 
-                // Try the 8-column BlockQ4Kx8 repacked path.
+                // Try the 8-column BlockQ4Kx8 repacked paths. Repacks are fetched
+                // from the QTensor (built once, cached) so they stay valid after
+                // the original Q4_K blocks are released.
                 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
                 if self_storage.dtype() == GgmlDType::Q4K && n.is_multiple_of(8) {
-                    use zerocopy::{FromBytes, IntoBytes};
-
-                    let total_blocks =
-                        self_storage.storage_size_in_bytes() / std::mem::size_of::<BlockQ4K>();
+                    use zerocopy::FromBytes;
 
                     // Prefill (m >= 4) routes to the lane=row 8x4 GEMM; the pack is
                     // cached on this tensor (`repacked_laneq`). Decode (m < 4) or a
                     // disabled toggle falls through to the #3643 path below.
                     if dst_shape.elem_count() / n >= 4 && repack::prefill_lanerow_enabled() {
                         let m = dst_shape.elem_count() / n;
-                        let laneq = self.repacked_laneq.get_or_init(|| {
-                            let blocks = unsafe {
-                                std::slice::from_raw_parts(
-                                    self_storage.as_ptr() as *const BlockQ4K,
-                                    total_blocks,
-                                )
-                            };
-                            let packed =
-                                repack::repack_q4k_weight_laneq4(blocks, n, total_blocks / n);
-                            Some(packed.as_bytes().to_vec())
-                        });
-                        if let Some(laneq_bytes) = laneq {
+                        if let Some(laneq_bytes) = self.repacked_laneq_for(n) {
                             let laneq_blocks: &[repack::BlockQ4Kx8L] =
                                 <[repack::BlockQ4Kx8L]>::ref_from_bytes(laneq_bytes).map_err(
                                     |_| {
@@ -1005,17 +1068,7 @@ impl crate::CustomOp1 for QTensor {
                         }
                     }
 
-                    let repacked = self.repacked_qs.get_or_init(|| {
-                        let blocks = unsafe {
-                            std::slice::from_raw_parts(
-                                self_storage.as_ptr() as *const BlockQ4K,
-                                total_blocks,
-                            )
-                        };
-                        let packed = k_quants::pack_to_q4kx8(blocks, n);
-                        Some(packed.as_bytes().to_vec())
-                    });
-                    if let Some(repacked_bytes) = repacked {
+                    if let Some(repacked_bytes) = self.repacked_qs_for(n) {
                         let block_x8: &[BlockQ4Kx8] =
                             <[BlockQ4Kx8]>::ref_from_bytes(repacked_bytes).map_err(|_| {
                                 crate::Error::Msg(
