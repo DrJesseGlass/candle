@@ -13,7 +13,7 @@ use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f16kv_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCacheF16};
-use candle_nn::{Activation, Embedding, Module};
+use candle_nn::{Activation, Module};
 
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -512,7 +512,9 @@ impl LayerWeights {
 
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
-    embed_tokens: Embedding,
+    // Kept quantized; only the input-token rows are dequantized per forward via
+    // QTensor::embedding, instead of materializing the full f32 table at load.
+    embed_tokens: Arc<QTensor>,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -538,7 +540,9 @@ impl ModelWeights {
         let num_kv_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
         let head_dim = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
         let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
-        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
+        // Validated but unbound: the embedding is the quantized QTensor (per-row
+        // dequant), not a dequantized table sized by this.
+        md_get("qwen3.embedding_length")?.to_u32()?;
         let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
@@ -552,8 +556,9 @@ impl ModelWeights {
             None => DType::F16,
         };
 
-        let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        // Keep the embedding quantized; dequantize only the input-token rows per
+        // forward. The Arc is shared with the tied lm_head below.
+        let embed_tokens: Arc<QTensor> = gg.tensor("token_embd.weight")?.into();
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
@@ -578,12 +583,13 @@ impl ModelWeights {
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        // Load output projection tensor, falling back to tied embeddings like gemma3
-        let lm_head_tensor = match gg.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gg.tensor("token_embd.weight")?,
+        // Output projection, falling back to tied embeddings like gemma3. When
+        // tied, reuse the shared embed_tokens Arc: from_arc sees it shared and
+        // keeps its blocks (needed for the per-row embedding) rather than releasing.
+        let lm_head = match gg.tensor("output.weight") {
+            Ok(tensor) => QMatMul::from_weights(tensor.into())?,
+            Err(_) => QMatMul::from_weights(embed_tokens.clone())?,
         };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
@@ -628,7 +634,7 @@ impl ModelWeights {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
-        let mut h = self.embed_tokens.forward(input)?;
+        let mut h = self.embed_tokens.embedding(input)?;
         // Skip mask materialization when using CPU flash attention
         let causal_mask = if l == 1 || self.device.is_cpu() {
             None
