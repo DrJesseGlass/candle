@@ -76,9 +76,17 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let device = Device::Cpu;
 
+    // Boot split: gguf read vs model build (construct + repack + any dequant).
+    let t_read = Instant::now();
     let mut file = std::fs::File::open(&args.model)?;
     let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
+    let gguf_read_ms = t_read.elapsed().as_millis();
+    let t_build = Instant::now();
     let mut model = Qwen3::from_gguf(content, &mut file, &device)?;
+    let model_build_ms = t_build.elapsed().as_millis();
+    if !args.json {
+        eprintln!("COLDSTART gguf_read_ms={gguf_read_ms} model_build_ms={model_build_ms}");
+    }
 
     let prompt: Vec<u32> = vec![args.token_id; args.pp];
 
@@ -123,9 +131,20 @@ fn main() -> Result<()> {
     if args.json {
         println!(
             "{{\"engine\":\"candle\",\"pp\":{},\"tg\":{},\"reps\":{},\
+\"gguf_read_ms\":{},\"model_build_ms\":{},\
 \"pp_tok_s_median\":{:.3},\"pp_tok_s_min\":{:.3},\"pp_tok_s_max\":{:.3},\
 \"tg_tok_s_median\":{:.3},\"tg_tok_s_min\":{:.3},\"tg_tok_s_max\":{:.3}}}",
-            args.pp, args.tg, args.reps, pp_med, pp_min, pp_max, tg_med, tg_min, tg_max
+            args.pp,
+            args.tg,
+            args.reps,
+            gguf_read_ms,
+            model_build_ms,
+            pp_med,
+            pp_min,
+            pp_max,
+            tg_med,
+            tg_min,
+            tg_max
         );
     } else {
         println!("\ncandle  pp{}  tg{}  reps={}", args.pp, args.tg, args.reps);
