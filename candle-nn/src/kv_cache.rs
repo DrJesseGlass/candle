@@ -1137,13 +1137,17 @@ pub struct RawInterleavedKvCacheF16 {
 }
 
 impl RawInterleavedKvCacheF16 {
-    // Create a cache with space for max_seq positions.
+    // max_seq is only a hint for the initial reservation; grow() doubles capacity
+    // on demand in write_kv, so memory tracks the tokens actually cached rather
+    // than a fixed max context.
+    const INIT_POSITIONS: usize = 256;
     pub fn new(h_kv: usize, d: usize, max_seq: usize) -> Self {
+        let cap = max_seq.clamp(1, Self::INIT_POSITIONS);
         Self {
-            buf: vec![half::f16::ZERO; h_kv * max_seq * 2 * d],
+            buf: vec![half::f16::ZERO; h_kv * cap * 2 * d],
             h_kv,
             d,
-            cap: max_seq,
+            cap,
             len: 0,
         }
     }
