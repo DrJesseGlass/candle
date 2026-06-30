@@ -117,6 +117,60 @@ impl TensorInfo {
             device,
         )
     }
+
+    // Positioned (pread) load: reads this tensor's bytes at its absolute file
+    // offset without a shared cursor, so many tensors can be loaded concurrently
+    // from the same file handle. See Content::tensors_parallel.
+    pub fn read_at(
+        &self,
+        file: &std::fs::File,
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let tensor_start = tensor_data_offset.saturating_add(self.offset);
+        let mut raw_data = vec![0u8; size_in_bytes];
+        pread_exact(file, &mut raw_data, tensor_start)?;
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            &raw_data,
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
+}
+
+// Read exactly buf.len() bytes at an absolute offset, no shared cursor (so it is
+// safe to call concurrently on one file). Maps to pread/seek_read per platform.
+#[cfg(unix)]
+fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)?;
+    Ok(())
+}
+#[cfg(windows)]
+fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            crate::bail!("unexpected EOF reading {} bytes at offset {offset}", buf.len());
+        }
+        done += n;
+    }
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
+fn pread_exact(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> Result<()> {
+    crate::bail!("positioned reads (parallel load) are not supported on this platform")
 }
 
 #[derive(Debug)]
@@ -577,6 +631,30 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    // Load every tensor concurrently via positioned reads, returning a name->tensor
+    // map. The per-tensor read + copy/construct (and any Q6Kx8 unpack) run across
+    // the rayon pool, so boot is bound by the slowest tensor, not their sum. CPU
+    // only; each tensor's lazy repack is still built later at first use.
+    pub fn tensors_parallel(
+        &self,
+        file: &std::fs::File,
+        device: &Device,
+    ) -> Result<HashMap<String, QTensor>> {
+        use rayon::prelude::*;
+        if !matches!(device, Device::Cpu) {
+            crate::bail!("parallel tensor load is CPU-only");
+        }
+        self.tensor_infos
+            .par_iter()
+            .map(|(name, info)| {
+                Ok((
+                    name.clone(),
+                    info.read_at(file, self.tensor_data_offset, device)?,
+                ))
+            })
+            .collect()
     }
 }
 

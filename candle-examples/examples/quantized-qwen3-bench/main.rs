@@ -48,6 +48,11 @@ struct Args {
     /// Emit a single JSON line on stdout instead of a human table.
     #[arg(long)]
     json: bool,
+
+    /// Load tensors concurrently (positioned reads across the rayon pool) instead
+    /// of sequentially through one cursor.
+    #[arg(long)]
+    parallel: bool,
 }
 
 /// Greedy next token from a 1-D logits tensor, computed on-device so the host
@@ -82,7 +87,11 @@ fn main() -> Result<()> {
     let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&args.model))?;
     let gguf_read_ms = t_read.elapsed().as_millis();
     let t_build = Instant::now();
-    let mut model = Qwen3::from_gguf(content, &mut file, &device)?;
+    let mut model = if args.parallel {
+        Qwen3::from_gguf_parallel(content, &file, &device)?
+    } else {
+        Qwen3::from_gguf(content, &mut file, &device)?
+    };
     let model_build_ms = t_build.elapsed().as_millis();
     if !args.json {
         eprintln!("COLDSTART gguf_read_ms={gguf_read_ms} model_build_ms={model_build_ms}");
