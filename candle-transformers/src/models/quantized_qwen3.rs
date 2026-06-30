@@ -15,7 +15,6 @@ use candle_nn::attention::{flash_attn, AttnMask};
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCacheF16};
 use candle_nn::{Activation, Module};
 
-use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -23,42 +22,20 @@ pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
-    // When set, tensors are served from this preloaded map (filled in parallel
-    // before construction) instead of read sequentially through the reader.
-    preloaded: Option<HashMap<String, QTensor>>,
 }
 
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        Self {
-            ct,
-            reader,
-            device,
-            preloaded: None,
-        }
-    }
-
-    pub fn new_preloaded(
-        ct: gguf_file::Content,
-        reader: R,
-        preloaded: HashMap<String, QTensor>,
-        device: Device,
-    ) -> Self {
-        Self {
-            ct,
-            reader,
-            device,
-            preloaded: Some(preloaded),
-        }
+        Self { ct, reader, device }
     }
 
     pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        let ws = self.tensor(name)?;
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         QMatMul::from_weights(ws.into())
     }
 
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.tensor(name)?;
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         RmsNorm::from_qtensor(ws, eps)
     }
 
@@ -67,9 +44,6 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        if let Some(qt) = self.preloaded.as_mut().and_then(|m| m.remove(name)) {
-            return Ok(qt);
-        }
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 }
@@ -556,23 +530,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gg(Gguf::new(ct, reader, device.clone()), device)
-    }
-
-    // Parallel load: every tensor is read (positioned pread) and constructed
-    // concurrently across the rayon pool before assembly, so the weight-load
-    // phase is bound by the slowest tensor rather than their sum. CPU only.
-    pub fn from_gguf_parallel(
-        ct: gguf_file::Content,
-        file: &std::fs::File,
-        device: &Device,
-    ) -> Result<Self> {
-        let preloaded = ct.tensors_parallel(file, device)?;
-        let reader = file.try_clone()?;
-        Self::from_gg(Gguf::new_preloaded(ct, reader, preloaded, device.clone()), device)
-    }
-
-    fn from_gg<R: Read + Seek>(mut gg: Gguf<R>, device: &Device) -> Result<Self> {
+        let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
