@@ -274,6 +274,10 @@ struct TextModel {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
+    // Tied lm_head as a quantized matmul over token_embd. Reusing the dense
+    // dequantized embedding via broadcast_matmul(w.t()) re-materializes a
+    // contiguous transposed copy of the whole vocab table on every forward.
+    lm_head: Linear,
     rotary: RotaryEmbedding,
     dtype: DType,
 }
@@ -282,6 +286,8 @@ impl TextModel {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let dtype = DType::F32;
         let embed_tokens = Embedding::new(cfg.vocab_size, cfg.hidden_size, vb.pp("token_embd"))?;
+        let lm_head =
+            quantized_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("token_embd"))?;
 
         let vb_layers = vb.pp("blk");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -296,6 +302,7 @@ impl TextModel {
             embed_tokens,
             layers,
             norm,
+            lm_head,
             rotary,
             dtype,
         })
@@ -342,9 +349,7 @@ impl TextModel {
         }
 
         let hidden = self.norm.forward(&hidden)?;
-
-        let w = self.embed_tokens.embeddings();
-        hidden.broadcast_matmul(&w.t()?)
+        self.lm_head.forward(&hidden)
     }
 
     fn clear_kv_cache(&mut self) {
