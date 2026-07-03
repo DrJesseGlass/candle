@@ -1668,9 +1668,7 @@ pub(crate) fn gemm_q8_0x4(
     debug_assert_eq!(w.len(), a.len());
     unsafe {
         let mut sumf: [float32x4_t; 4] = [vdupq_n_f32(0.0); 4];
-        for l in 0..w.len() {
-            let wb = &w[l];
-            let ab = &a[l];
+        for (wb, ab) in w.iter().zip(a.iter()) {
             let mut sumi: [int32x4_t; 4] = [vdupq_n_s32(0); 4];
             for j in 0..8 {
                 let bv = vld1q_s8(wb.qs.as_ptr().add(16 * j));
@@ -1707,9 +1705,7 @@ pub(crate) fn gemv_q8_0x4(w: &[super::repack::BlockQ8_0x4], a: &[BlockQ8_0], out
     debug_assert_eq!(w.len(), a.len());
     unsafe {
         let mut acc = vdupq_n_f32(0.0);
-        for l in 0..w.len() {
-            let wb = &w[l];
-            let ab = &a[l];
+        for (wb, ab) in w.iter().zip(a.iter()) {
             let a_lo = vld1q_s8(ab.qs.as_ptr());
             let a_hi = vld1q_s8(ab.qs.as_ptr().add(16));
 
@@ -1734,5 +1730,43 @@ pub(crate) fn gemv_q8_0x4(w: &[super::repack::BlockQ8_0x4], a: &[BlockQ8_0], out
             acc = vfmaq_f32(acc, vcvtq_f32_s32(ret), vmulq_n_f32(bdv, ad));
         }
         vst1q_f32(out.as_mut_ptr(), acc);
+    }
+}
+
+/// NEON activation pack for the Q8_0x4 GEMM: quantize 4 rows and write the
+/// 4-byte-interleaved layout directly (port of llama ggml_quantize_mat_q8_0_4x4).
+/// Bit-identical to the scalar `BlockQ8_0::from_float` + interleave: vcvtaq
+/// rounds ties away from zero exactly like Rust `f32::round`.
+#[cfg(all(target_feature = "neon", target_feature = "dotprod"))]
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn quantize_mat_q8_0x4_neon(rows: &[&[f32]; 4], out: &mut [super::repack::BlockQ8_0x4]) {
+    use core::arch::aarch64::*;
+    let nb = out.len();
+    unsafe {
+        for (i, dst) in out.iter_mut().enumerate() {
+            let mut srcv = [[vdupq_n_f32(0.0); 8]; 4];
+            for (r, row) in rows.iter().enumerate() {
+                debug_assert_eq!(row.len(), nb * 32);
+                let base = row.as_ptr().add(i * 32);
+                let mut amaxv = vdupq_n_f32(0.0);
+                for j in 0..8 {
+                    let v = vld1q_f32(base.add(4 * j));
+                    srcv[r][j] = v;
+                    amaxv = vmaxq_f32(amaxv, vabsq_f32(v));
+                }
+                let amax = vmaxvq_f32(amaxv);
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                dst.d[r] = half::f16::from_f32(d);
+                for j in 0..8 {
+                    let vi = vcvtaq_s32_f32(vmulq_n_f32(srcv[r][j], id));
+                    let p = dst.qs.as_mut_ptr().add(16 * j + 4 * r);
+                    *p = vgetq_lane_s32::<0>(vi) as i8;
+                    *p.add(1) = vgetq_lane_s32::<1>(vi) as i8;
+                    *p.add(2) = vgetq_lane_s32::<2>(vi) as i8;
+                    *p.add(3) = vgetq_lane_s32::<3>(vi) as i8;
+                }
+            }
+        }
     }
 }

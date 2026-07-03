@@ -959,10 +959,9 @@ pub(crate) fn repack_q8_0_weight(blocks: &[BlockQ8_0], n: usize) -> Vec<BlockQ8_
     out
 }
 
-/// Quantize 4 activation rows (k floats each) into interleaved x4 blocks.
-/// Byte-identical quantization to `BlockQ8_0::from_float` per row, so the
-/// packed path sees the same activation values as the unpacked one.
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+/// Scalar reference twin of `neon::quantize_mat_q8_0x4_neon`: from_float per
+/// row + interleave. Kept for the bit-exactness test of the NEON pack.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "dotprod"))]
 pub(crate) fn quantize_q8_0_x4_into(rows: &[&[f32]; 4], out: &mut [BlockQ8_0x4]) {
     let nb = out.len();
     let mut tmp = vec![BlockQ8_0::zeros(); nb];
@@ -1025,7 +1024,7 @@ pub(crate) fn matmul_q8_0x4(
             })
         };
         crate::utils::par_chunks_mut(&mut q8, nb, |rt, chunk| {
-            quantize_q8_0_x4_into(&tile_rows(rt), chunk);
+            super::neon::quantize_mat_q8_0x4_neon(&tile_rows(rt), chunk);
         });
 
         let process = |g: usize| {
@@ -1110,6 +1109,28 @@ mod q8_0_packed_tests {
                 ((s >> 33) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[test]
+    fn neon_activation_pack_matches_scalar() {
+        let k = 96;
+        let nb = k / QK8_0;
+        let rows_data: Vec<Vec<f32>> = (0..4).map(|r| rand_f32(50 + r, k)).collect();
+        let rows: [&[f32]; 4] = std::array::from_fn(|r| rows_data[r].as_slice());
+        let mut scalar = vec![BlockQ8_0x4::zeroed(); nb];
+        quantize_q8_0_x4_into(&rows, &mut scalar);
+        let mut neon = vec![BlockQ8_0x4::zeroed(); nb];
+        super::super::neon::quantize_mat_q8_0x4_neon(&rows, &mut neon);
+        for b in 0..nb {
+            for r in 0..4 {
+                assert_eq!(
+                    scalar[b].d[r].to_bits(),
+                    neon[b].d[r].to_bits(),
+                    "d b={b} r={r}"
+                );
+            }
+            assert_eq!(scalar[b].qs, neon[b].qs, "qs b={b}");
+        }
     }
 
     #[test]
