@@ -40,6 +40,7 @@ impl Attention {
         let v = self.v_proj.forward(xs)?;
 
         let shape = (b, seq_len, self.num_heads, self.head_dim);
+
         let q = q.reshape(shape)?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape(shape)?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape(shape)?.transpose(1, 2)?.contiguous()?;
