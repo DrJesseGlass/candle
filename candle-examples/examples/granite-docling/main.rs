@@ -77,6 +77,14 @@ struct Args {
 
     #[arg(long)]
     quantized: bool,
+
+    /// Local text decoder GGUF path (overrides the hub download; implies --quantized).
+    #[arg(long)]
+    text_gguf: Option<String>,
+
+    /// Local vision mmproj GGUF path (overrides the hub download).
+    #[arg(long)]
+    mmproj_gguf: Option<String>,
 }
 
 fn resize_and_normalize(img: &image::RgbImage, w: u32, h: u32) -> Vec<f32> {
@@ -340,12 +348,19 @@ fn main() -> Result<()> {
     let tokenizer_path = base_repo.get("tokenizer.json")?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
-    let (mut model, tile_size, image_seq_len) = if args.quantized {
+    let quantized = args.quantized || args.text_gguf.is_some() || args.mmproj_gguf.is_some();
+    let (mut model, tile_size, image_seq_len) = if quantized {
         let model_id = args.model_id.as_deref().unwrap_or(QUANTIZED_MODEL_ID);
         let repo = api.model(model_id.to_string());
 
-        let text_path = repo.get("granite-docling-258M-Q8_0.gguf")?;
-        let vision_path = repo.get("mmproj-granite-docling-258M-Q8_0.gguf")?;
+        let text_path = match &args.text_gguf {
+            Some(p) => p.into(),
+            None => repo.get("granite-docling-258M-Q8_0.gguf")?,
+        };
+        let vision_path = match &args.mmproj_gguf {
+            Some(p) => p.into(),
+            None => repo.get("mmproj-granite-docling-258M-Q8_0.gguf")?,
+        };
 
         println!("Loading quantized model...");
         println!("  Text:   {text_path:?}");
@@ -422,7 +437,7 @@ fn main() -> Result<()> {
         .prompt
         .as_deref()
         .unwrap_or("Convert this page to docling.");
-    let pv_dtype = if args.quantized {
+    let pv_dtype = if quantized {
         DType::F32
     } else if args.bf16 {
         DType::BF16

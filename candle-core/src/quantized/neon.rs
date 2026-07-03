@@ -1649,3 +1649,90 @@ pub(crate) fn gemm_q4kx8_q8k_lanerow(q4: &[BlockQ4Kx8L], q8: &[BlockQ8Kx4], dst:
         }
     }
 }
+
+// ---- Packed Q8_0 (block_q8_0x4) kernels, ports of llama.cpp's
+// ggml_gemm_q8_0_4x4_q8_0 / ggml_gemv_q8_0_4x4_q8_0 (arch/arm/repack.cpp).
+// The x4 layout interleaves 4 rows in 4-byte chunks so one SDOT covers 4
+// output columns via lane broadcast; see repack::BlockQ8_0x4.
+
+/// One 4-col x 4-row tile: w = 4 interleaved weight rows, a = 4 interleaved
+/// activation rows, both `nb` blocks long. out[r * 4 + c] = row r x col c.
+#[cfg(all(target_feature = "neon", target_feature = "dotprod"))]
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn gemm_q8_0x4(
+    w: &[super::repack::BlockQ8_0x4],
+    a: &[super::repack::BlockQ8_0x4],
+    out: &mut [f32; 16],
+) {
+    use core::arch::aarch64::*;
+    debug_assert_eq!(w.len(), a.len());
+    unsafe {
+        let mut sumf: [float32x4_t; 4] = [vdupq_n_f32(0.0); 4];
+        for l in 0..w.len() {
+            let wb = &w[l];
+            let ab = &a[l];
+            let mut sumi: [int32x4_t; 4] = [vdupq_n_s32(0); 4];
+            for j in 0..8 {
+                let bv = vld1q_s8(wb.qs.as_ptr().add(16 * j));
+                let av = vld1q_s8(ab.qs.as_ptr().add(16 * j));
+                sumi[0] = vdot_laneq::<0>(sumi[0], bv, av);
+                sumi[1] = vdot_laneq::<1>(sumi[1], bv, av);
+                sumi[2] = vdot_laneq::<2>(sumi[2], bv, av);
+                sumi[3] = vdot_laneq::<3>(sumi[3], bv, av);
+            }
+            let bd = [
+                wb.d[0].to_f32(),
+                wb.d[1].to_f32(),
+                wb.d[2].to_f32(),
+                wb.d[3].to_f32(),
+            ];
+            let bdv = vld1q_f32(bd.as_ptr());
+            for r in 0..4 {
+                let ad = ab.d[r].to_f32();
+                sumf[r] = vfmaq_f32(sumf[r], vmulq_n_f32(bdv, ad), vcvtq_f32_s32(sumi[r]));
+            }
+        }
+        for r in 0..4 {
+            vst1q_f32(out.as_mut_ptr().add(r * 4), sumf[r]);
+        }
+    }
+}
+
+/// GEMV against one 4-col weight group: a is a plain Q8_0 activation row.
+/// out[c] = a x col c.
+#[cfg(all(target_feature = "neon", target_feature = "dotprod"))]
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn gemv_q8_0x4(w: &[super::repack::BlockQ8_0x4], a: &[BlockQ8_0], out: &mut [f32; 4]) {
+    use core::arch::aarch64::*;
+    debug_assert_eq!(w.len(), a.len());
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        for l in 0..w.len() {
+            let wb = &w[l];
+            let ab = &a[l];
+            let a_lo = vld1q_s8(ab.qs.as_ptr());
+            let a_hi = vld1q_s8(ab.qs.as_ptr().add(16));
+
+            let mut ret = vdupq_n_s32(0);
+            ret = vdot_laneq::<0>(ret, vld1q_s8(wb.qs.as_ptr()), a_lo);
+            ret = vdot_laneq::<1>(ret, vld1q_s8(wb.qs.as_ptr().add(16)), a_lo);
+            ret = vdot_laneq::<2>(ret, vld1q_s8(wb.qs.as_ptr().add(32)), a_lo);
+            ret = vdot_laneq::<3>(ret, vld1q_s8(wb.qs.as_ptr().add(48)), a_lo);
+            ret = vdot_laneq::<0>(ret, vld1q_s8(wb.qs.as_ptr().add(64)), a_hi);
+            ret = vdot_laneq::<1>(ret, vld1q_s8(wb.qs.as_ptr().add(80)), a_hi);
+            ret = vdot_laneq::<2>(ret, vld1q_s8(wb.qs.as_ptr().add(96)), a_hi);
+            ret = vdot_laneq::<3>(ret, vld1q_s8(wb.qs.as_ptr().add(112)), a_hi);
+
+            let bd = [
+                wb.d[0].to_f32(),
+                wb.d[1].to_f32(),
+                wb.d[2].to_f32(),
+                wb.d[3].to_f32(),
+            ];
+            let bdv = vld1q_f32(bd.as_ptr());
+            let ad = ab.d.to_f32();
+            acc = vfmaq_f32(acc, vcvtq_f32_s32(ret), vmulq_n_f32(bdv, ad));
+        }
+        vst1q_f32(out.as_mut_ptr(), acc);
+    }
+}

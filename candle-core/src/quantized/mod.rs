@@ -68,6 +68,10 @@ pub struct QTensor {
     /// aarch64 prefill GEMM; tied to this tensor's lifetime so it can't go stale.
     #[allow(dead_code)]
     repacked_laneq: OnceLock<Option<Vec<u8>>>,
+    /// Lazily repacked Q8_0 weight (`repack::BlockQ8_0x4` bytes) for the aarch64
+    /// GEMM/GEMV paths; same lifetime/caching scheme as the Q4_K repacks.
+    #[allow(dead_code)]
+    repacked_q8_0: OnceLock<Option<Vec<u8>>>,
 }
 
 impl Device {
@@ -560,6 +564,7 @@ impl QTensor {
             shape,
             repacked_qs: OnceLock::new(),
             repacked_laneq: OnceLock::new(),
+            repacked_q8_0: OnceLock::new(),
         })
     }
 
@@ -582,6 +587,7 @@ impl QTensor {
             shape: shape.clone(),
             repacked_qs: OnceLock::new(),
             repacked_laneq: OnceLock::new(),
+            repacked_q8_0: OnceLock::new(),
         })
     }
 
@@ -619,6 +625,7 @@ impl QTensor {
             shape: shape.clone(),
             repacked_qs: OnceLock::new(),
             repacked_laneq: OnceLock::new(),
+            repacked_q8_0: OnceLock::new(),
         })
     }
 
@@ -664,6 +671,7 @@ impl QTensor {
             shape: shape.clone(),
             repacked_qs: OnceLock::new(),
             repacked_laneq: OnceLock::new(),
+            repacked_q8_0: OnceLock::new(),
         })
     }
 
@@ -694,6 +702,7 @@ impl QTensor {
             shape: shape.clone(),
             repacked_qs: OnceLock::new(),
             repacked_laneq: OnceLock::new(),
+            repacked_q8_0: OnceLock::new(),
         })
     }
 
@@ -780,24 +789,50 @@ impl QTensor {
         })
     }
 
-    // Build the aarch64 Q4_K matmul repacks and free the original blocks; the
-    // matmuls then run from the cached repacks alone. No-op off aarch64/Q4_K.
+    // Build-once cached BlockQ8_0x4 repack (GEMM + GEMV), same caching scheme.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    fn repacked_q8_0_for(&self, n: usize) -> &Option<Vec<u8>> {
+        use zerocopy::IntoBytes;
+        self.repacked_q8_0.get_or_init(|| {
+            let s = match &self.storage {
+                QStorage::Cpu(s) => s,
+                _ => return None,
+            };
+            let total_blocks = s.storage_size_in_bytes() / std::mem::size_of::<BlockQ8_0>();
+            if total_blocks == 0 {
+                return None;
+            }
+            let blocks =
+                unsafe { std::slice::from_raw_parts(s.as_ptr() as *const BlockQ8_0, total_blocks) };
+            Some(repack::repack_q8_0_weight(blocks, n).as_bytes().to_vec())
+        })
+    }
+
+    // Build the aarch64 Q4_K/Q8_0 matmul repacks and free the original blocks;
+    // the matmuls then run from the cached repacks alone. No-op off aarch64.
     // Private: only from_arc calls it, on a uniquely-owned tensor that has ruled
-    // out dequant. Builds both decode and (when enabled) prefill repacks first so
-    // neither path needs the source afterward.
+    // out dequant. Builds every repack the matmul paths need first so none of
+    // them needs the source afterward.
     fn drop_source_after_repack(&mut self) {
         #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
         if let Ok((n, _k)) = self.shape.dims2() {
             let dtype = self.storage.dtype();
-            if dtype == GgmlDType::Q4K && n.is_multiple_of(8) {
-                let qs_ok = self.repacked_qs_for(n).is_some();
-                let laneq_ok =
-                    !repack::prefill_lanerow_enabled() || self.repacked_laneq_for(n).is_some();
-                if qs_ok && laneq_ok {
-                    let device = self.storage.device();
-                    if let Ok(empty) = device.qzeros(0, dtype) {
-                        self.storage = empty;
-                    }
+            let repacked = match dtype {
+                GgmlDType::Q4K if n.is_multiple_of(8) => {
+                    let qs_ok = self.repacked_qs_for(n).is_some();
+                    let laneq_ok =
+                        !repack::prefill_lanerow_enabled() || self.repacked_laneq_for(n).is_some();
+                    qs_ok && laneq_ok
+                }
+                GgmlDType::Q8_0 if n.is_multiple_of(4) => {
+                    repack::q8_0_packed_enabled() && self.repacked_q8_0_for(n).is_some()
+                }
+                _ => false,
+            };
+            if repacked {
+                let device = self.storage.device();
+                if let Ok(empty) = device.qzeros(0, dtype) {
+                    self.storage = empty;
                 }
             }
         }
@@ -1082,6 +1117,31 @@ impl crate::CustomOp1 for QTensor {
                             block_x8,
                             &mut dst_storage,
                         )?;
+                        return Ok((crate::CpuStorage::F32(dst_storage), dst_shape));
+                    }
+                }
+
+                // Packed Q8_0 (block_q8_0x4): lane-broadcast GEMM/GEMV, the
+                // llama.cpp aarch64 online-repack equivalent. Serves all m.
+                #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+                if self_storage.dtype() == GgmlDType::Q8_0
+                    && n.is_multiple_of(4)
+                    && repack::q8_0_packed_enabled()
+                {
+                    use zerocopy::FromBytes;
+                    if let Some(bytes) = self.repacked_q8_0_for(n) {
+                        let packed: &[repack::BlockQ8_0x4] =
+                            <[repack::BlockQ8_0x4]>::ref_from_bytes(bytes).map_err(|_| {
+                                crate::Error::Msg(
+                                    "repacked_q8_0 alignment invariant violated".to_string(),
+                                )
+                            })?;
+                        repack::matmul_q8_0x4(
+                            (dst_shape.elem_count() / n, k, n),
+                            slice,
+                            packed,
+                            &mut dst_storage,
+                        );
                         return Ok((crate::CpuStorage::F32(dst_storage), dst_shape));
                     }
                 }
