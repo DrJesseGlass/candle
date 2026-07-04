@@ -556,10 +556,22 @@ impl Model {
     pub fn setup(&mut self, pixel_values: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
         self.text_model.clear_kv_cache();
         let image_features = self.encode_image(pixel_values)?;
+        self.prefill_with_image_features(&image_features, input_ids)
+    }
+
+    /// The prefill half of [`Model::setup`], for callers that time the vision
+    /// encode separately: merge pre-computed image features into the prompt
+    /// embeddings and run the text prefill. Does NOT clear the KV cache.
+    /// Returns last-position logits, shape (1, 1, vocab).
+    pub fn prefill_with_image_features(
+        &mut self,
+        image_features: &Tensor,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
         let text_embeds = self.text_model.embed(input_ids)?;
         let input_embeds = merge_image_tokens(
             &text_embeds,
-            &image_features,
+            image_features,
             input_ids,
             self.image_token_id,
         )?;
