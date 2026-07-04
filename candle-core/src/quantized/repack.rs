@@ -1156,3 +1156,71 @@ mod q8_0_packed_tests {
         }
     }
 }
+
+/// Dynamic int8 matmul_t for activation x activation GEMMs (attention scores):
+/// dst(m,n) = lhs(m,k) x rhs(n,k)^T with BOTH operands quantized to Q8_0 on the
+/// fly (per-32-block scales, SDOT accumulate). Needs k % 32 == 0 and n % 4 == 0.
+/// Relative error vs f32 is ~1e-3..1e-2 - fine for pre-softmax logits.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_feature = "dotprod"
+))]
+pub fn matmul_q8_0_dynamic(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[f32],
+    dst: &mut [f32],
+) -> crate::Result<()> {
+    if !k.is_multiple_of(QK8_0) || !n.is_multiple_of(4) {
+        crate::bail!("matmul_q8_0_dynamic needs k%32==0 (got {k}) and n%4==0 (got {n})");
+    }
+    if lhs.len() != m * k || rhs.len() != n * k || dst.len() != m * n {
+        crate::bail!("matmul_q8_0_dynamic size mismatch");
+    }
+    let nb = k / QK8_0;
+    // Pack the rhs rows 4-at-a-time into the x4 interleaved layout (the same
+    // format the weight repack produces), parallel over row-quads.
+    let mut packed = vec![BlockQ8_0x4::zeroed(); (n / 4) * nb];
+    crate::utils::par_chunks_mut(&mut packed, nb, |g, chunk| {
+        let rows: [&[f32]; 4] = std::array::from_fn(|r| {
+            let row = g * 4 + r;
+            &rhs[row * k..(row + 1) * k]
+        });
+        super::neon::quantize_mat_q8_0x4_neon(&rows, chunk);
+    });
+    matmul_q8_0x4((m, k, n), lhs, &packed, dst);
+    Ok(())
+}
+
+#[cfg(all(test, target_feature = "neon", target_feature = "dotprod"))]
+mod q8_dynamic_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_matmul_close_to_f32() {
+        let (m, k, n) = (16, 64, 12);
+        let mut s = 3u64;
+        let mut rand = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as u32 as f32 / u32::MAX as f32) * 4.0 - 2.0
+        };
+        let lhs: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+        let rhs: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+        let mut got = vec![0f32; m * n];
+        matmul_q8_0_dynamic((m, k, n), &lhs, &rhs, &mut got).unwrap();
+        for i in 0..m {
+            for j in 0..n {
+                let exact: f32 = (0..k).map(|x| lhs[i * k + x] * rhs[j * k + x]).sum();
+                let rel = (got[i * n + j] - exact).abs() / exact.abs().max(1.0);
+                assert!(
+                    rel < 2e-2,
+                    "({i},{j}): q8 {} vs f32 {exact}",
+                    got[i * n + j]
+                );
+            }
+        }
+    }
+}

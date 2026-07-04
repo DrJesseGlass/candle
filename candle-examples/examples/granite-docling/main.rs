@@ -75,6 +75,12 @@ struct Args {
     #[arg(long)]
     no_split: bool,
 
+    /// Longest-edge target for image splitting (tiles scale ~quadratically:
+    /// 2048 -> 12+1 tiles, 1536 -> 6+1, 1024 -> 2+1 for a portrait page).
+    /// Lower = faster encode, coarser detail. Ignored with --no-split.
+    #[arg(long, default_value_t = 2048)]
+    max_edge: usize,
+
     #[arg(long)]
     quantized: bool,
 
@@ -471,7 +477,7 @@ fn main() -> Result<()> {
             let ids = build_input_ids_single(&tokenizer, prompt_text, image_seq_len)?;
             (pv, ids)
         } else {
-            let (n_rows, n_cols, tiles) = split_image(&raw_img, tile_size, 2048);
+            let (n_rows, n_cols, tiles) = split_image(&raw_img, tile_size, args.max_edge);
             let pv = tiles_to_tensor(&tiles, tile_size, pv_dtype, &device)?;
             let ids =
                 build_input_ids_split(&tokenizer, prompt_text, image_seq_len, n_rows, n_cols)?;

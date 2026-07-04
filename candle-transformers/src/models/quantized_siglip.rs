@@ -45,12 +45,63 @@ impl Attention {
         let k = k.reshape(shape)?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape(shape)?.transpose(1, 2)?.contiguous()?;
 
-        let attn = (q.matmul(&k.t()?)? * self.scale)?;
+        let attn = self.scores(&q, &k, b, seq_len)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         attn.matmul(&v)?
             .transpose(1, 2)?
             .reshape((b, seq_len, ()))?
             .apply(&self.out_proj)
+    }
+
+    /// Scaled attention scores q @ k^T. On aarch64/dotprod CPU the score GEMM
+    /// runs with both operands dynamically quantized to Q8_0 (SDOT, ~1e-3 rel
+    /// error - well inside what the softmax tolerates); softmax and probs @ v
+    /// stay f32, so small attention weights are not truncated.
+    /// CANDLE_Q8_ATTN=0 restores the f32 GEMM.
+    fn scores(&self, q: &Tensor, k: &Tensor, b: usize, seq_len: usize) -> Result<Tensor> {
+        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        {
+            fn q8_attn_enabled() -> bool {
+                static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                    std::env::var("CANDLE_Q8_ATTN").map_or(true, |v| v != "0")
+                });
+                *ON
+            }
+            if q.device().is_cpu()
+                && q.dtype() == candle::DType::F32
+                && self.head_dim.is_multiple_of(32)
+                && seq_len.is_multiple_of(4)
+                && q8_attn_enabled()
+            {
+                use candle::Storage;
+                let (qg, ql) = q.storage_and_layout();
+                let q_data: &[f32] = match &*qg {
+                    Storage::Cpu(c) => &c.as_slice::<f32>()?[ql.start_offset()..],
+                    _ => candle::bail!("expected CPU storage"),
+                };
+                let (kg, kl) = k.storage_and_layout();
+                let k_data: &[f32] = match &*kg {
+                    Storage::Cpu(c) => &c.as_slice::<f32>()?[kl.start_offset()..],
+                    _ => candle::bail!("expected CPU storage"),
+                };
+                let bh = b * self.num_heads;
+                let sd = seq_len * self.head_dim;
+                let ss = seq_len * seq_len;
+                let mut out = vec![0f32; bh * ss];
+                for i in 0..bh {
+                    candle::quantized::repack::matmul_q8_0_dynamic(
+                        (seq_len, self.head_dim, seq_len),
+                        &q_data[i * sd..(i + 1) * sd],
+                        &k_data[i * sd..(i + 1) * sd],
+                        &mut out[i * ss..(i + 1) * ss],
+                    )?;
+                }
+                let scores =
+                    Tensor::from_vec(out, (b, self.num_heads, seq_len, seq_len), q.device())?;
+                return scores * self.scale;
+            }
+        }
+        q.matmul(&k.t()?)? * self.scale
     }
 }
 
