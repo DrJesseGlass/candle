@@ -569,12 +569,8 @@ impl Model {
         input_ids: &Tensor,
     ) -> Result<Tensor> {
         let text_embeds = self.text_model.embed(input_ids)?;
-        let input_embeds = merge_image_tokens(
-            &text_embeds,
-            image_features,
-            input_ids,
-            self.image_token_id,
-        )?;
+        let input_embeds =
+            merge_image_tokens(&text_embeds, image_features, input_ids, self.image_token_id)?;
         self.text_model.forward_embeds(&input_embeds)
     }
 
