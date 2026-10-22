@@ -1081,3 +1081,90 @@ pub(crate) fn try_indexed_gemv(
         Ok(false)
     }
 }
+
+/// Dynamic int8 matmul_t for activation x activation GEMMs (attention scores):
+/// dst(m,n) = lhs(m,k) x rhs(n,k)^T with both operands quantized to Q8_0 on the
+/// fly (per-32-block scales, SDOT or SMMLA accumulate). Needs k % 32 == 0 and
+/// n % 4 == 0. Relative error vs f32 is ~1e-3..1e-2, fine for pre-softmax logits.
+///
+/// Returns Ok(false) without touching dst when this CPU has neither dotprod nor
+/// i8mm, so the caller can fall back to the f32 path.
+#[cfg(target_arch = "aarch64")]
+pub fn matmul_q8_0_dynamic(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs: &[f32],
+    dst: &mut [f32],
+) -> Result<bool> {
+    use rayon::prelude::*;
+    if !k.is_multiple_of(QK8_0) || !n.is_multiple_of(4) {
+        crate::bail!("matmul_q8_0_dynamic needs k%32==0 (got {k}) and n%4==0 (got {n})");
+    }
+    if lhs.len() != m * k || rhs.len() != n * k || dst.len() != m * n {
+        crate::bail!("matmul_q8_0_dynamic size mismatch");
+    }
+    let features = crate::cpu::features::get();
+    if !(features.dotprod || features.i8mm) {
+        return Ok(false);
+    }
+    let nb = k / QK8_0;
+    // Quantize the rhs rows to Q8_0 (NEON row quantizer), then interleave them
+    // 4-at-a-time into the same x4 layout the weight repack produces.
+    let mut blocks = vec![<BlockQ8_0 as super::GgmlType>::zeros(); n * nb];
+    blocks
+        .par_chunks_mut(nb)
+        .zip(rhs.par_chunks(k))
+        .for_each(|(out, row)| <BlockQ8_0 as super::GgmlType>::from_float(row, out));
+    let interleave = if features.i8mm { 8 } else { 4 };
+    let packed = PackedStorage::Q8_0x4(pack_to_q8_0x4(&blocks, n, interleave));
+    let kind = PackedKind::Q8_0x4;
+    // Tiled kernels need m % 4 == 0: aligned rows go through the tiled kernel and
+    // the tail rows run as gemvs on the same packing.
+    let m_tiled = m & !3;
+    let (lhs_tiled, lhs_tail) = lhs.split_at(m_tiled * k);
+    let (dst_tiled, dst_tail) = dst.split_at_mut(m_tiled * n);
+    if m_tiled > 0 {
+        kind.matmul((m_tiled, k, n), lhs_tiled, &packed, dst_tiled)?;
+    }
+    for (lhs_row, dst_row) in lhs_tail.chunks_exact(k).zip(dst_tail.chunks_exact_mut(n)) {
+        kind.matmul((1, k, n), lhs_row, &packed, dst_row)?;
+    }
+    Ok(true)
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod q8_dynamic_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_matmul_close_to_f32() {
+        // m = 18 exercises both the tiled rows and the gemv tail.
+        for (m, k, n) in [(1usize, 64usize, 12usize), (16, 64, 12), (18, 96, 8)] {
+            let mut s = 3u64;
+            let mut rand = || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as u32 as f32 / u32::MAX as f32) * 4.0 - 2.0
+            };
+            let lhs: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+            let rhs: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+            let mut got = vec![0f32; m * n];
+            if !matmul_q8_0_dynamic((m, k, n), &lhs, &rhs, &mut got).unwrap() {
+                // No dotprod/i8mm on this CPU: nothing to check.
+                return;
+            }
+            for i in 0..m {
+                for j in 0..n {
+                    let exact: f32 = (0..k).map(|x| lhs[i * k + x] * rhs[j * k + x]).sum();
+                    let rel = (got[i * n + j] - exact).abs() / exact.abs().max(1.0);
+                    assert!(
+                        rel < 2e-2,
+                        "({m},{k},{n}) ({i},{j}): q8 {} vs f32 {exact}",
+                        got[i * n + j]
+                    );
+                }
+            }
+        }
+    }
+}
