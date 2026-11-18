@@ -58,6 +58,8 @@ impl Attention {
     /// f32, so small attention weights are not truncated.
     /// CANDLE_Q8_ATTN=0 restores the f32 GEMM.
     fn scores(&self, q: &Tensor, k: &Tensor, b: usize, seq_len: usize) -> Result<Tensor> {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (b, seq_len);
         #[cfg(target_arch = "aarch64")]
         {
             fn q8_attn_enabled() -> bool {
