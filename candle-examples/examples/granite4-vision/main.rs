@@ -388,9 +388,9 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let dtype = if args.bf16 { DType::BF16 } else { DType::F32 };
 
-    let api = hf_hub::api::sync::Api::new()?;
+    let api = candle_examples::hub::Api::new()?;
     let model_id = args.model_id.as_deref().unwrap_or(MODEL_ID);
-    let repo = api.model(model_id.to_string());
+    let repo = api.model(model_id);
 
     let config_path = repo.get("config.json")?;
     let config: Config = serde_json::from_reader(std::fs::File::open(&config_path)?)?;

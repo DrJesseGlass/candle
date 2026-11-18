@@ -340,15 +340,15 @@ fn parse_page_range(s: &str, page_count: u32) -> Result<pdf2image::Pages> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let device = candle_examples::device(args.cpu)?;
-    let api = hf_hub::api::sync::Api::new()?;
+    let api = candle_examples::hub::Api::new()?;
 
-    let base_repo = api.model(MODEL_ID.to_string());
+    let base_repo = api.model(MODEL_ID);
     let tokenizer_path = base_repo.get("tokenizer.json")?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
     let (mut model, tile_size, image_seq_len) = if args.quantized {
         let model_id = args.model_id.as_deref().unwrap_or(QUANTIZED_MODEL_ID);
-        let repo = api.model(model_id.to_string());
+        let repo = api.model(model_id);
 
         let text_path = repo.get("granite-docling-258M-Q8_0.gguf")?;
         let vision_path = repo.get("mmproj-granite-docling-258M-Q8_0.gguf")?;
@@ -396,7 +396,7 @@ fn main() -> Result<()> {
     } else {
         let dtype = if args.bf16 { DType::BF16 } else { DType::F32 };
         let model_id = args.model_id.as_deref().unwrap_or(MODEL_ID);
-        let repo = api.model(model_id.to_string());
+        let repo = api.model(model_id);
 
         let config_path = repo.get("config.json")?;
         let config: Config = serde_json::from_reader(std::fs::File::open(&config_path)?)?;

@@ -108,7 +108,7 @@ fn get_tokenizer(args: &Args) -> Result<Tokenizer> {
     let path = match &args.tokenizer {
         Some(p) => std::path::PathBuf::from(p),
         None => {
-            let api = hf_hub::api::sync::Api::new()?;
+            let api = candle_examples::hub::Api::new()?;
             let repo = api.model(args.model_id.clone());
             repo.get("tokenizer.json")
                 .context("Failed to download tokenizer.json")?
@@ -121,12 +121,8 @@ fn get_model_path(args: &Args) -> Result<std::path::PathBuf> {
     match &args.model {
         Some(p) => Ok(std::path::PathBuf::from(p)),
         None => {
-            let api = hf_hub::api::sync::Api::new()?;
-            let repo = api.repo(hf_hub::Repo::with_revision(
-                args.gguf_repo.clone(),
-                hf_hub::RepoType::Model,
-                "main".to_string(),
-            ));
+            let api = candle_examples::hub::Api::new()?;
+            let repo = api.model(args.gguf_repo.clone()).with_revision("main");
             repo.get(&args.gguf_file)
                 .context("Failed to download GGUF model file")
         }
@@ -195,7 +191,7 @@ fn main() -> Result<()> {
     let ct = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&model_path))?;
 
     let mut total_size_in_bytes = 0;
-    for (_, tensor) in ct.tensor_infos.iter() {
+    for tensor in ct.tensor_infos.values() {
         let elem_count = tensor.shape.elem_count();
         total_size_in_bytes +=
             elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
