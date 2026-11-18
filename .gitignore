@@ -5,9 +5,8 @@ data/
 dist/
 target/
 
-# Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
-# More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
-Cargo.lock
+# Cargo.lock is committed on the production branch so builds and security audits are reproducible.
+# Upstream (library) keeps it ignored; drop this hunk when merging back toward main.
 
 # editor config
 .helix

@@ -1,0 +1,25 @@
+# cargo-deny configuration for the production branch.
+# Only the advisories check is wired into CI (cargo deny check advisories).
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+
+[graph]
+# Resolve every feature (cuda, mkl, metal, ...) so the audit covers the whole lockfile.
+all-features = true
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Flag unmaintained crates only when a workspace crate depends on them directly;
+# deep transitive ones (paste, bincode 1, chrono via arrow, ...) are upstream's call.
+unmaintained = "workspace"
+ignore = [
+    # ocipkg 0.2.9 is pulled in by intel-mkl-src 0.8.1 (mkl feature only).
+    # ocipkg 0.4.1 fixes it but no intel-mkl-src release has picked it up.
+    # Revisit when intel-mkl-src publishes a new version.
+    { id = "RUSTSEC-2026-0450", reason = "ocipkg via intel-mkl-src 0.8.1, mkl feature only, no fixed release" },
+    # chrono 0.4 is a direct dependency of candle-examples (timestamps only).
+    # Unmaintained advisory, not a vulnerability. Upstream candidate: switch to jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, used by candle-examples for timestamps, swap for jiff/time upstream" },
+]
